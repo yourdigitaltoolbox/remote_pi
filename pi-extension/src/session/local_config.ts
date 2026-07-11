@@ -39,6 +39,8 @@ export interface LocalConfig {
    * configs without this field are treated as `true` for backward compat.
    */
   auto_start_relay?: boolean;
+  /** Operator-owned project default used only after run/agent child intent. */
+  child_exposure?: "off" | "local" | "relay";
   // Historical `workspace?`/`worktree?` presentation fields were removed.
   // Current durable workspace identity is the protected `workspace_id`, while
   // cwd/name are compatibility metadata. Legacy inline projection still
@@ -177,6 +179,9 @@ function parseLocalConfig(raw: string): LocalConfig | null {
     if (migrated) cfg.agent_name = migrated;
   }
   if (typeof src["auto_start_relay"] === "boolean") cfg.auto_start_relay = src["auto_start_relay"];
+  if (src["child_exposure"] === "off" || src["child_exposure"] === "local" || src["child_exposure"] === "relay") {
+    cfg.child_exposure = src["child_exposure"];
+  }
   return cfg;
 }
 
@@ -184,7 +189,13 @@ function parseLocalConfig(raw: string): LocalConfig | null {
 function directConfig(): LocalConfig | null {
   const raw = process.env[DIRECT_CONFIG_ENV];
   if (!raw || raw.trim().length === 0) return null;
-  return parseLocalConfig(raw);
+  const parsed = parseLocalConfig(raw);
+  if (!parsed) return null;
+  // Supervisor-injected direct config is runtime convenience, not protected
+  // operator policy custody. Child exposure is accepted only from the
+  // protected on-disk project config inspected below.
+  const { child_exposure: _untrustedChildPolicy, ...runtimeConfig } = parsed;
+  return runtimeConfig;
 }
 
 /**
@@ -196,16 +207,25 @@ export function localConfigExists(cwd: string): boolean {
 }
 
 export function loadLocalConfig(cwd: string): LocalConfig {
-  // Precedence: inline `REMOTE_PI_DIRECT_CONFIG` env wins over the file. An
-  // unset/empty/malformed env falls through to the on-disk config.json.
+  // Inline runtime config wins for its non-policy fields. Operator-owned child
+  // policy is merged only from a protected on-disk inspection.
   const direct = directConfig();
-  if (direct) return direct;
+  if (direct) {
+    const protectedConfig = inspectLocalConfig(cwd);
+    return protectedConfig.state === "loaded" && protectedConfig.config.child_exposure
+      ? { ...direct, child_exposure: protectedConfig.config.child_exposure }
+      : direct;
+  }
 
   const inspected = inspectLocalConfig(cwd);
   if (inspected.state === "repair_required") {
     // Corruption/security failures are never treated as a missing config: the
     // safe compatibility projection explicitly disables relay auto-start.
     return { auto_start_relay: false };
+  }
+  if (inspected.state === "legacy") {
+    const { child_exposure: _unversionedChildPolicy, ...legacyConfig } = inspected.config;
+    return legacyConfig;
   }
   return inspected.config;
 }
@@ -437,6 +457,12 @@ export function inspectLocalConfig(cwd: string): LocalConfigInspection {
   if (value["auto_start_relay"] !== undefined && typeof value["auto_start_relay"] !== "boolean") {
     return repair("auto_start_relay must be a boolean when present");
   }
+  if (value["child_exposure"] !== undefined
+    && value["child_exposure"] !== "off"
+    && value["child_exposure"] !== "local"
+    && value["child_exposure"] !== "relay") {
+    return repair("child_exposure must be off, local, or relay when present");
+  }
   const rawAgentName = value["agent_name"];
   if (typeof rawAgentName === "string" && (!rawAgentName.trim()
     || /[\\/]/.test(rawAgentName)
@@ -460,7 +486,7 @@ export function inspectLocalConfig(cwd: string): LocalConfigInspection {
     return { state: "legacy", config, revision: 0, path: p, hash };
   }
 
-  const allowedVersionedKeys = new Set(["schema_version", "revision", "workspace_id", "agent_name", "auto_start_relay"]);
+  const allowedVersionedKeys = new Set(["schema_version", "revision", "workspace_id", "agent_name", "auto_start_relay", "child_exposure"]);
   const unknown = Object.keys(value).find((key) => !allowedVersionedKeys.has(key));
   if (unknown) return repair(`versioned config contains unknown durable field '${unknown}'`);
   if (value["schema_version"] !== 1 || validRevision === 0 || !validWorkspaceId) {
@@ -547,13 +573,19 @@ export function saveLocalConfig(cwd: string, patch: Partial<LocalConfig>, option
   const patchKeys = Object.keys(patch as Record<string, unknown>);
   const unsafePatchKey = patchKeys.find((key) => FORBIDDEN_DURABLE_KEY.test(key));
   if (unsafePatchKey) throw new LocalConfigSecurityError(`forbidden durable field '${unsafePatchKey}'`);
-  const unknownPatchKey = patchKeys.find((key) => key !== "agent_name" && key !== "auto_start_relay");
+  const unknownPatchKey = patchKeys.find((key) => key !== "agent_name" && key !== "auto_start_relay" && key !== "child_exposure");
   if (unknownPatchKey) throw new LocalConfigSecurityError(`unknown durable field '${unknownPatchKey}'`);
   if (patch.agent_name !== undefined && (typeof patch.agent_name !== "string" || !sanitizeSegment(patch.agent_name))) {
     throw new LocalConfigSecurityError("agent_name must be a non-empty safe string");
   }
   if (patch.auto_start_relay !== undefined && typeof patch.auto_start_relay !== "boolean") {
     throw new LocalConfigSecurityError("auto_start_relay must be a boolean");
+  }
+  if (patch.child_exposure !== undefined
+    && patch.child_exposure !== "off"
+    && patch.child_exposure !== "local"
+    && patch.child_exposure !== "relay") {
+    throw new LocalConfigSecurityError("child_exposure must be off, local, or relay");
   }
 
   // Path/symlink failures are security failures, never repairable content.

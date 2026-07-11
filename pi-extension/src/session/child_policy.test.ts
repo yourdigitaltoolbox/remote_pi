@@ -2,6 +2,7 @@ import { describe, expect, test } from "vitest";
 import {
   CHILD_DESCRIPTOR_ENV,
   LEGACY_CHILD_ENV,
+  effectiveExposureForStatus,
   resolveSessionExposure,
   type ChildSessionDescriptorV1,
 } from "./child_policy.js";
@@ -17,6 +18,7 @@ function descriptor(overrides: Partial<ChildSessionDescriptorV1> = {}): ChildSes
     processEpoch: "22222222-2222-4222-8222-222222222222",
     index: 0,
     requestedExposure: "local",
+    intentSource: "run",
     producer: {
       name: "pi-subagents",
       version: "0.34.0",
@@ -58,22 +60,71 @@ describe("child session exposure policy", () => {
     });
   });
 
-  test("a valid current descriptor classifies the child but does not self-authorize relay", () => {
-    const env = {
-      [CHILD_DESCRIPTOR_ENV]: JSON.stringify(descriptor({ requestedExposure: "relay" })),
-    };
-    const policy = resolveSessionExposure(env, { auto_start_relay: true });
-    expect(policy.classification).toBe("child_current");
-    expect(policy.mode).toBe("local");
-    expect(policy.source).toBe("descriptor");
-    expect(policy.descriptor).toMatchObject({
-      runId: "run-1",
-      workspaceId: "33333333-3333-4333-8333-333333333333",
-      processEpoch: "22222222-2222-4222-8222-222222222222",
-      producer: { name: "pi-subagents", protocolVersion: 1 },
-      compatibility: { remotePi: { state: "compatible", protocolVersion: 1 } },
+  test("status requires a current child lease before reporting effective relay", () => {
+    const child = resolveSessionExposure({
+      [CHILD_DESCRIPTOR_ENV]: JSON.stringify(descriptor({ requestedExposure: "relay", intentSource: "run" })),
     });
-    expect(policy.diagnostic).toContain("relay authorization");
+    expect(effectiveExposureForStatus(child, true, false)).toBe("local");
+    expect(effectiveExposureForStatus(child, true, true)).toBe("relay");
+    expect(effectiveExposureForStatus(child, false, true)).toBe("local");
+
+    const staleChild = resolveSessionExposure({ [LEGACY_CHILD_ENV]: "1" }, { auto_start_relay: true });
+    expect(effectiveExposureForStatus(staleChild, true, false)).toBe("local");
+    expect(effectiveExposureForStatus(staleChild, true, true)).toBe("local");
+
+    const normal = resolveSessionExposure({}, { auto_start_relay: true });
+    expect(effectiveExposureForStatus(normal, true, false)).toBe("relay");
+  });
+
+  test("reports explicit run and agent intent before remote-pi defaults without self-authorizing relay", () => {
+    for (const [intentSource, source] of [["run", "run-request"], ["agent", "agent-default"]] as const) {
+      const env = {
+        [CHILD_DESCRIPTOR_ENV]: JSON.stringify(descriptor({ requestedExposure: "relay", intentSource })),
+      };
+      const policy = resolveSessionExposure(env, { auto_start_relay: true, child_exposure: "off" });
+      expect(policy.classification).toBe("child_current");
+      expect(policy.mode).toBe("local");
+      expect(policy.requestedMode).toBe("relay");
+      expect(policy.source).toBe(source);
+      expect(policy.descriptor).toMatchObject({
+        runId: "run-1",
+        workspaceId: "33333333-3333-4333-8333-333333333333",
+        processEpoch: "22222222-2222-4222-8222-222222222222",
+        intentSource,
+        producer: { name: "pi-subagents", protocolVersion: 1 },
+        compatibility: { remotePi: { state: "compatible", protocolVersion: 1 } },
+      });
+      expect(policy.diagnostic).toContain("relay authorization");
+    }
+  });
+
+  test("uses remote-pi child policy then the built-in local fallback when launcher intent is absent", () => {
+    const env = { [CHILD_DESCRIPTOR_ENV]: JSON.stringify(descriptor({ intentSource: "fallback" })) };
+    expect(resolveSessionExposure(env, { child_exposure: "off", auto_start_relay: true })).toMatchObject({
+      classification: "child_current", mode: "off", requestedMode: "off", source: "remote-child-policy",
+    });
+    expect(resolveSessionExposure(env, { child_exposure: "local", auto_start_relay: true })).toMatchObject({
+      classification: "child_current", mode: "local", requestedMode: "local", source: "remote-child-policy",
+    });
+    expect(resolveSessionExposure(env, { child_exposure: "relay", auto_start_relay: false })).toMatchObject({
+      classification: "child_current", mode: "local", requestedMode: "relay", source: "remote-child-policy",
+    });
+    expect(resolveSessionExposure(env, { auto_start_relay: true })).toMatchObject({
+      classification: "child_current", mode: "local", requestedMode: "local", source: "built-in-local",
+    });
+  });
+
+  test("keeps source-less v1 descriptors compatible and fails invalid intent sources closed", () => {
+    const compatible = descriptor({ requestedExposure: "local" });
+    delete compatible.intentSource;
+    expect(resolveSessionExposure({ [CHILD_DESCRIPTOR_ENV]: JSON.stringify(compatible) }, {})).toMatchObject({
+      classification: "child_current", mode: "local", requestedMode: "local", source: "descriptor",
+    });
+    expect(resolveSessionExposure({
+      [CHILD_DESCRIPTOR_ENV]: JSON.stringify({ ...descriptor(), intentSource: "cwd-relay" }),
+    }, { child_exposure: "relay" })).toMatchObject({
+      classification: "child_invalid", mode: "local", source: "invalid-descriptor",
+    });
   });
 
   test("rejects a valid-looking preflight identity that does not match the loaded package", () => {

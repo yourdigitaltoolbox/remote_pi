@@ -1,12 +1,14 @@
-import { isRelayExposureBinding, type RelayExposureBinding, type RelayExposureNormalCloseReason } from "./relay_exposure_lease.js";
+import { isRelayExposureBinding, type RelayExposureBinding, type RelayExposureIntentSource, type RelayExposureNormalCloseReason } from "./relay_exposure_lease.js";
 
 const UUID_PATTERN = /^[0-9a-f]{8}-[0-9a-f]{4}-[1-5][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i;
 const RUNNER_TOKEN_PATTERN = /^rprd1\.([0-9a-f-]{36})\.([A-Za-z0-9_-]{43})$/;
 const MAX_RUN_ID_BYTES = 512;
-const DELEGATE_KEYS = new Set(["type", "version", "rootRunId", "workspaceId", "delegationTtlMs", "maxLeaseTtlMs", "maxChildIssues"]);
+const DELEGATE_KEYS = new Set(["type", "version", "rootRunId", "workspaceId", "delegationTtlMs", "maxLeaseTtlMs", "maxChildIssues", "intentSources"]);
+const LEGACY_DELEGATE_KEYS = new Set(["type", "version", "rootRunId", "workspaceId", "delegationTtlMs", "maxLeaseTtlMs", "maxChildIssues"]);
 const DELEGATE_SUCCESS_KEYS = new Set(["type", "version", "ok", "token", "expiresAt", "maxLeaseTtlMs", "maxChildIssues"]);
 const DELEGATE_FAILURE_KEYS = new Set(["type", "version", "ok", "reason"]);
-const ISSUE_KEYS = new Set(["type", "version", "requestId", "token", "binding", "ttlMs"]);
+const ISSUE_KEYS = new Set(["type", "version", "requestId", "token", "binding", "ttlMs", "intentSource"]);
+const LEGACY_ISSUE_KEYS = new Set(["type", "version", "requestId", "token", "binding", "ttlMs"]);
 const RENEW_KEYS = new Set(["type", "version", "requestId", "token", "relayExposureLeaseId", "renewalId", "binding", "ttlMs"]);
 const REVOKE_KEYS = new Set(["type", "version", "requestId", "token", "relayExposureLeaseId", "binding"]);
 const CLOSE_KEYS = new Set(["type", "version", "requestId", "token", "relayExposureLeaseId", "binding", "reason"]);
@@ -30,6 +32,16 @@ function uuid(value: unknown): value is string {
   return typeof value === "string" && UUID_PATTERN.test(value);
 }
 
+function intentSource(value: unknown): value is RelayExposureIntentSource {
+  return value === "run" || value === "agent" || value === "fallback";
+}
+
+function intentSources(value: unknown): RelayExposureIntentSource[] | undefined {
+  if (!Array.isArray(value) || value.length === 0 || value.length > 3 || !value.every(intentSource)) return undefined;
+  const unique = [...new Set(value)];
+  return unique.length === value.length ? unique : undefined;
+}
+
 export function isRelayRunnerDelegationToken(value: unknown): value is string {
   if (typeof value !== "string") return false;
   const match = RUNNER_TOKEN_PATTERN.exec(value);
@@ -44,6 +56,7 @@ export interface RelayRunnerDelegateRequest {
   delegationTtlMs: number;
   maxLeaseTtlMs: number;
   maxChildIssues: number;
+  intentSources: RelayExposureIntentSource[];
 }
 
 export type RelayRunnerDelegateResult =
@@ -57,19 +70,25 @@ interface RunnerBase {
 }
 
 export type RelayRunnerRequest =
-  | (RunnerBase & { type: "relay_runner_issue"; binding: RelayExposureBinding; ttlMs: number })
+  | (RunnerBase & { type: "relay_runner_issue"; binding: RelayExposureBinding; ttlMs: number; intentSource: RelayExposureIntentSource })
   | (RunnerBase & { type: "relay_runner_renew"; relayExposureLeaseId: string; renewalId: string; binding: RelayExposureBinding; ttlMs: number })
   | (RunnerBase & { type: "relay_runner_revoke"; relayExposureLeaseId: string; binding: RelayExposureBinding })
   | (RunnerBase & { type: "relay_runner_close"; relayExposureLeaseId: string; binding: RelayExposureBinding; reason: RelayExposureNormalCloseReason })
   | (RunnerBase & { type: "relay_runner_release" });
 
 export function parseRelayRunnerDelegateRequest(value: unknown): RelayRunnerDelegateRequest | undefined {
-  if (!value || typeof value !== "object" || Array.isArray(value) || !exact(value, DELEGATE_KEYS)) return undefined;
+  if (!value || typeof value !== "object" || Array.isArray(value)
+    || (!exact(value, DELEGATE_KEYS) && !exact(value, LEGACY_DELEGATE_KEYS))) return undefined;
   const input = value as Partial<RelayRunnerDelegateRequest>;
   if (input.type !== "relay_runner_delegate" || input.version !== 1) return undefined;
   if (typeof input.rootRunId !== "string" || !input.rootRunId.trim() || Buffer.byteLength(input.rootRunId, "utf8") > MAX_RUN_ID_BYTES) return undefined;
   if (!uuid(input.workspaceId) || !positiveInteger(input.delegationTtlMs) || !positiveInteger(input.maxLeaseTtlMs) || !positiveInteger(input.maxChildIssues)) return undefined;
-  return input as RelayRunnerDelegateRequest;
+  // Pre-D8 runners omitted source metadata. They could not request protected
+  // policy fallback, so retain compatibility at the least-privileged explicit
+  // layer instead of upgrading the unknown source to `run`.
+  const sources = input.intentSources === undefined ? ["agent" as const] : intentSources(input.intentSources);
+  if (!sources) return undefined;
+  return { ...input, intentSources: sources } as RelayRunnerDelegateRequest;
 }
 
 export function parseRelayRunnerDelegateResult(value: unknown): RelayRunnerDelegateResult | undefined {
@@ -101,7 +120,9 @@ export function parseRelayRunnerRequest(value: unknown): RelayRunnerRequest | un
   if (input.type === "relay_runner_release") return exact(value, RELEASE_KEYS) ? input as unknown as RelayRunnerRequest : undefined;
   if (!isRelayExposureBinding(input.binding)) return undefined;
   if (input.type === "relay_runner_issue") {
-    return exact(value, ISSUE_KEYS) && positiveInteger(input.ttlMs) ? input as unknown as RelayRunnerRequest : undefined;
+    if ((!exact(value, ISSUE_KEYS) && !exact(value, LEGACY_ISSUE_KEYS)) || !positiveInteger(input.ttlMs)) return undefined;
+    if (input.intentSource !== undefined && !intentSource(input.intentSource)) return undefined;
+    return { ...input, intentSource: input.intentSource ?? "agent" } as unknown as RelayRunnerRequest;
   }
   if (input.type === "relay_runner_renew") {
     return exact(value, RENEW_KEYS) && uuid(input.relayExposureLeaseId) && uuid(input.renewalId) && positiveInteger(input.ttlMs)

@@ -99,6 +99,7 @@ import {
 } from "./session/local_config.js";
 import { runSetupWizard, type WizardUI } from "./session/setup_wizard.js";
 import {
+  effectiveExposureForStatus,
   isChildSession,
   resolveSessionExposure,
   type SessionExposurePolicy,
@@ -1660,6 +1661,7 @@ async function _handlePairRequest(
 // session replacement (newSession/fork/switch/reload). We re-capture it via
 // `withSession` when WE drive a newSession (see the session_new dispatch).
 let _lastCtx: Pick<ExtensionContext, "ui" | "abort" | "cwd"> | null = null;
+let _sessionCwd: string | null = null;
 // Freshest base ExtensionContext, re-captured on EVERY `session_start`
 // (startup/new/fork/reload/resume). The session_start ctx is always bound to
 // the CURRENT session, so compact + cancel (base-ctx methods) routed through
@@ -1710,56 +1712,70 @@ function _registerRelayExposureRpc(pi: ExtensionAPI): void {
         if (!_meshNode) {
           reply = { version: 1, requestId: request.requestId, success: false, reason: "local_mesh_unavailable" };
         } else if (request.method === "delegate_runner") {
-          const envelope = await _meshNode.request("broker", {
-            type: "relay_runner_delegate",
-            version: 1,
-            rootRunId: request.rootRunId,
-            workspaceId: request.workspaceId,
-            delegationTtlMs: request.delegationTtlMs,
-            maxLeaseTtlMs: request.maxLeaseTtlMs,
-            maxChildIssues: request.maxChildIssues,
-          }, 2_000);
-          const result = parseRelayRunnerDelegateResult(envelope.body);
-          reply = result?.ok === true
-            ? {
-                version: 1,
-                requestId: request.requestId,
-                success: true,
-                ok: true,
-                token: result.token,
-                socketPath: sessionSockPath(LOCAL_SESSION_NAME),
-                expiresAt: result.expiresAt,
-                maxLeaseTtlMs: result.maxLeaseTtlMs,
-                maxChildIssues: result.maxChildIssues,
-              }
-            : {
-                version: 1,
-                requestId: request.requestId,
-                success: false,
-                reason: result?.reason ?? "invalid_broker_reply",
-              };
+          const policy = inspectLocalConfig(_lastCtx?.cwd ?? _sessionCwd ?? process.cwd());
+          const childPolicy = policy.state === "loaded" ? policy.config.child_exposure : undefined;
+          const allowedIntentSources = request.intentSources.filter((source) => source !== "fallback" || childPolicy === "relay");
+          if (allowedIntentSources.length === 0) {
+            reply = { version: 1, requestId: request.requestId, success: false, reason: "policy_denied" };
+          } else {
+            const envelope = await _meshNode.request("broker", {
+              type: "relay_runner_delegate",
+              version: 1,
+              rootRunId: request.rootRunId,
+              workspaceId: request.workspaceId,
+              delegationTtlMs: request.delegationTtlMs,
+              maxLeaseTtlMs: request.maxLeaseTtlMs,
+              maxChildIssues: request.maxChildIssues,
+              intentSources: allowedIntentSources,
+            }, 2_000);
+            const result = parseRelayRunnerDelegateResult(envelope.body);
+            reply = result?.ok === true
+              ? {
+                  version: 1,
+                  requestId: request.requestId,
+                  success: true,
+                  ok: true,
+                  token: result.token,
+                  socketPath: sessionSockPath(LOCAL_SESSION_NAME),
+                  expiresAt: result.expiresAt,
+                  maxLeaseTtlMs: result.maxLeaseTtlMs,
+                  maxChildIssues: result.maxChildIssues,
+                }
+              : {
+                  version: 1,
+                  requestId: request.requestId,
+                  success: false,
+                  reason: result?.reason ?? "invalid_broker_reply",
+                };
+          }
         } else if (request.method === "issue") {
-          const envelope = await _meshNode.request("broker", {
-            type: "relay_lease_issue",
-            binding: request.binding,
-            ttlMs: request.ttlMs,
-          }, 2_000);
-          const result = parseRelayExposureIssueBrokerReply(envelope.body);
-          reply = result?.ok === true
-            ? {
-                version: 1,
-                requestId: request.requestId,
-                success: true,
-                ok: true,
-                capability: result.capability,
-                lease: result.lease,
-              }
-            : {
-                version: 1,
-                requestId: request.requestId,
-                success: false,
-                reason: result?.reason ?? "invalid_broker_reply",
-              };
+          const policy = inspectLocalConfig(_lastCtx?.cwd ?? _sessionCwd ?? process.cwd());
+          const childPolicy = policy.state === "loaded" ? policy.config.child_exposure : undefined;
+          if (request.intentSource === "fallback" && childPolicy !== "relay") {
+            reply = { version: 1, requestId: request.requestId, success: false, reason: "policy_denied" };
+          } else {
+            const envelope = await _meshNode.request("broker", {
+              type: "relay_lease_issue",
+              binding: request.binding,
+              ttlMs: request.ttlMs,
+            }, 2_000);
+            const result = parseRelayExposureIssueBrokerReply(envelope.body);
+            reply = result?.ok === true
+              ? {
+                  version: 1,
+                  requestId: request.requestId,
+                  success: true,
+                  ok: true,
+                  capability: result.capability,
+                  lease: result.lease,
+                }
+              : {
+                  version: 1,
+                  requestId: request.requestId,
+                  success: false,
+                  reason: result?.reason ?? "invalid_broker_reply",
+                };
+          }
         } else if (request.method === "promote") {
           const envelope = await _meshNode.request("broker", {
             type: "relay_lease_promote",
@@ -2054,6 +2070,7 @@ const extension: ExtensionFactory = (pi: ExtensionAPI): void => {
   // bound to the current session.
   pi.on("session_start", (_event, ctx) => {
     _lastEventCtx = ctx;
+    if ("cwd" in ctx && typeof ctx.cwd === "string") _sessionCwd = ctx.cwd;
     const sessionId = _sessionIdFromContext(ctx);
     if (_disposed || !_runtimeSessionId || (sessionId && sessionId !== _runtimeSessionId)) {
       if (_runtimeIdentity) _runtimeEpochFence.retire(_runtimeIdentity);
@@ -2197,7 +2214,8 @@ const extension: ExtensionFactory = (pi: ExtensionAPI): void => {
         "pair", "devices", "revoke",
         "rename",
         "set-relay",
-        "relay-parent authorize",
+        "child-policy off", "child-policy local", "child-policy relay",
+        "relay-parent authorize", "relay-parent revoke",
         "peers",  // plan/25 Wave D — local + cross-PC inventory
         "create", "remove", "daemons",  // daemon registry (plan/26 W1)
         // Fleet ops use the `daemon` prefix so `/remote-pi stop` keeps
@@ -2222,7 +2240,9 @@ const extension: ExtensionFactory = (pi: ExtensionAPI): void => {
       else if (sub.startsWith("revoke"))         { await _cmdRevoke(sub.slice("revoke".length).trim(), ctx); }
       else if (sub.startsWith("set-relay"))      { _cmdSetRelay(sub.slice("set-relay".length).trim(), ctx); }
       else if (sub === "rename" || sub.startsWith("rename ")) { await _renameAgent(sub.slice("rename".length).trim(), { persist: true }); }
+      else if (sub === "child-policy" || sub.startsWith("child-policy ")) { await _cmdChildPolicy(sub.slice("child-policy".length).trim(), ctx); }
       else if (sub === "relay-parent authorize" || sub.startsWith("relay-parent authorize ")) { _cmdAuthorizeRelayParent(sub.slice("relay-parent authorize".length).trim(), ctx); }
+      else if (sub === "relay-parent revoke" || sub.startsWith("relay-parent revoke ")) { await _cmdDeauthorizeRelayParent(sub.slice("relay-parent revoke".length).trim(), ctx); }
       else if (sub === "peers")                  { await _cmdPeers(ctx); }
       else if (sub.startsWith("create"))         { await _cmdCreate(sub.slice("create".length).trim(), ctx); }
       else if (sub.startsWith("remove"))         { await _cmdRemove(sub.slice("remove".length).trim(), ctx); }
@@ -2254,9 +2274,17 @@ const extension: ExtensionFactory = (pi: ExtensionAPI): void => {
     handler: async (args, ctx) => { _lastCtx = ctx; await _cmdRevoke(args.trim(), ctx); },
   });
   pi.registerCommand("remote-pi set-relay", { description: "Persist a new relay URL to user config", handler: async (args, ctx) => { _lastCtx = ctx; _cmdSetRelay(args.trim(), ctx); } });
+  pi.registerCommand("remote-pi child-policy", {
+    description: "Set the operator-owned project child default: off, local, or relay",
+    handler: async (args, ctx) => { _lastCtx = ctx; await _cmdChildPolicy(args.trim(), ctx); },
+  });
   pi.registerCommand("remote-pi relay-parent authorize", {
     description: "Explicitly delegate relay issuance to one live parent connection (broker leader only)",
     handler: async (args, ctx) => { _lastCtx = ctx; _cmdAuthorizeRelayParent(args.trim(), ctx); },
+  });
+  pi.registerCommand("remote-pi relay-parent revoke", {
+    description: "Withdraw relay issuance delegation and revoke active child exposure leases",
+    handler: async (args, ctx) => { _lastCtx = ctx; await _cmdDeauthorizeRelayParent(args.trim(), ctx); },
   });
 
   // Plan/25 Wave D
@@ -2303,6 +2331,52 @@ export default extension;
 
 // ── Command implementations ───────────────────────────────────────────────────
 
+async function _cmdChildPolicy(
+  requestedMode: string,
+  ctx: Pick<ExtensionContext, "ui" | "cwd">,
+): Promise<void> {
+  const exposure = _sessionExposure(ctx.cwd);
+  if (isChildSession(exposure)) {
+    ctx.ui.notify("[remote-pi] Child sessions cannot persist operator policy.", "warning");
+    return;
+  }
+  if (requestedMode !== "off" && requestedMode !== "local" && requestedMode !== "relay") {
+    ctx.ui.notify("[remote-pi] Usage: /remote-pi child-policy <off|local|relay>.", "warning");
+    return;
+  }
+  const inspection = inspectLocalConfig(ctx.cwd);
+  if (inspection.state === "repair_required") {
+    ctx.ui.notify(`[remote-pi] Protected config needs explicit repair before policy changes: ${inspection.diagnostic}`, "warning");
+    return;
+  }
+  if (requestedMode !== "relay") {
+    // A persisted relay fallback may have authorized parents/leases in another
+    // live process for this workspace. Never claim withdrawal succeeded merely
+    // because this command process has not joined the mesh.
+    if (!_meshNode && inspection.state === "loaded" && inspection.config.child_exposure === "relay") {
+      ctx.ui.notify("[remote-pi] Join the local mesh before lowering relay child policy so workspace authority withdrawal can be confirmed; policy was not changed.", "warning");
+      return;
+    }
+    if (_meshNode && !await _withdrawRelayWorkspacePolicy(ctx)) return;
+  }
+  try {
+    saveLocalConfig(ctx.cwd, { child_exposure: requestedMode }, {
+      expectedRevision: inspection.revision,
+      expectedState: inspection.state,
+      expectedHash: "hash" in inspection ? inspection.hash ?? null : null,
+    });
+  } catch (error) {
+    ctx.ui.notify(`[remote-pi] Child policy update failed after relay authority was safely withdrawn: ${error instanceof Error ? error.message : String(error)}`, "error");
+    return;
+  }
+  ctx.ui.notify(
+    requestedMode === "relay"
+      ? "[remote-pi] Child default is relay-requested. A separate live relay-parent authorization is still required."
+      : `[remote-pi] Child default is ${requestedMode}; live parent delegation and child relay leases were withdrawn.`,
+    "info",
+  );
+}
+
 function _cmdAuthorizeRelayParent(
   requestedRoute: string,
   ctx: Pick<ExtensionContext, "ui">,
@@ -2317,12 +2391,87 @@ function _cmdAuthorizeRelayParent(
     return;
   }
   const route = requestedRoute || _meshNode.address();
-  const result = broker.authorizeRelayParent(route);
+  if (!_runtimeIdentity) {
+    ctx.ui.notify("[remote-pi] Runtime identity is unavailable; relay-parent authorization failed closed.", "warning");
+    return;
+  }
+  const result = broker.authorizeRelayParent(route, {}, _runtimeIdentity.workspaceId);
   if (!result.ok) {
     ctx.ui.notify(`[remote-pi] Could not authorize relay parent '${route}': ${result.reason}.`, "warning");
     return;
   }
   ctx.ui.notify(`[remote-pi] Relay parent authorized for this live connection: ${route}. The delegation is transient and ends on disconnect or broker restart.`, "info");
+}
+
+async function _withdrawRelayWorkspacePolicy(
+  ctx: Pick<ExtensionContext, "ui">,
+): Promise<boolean> {
+  if (!_meshNode) return true;
+  if (!_runtimeIdentity) {
+    ctx.ui.notify("[remote-pi] Runtime identity is unavailable; child-policy withdrawal failed closed and was not persisted.", "warning");
+    return false;
+  }
+  const broker = _meshNode.localBroker();
+  if (broker) {
+    const result = broker.deauthorizeRelayWorkspace(_runtimeIdentity.workspaceId);
+    ctx.ui.notify(`[remote-pi] Withdrew relay delegation for ${result.revokedParents} parent connection(s) in this workspace.`, "info");
+    return true;
+  }
+  try {
+    const reply = await _meshNode.request("broker", { type: "relay_policy_withdraw" }, 2_000);
+    const body = reply.body as Record<string, unknown> | null;
+    if (!body
+      || Object.keys(body).length !== 3
+      || body["type"] !== "relay_policy_withdraw_result"
+      || body["ok"] !== true
+      || typeof body["revokedParents"] !== "number"
+      || !Number.isSafeInteger(body["revokedParents"])
+      || body["revokedParents"] < 0) {
+      ctx.ui.notify("[remote-pi] Broker rejected child-policy withdrawal; the policy change was not persisted.", "warning");
+      return false;
+    }
+    ctx.ui.notify(`[remote-pi] Withdrew relay delegation for ${body["revokedParents"]} parent connection(s) in this workspace.`, "info");
+    return true;
+  } catch {
+    ctx.ui.notify("[remote-pi] Child-policy withdrawal could not reach the broker; the policy change was not persisted.", "warning");
+    return false;
+  }
+}
+
+async function _cmdDeauthorizeRelayParent(
+  requestedRoute: string,
+  ctx: Pick<ExtensionContext, "ui">,
+): Promise<void> {
+  if (!_meshNode) {
+    ctx.ui.notify("[remote-pi] No live local mesh parent delegation exists.", "info");
+    return;
+  }
+  const broker = _meshNode.localBroker();
+  if (broker) {
+    const route = requestedRoute || _meshNode.address();
+    const result = broker.deauthorizeRelayParent(route);
+    if (!result.ok) {
+      ctx.ui.notify(`[remote-pi] Could not revoke relay parent '${route}': ${result.reason}.`, "warning");
+      return;
+    }
+    ctx.ui.notify(`[remote-pi] Relay parent delegation revoked for ${route}; active child relay leases are closing.`, "info");
+    return;
+  }
+  if (requestedRoute && requestedRoute !== _meshNode.address()) {
+    ctx.ui.notify("[remote-pi] Only the broker leader can revoke another parent route; this process can revoke itself.", "warning");
+    return;
+  }
+  try {
+    const reply = await _meshNode.request("broker", { type: "relay_parent_deauthorize" }, 2_000);
+    const body = reply.body as Record<string, unknown> | null;
+    if (!body || Object.keys(body).length !== 2 || body["type"] !== "relay_parent_deauthorize_result" || body["ok"] !== true) {
+      ctx.ui.notify("[remote-pi] Broker rejected relay-parent revocation.", "warning");
+      return;
+    }
+    ctx.ui.notify("[remote-pi] Relay parent delegation revoked; active child relay leases are closing.", "info");
+  } catch {
+    ctx.ui.notify("[remote-pi] Relay-parent revocation failed closed because the broker is unavailable.", "warning");
+  }
 }
 
 /**
@@ -2360,7 +2509,15 @@ function _cmdStatus(ctx: Pick<ExtensionContext, "ui"> & Partial<Pick<ExtensionCo
       : `🟡 Relay: on, waiting for first pairing (${relayUrl})`;
   }
 
-  const exposureLine = `Exposure: ${exposure.mode} (${exposure.classification}, source: ${exposure.source})`;
+  const requestedExposure = exposure.requestedMode ?? exposure.mode;
+  const hasCurrentChildLease = _relayExposureLease !== null
+    && _relayExposureLeaseMatchesCurrentChild(_relayExposureLease, exposure);
+  const effectiveExposure = effectiveExposureForStatus(
+    exposure,
+    _state === "started",
+    hasCurrentChildLease,
+  );
+  const exposureLine = `Exposure: effective ${effectiveExposure}; requested ${requestedExposure} (${exposure.classification}, source: ${exposure.source})`;
   const descriptorLine = exposure.descriptor
     ? `\n  Launcher: ${exposure.descriptor.producer.name}@${exposure.descriptor.producer.version} protocol v${exposure.descriptor.producer.protocolVersion} (${exposure.descriptor.producer.manifestSha256.slice(0, 12)})`
       + (exposure.descriptor.compatibility.remotePi.state === "compatible"
@@ -2424,7 +2581,7 @@ async function _cmdRoot(ctx: Pick<ExtensionContext, "ui" | "cwd">): Promise<void
   if (!localConfigExists(cwd) && isChildSession(exposure)) {
     if (exposure.mode !== "off" && !_meshNode) await _cmdJoin(ctx);
     if (exposure.classification === "child_current"
-      && exposure.descriptor?.requestedExposure === "relay"
+      && exposure.requestedMode === "relay"
       && _state === "idle") {
       await _cmdStart(ctx);
     }
@@ -2486,7 +2643,7 @@ async function _cmdRoot(ctx: Pick<ExtensionContext, "ui" | "cwd">): Promise<void
   // instance owns the live connect).
   if (_disposed) return;
   const shouldStartRelay = isChildSession(exposure)
-    ? exposure.classification === "child_current" && exposure.descriptor?.requestedExposure === "relay"
+    ? exposure.classification === "child_current" && exposure.requestedMode === "relay"
     : exposure.mode === "relay" && effectiveAutoStartRelay(config);
   if (shouldStartRelay && _state === "idle") await _cmdStart(ctx);
   _cmdStatus(ctx);
@@ -2546,7 +2703,7 @@ type ChildRelayActivation =
 
 async function _activateCurrentChildRelay(exposure: SessionExposurePolicy): Promise<ChildRelayActivation> {
   const descriptor = exposure.descriptor;
-  if (exposure.classification !== "child_current" || descriptor?.requestedExposure !== "relay") {
+  if (exposure.classification !== "child_current" || exposure.requestedMode !== "relay" || !descriptor) {
     return { ok: false, reason: "relay_not_requested" };
   }
   if (!_meshNode || !_runtimeIdentity) return { ok: false, reason: "local_mesh_unavailable" };

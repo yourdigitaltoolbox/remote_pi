@@ -40,12 +40,15 @@ export interface ParentDelegationOptions {
   maxLeaseTtlMs?: number;
 }
 
+export type RelayExposureIntentSource = "run" | "agent" | "fallback";
+
 export interface RunnerDelegationOptions {
   rootRunId: string;
   workspaceId: string;
   delegationTtlMs: number;
   maxLeaseTtlMs: number;
   maxChildIssues: number;
+  intentSources: readonly RelayExposureIntentSource[];
 }
 
 export type RunnerDelegationResult =
@@ -70,7 +73,7 @@ export type RunnerDelegationResult =
     };
 
 export type RunnerDelegationFailure =
-  | { ok: false; reason: "invalid_runner_delegation" | "runner_delegation_expired" | "runner_issue_capacity_exceeded" | "ttl_exceeds_runner_maximum" | "runner_lease_not_owned" }
+  | { ok: false; reason: "invalid_runner_delegation" | "runner_delegation_expired" | "runner_issue_capacity_exceeded" | "runner_intent_source_denied" | "ttl_exceeds_runner_maximum" | "runner_lease_not_owned" }
   | { ok: false; reason: "runner_binding_mismatch"; field: "runId" | "workspaceId" };
 
 export type RelayExposureIssueResult =
@@ -172,6 +175,7 @@ interface RunnerDelegation {
   maxLeaseTtlMs: number;
   maxChildIssues: number;
   childIssues: number;
+  allowedIntentSources: Set<RelayExposureIntentSource>;
   leaseIds: Set<string>;
 }
 
@@ -313,7 +317,7 @@ export class RelayExposureLeaseAuthority {
   private readonly maxRecords: number;
   private readonly maxRunnerDelegations: number;
   private readonly maxRunnerChildIssues: number;
-  private readonly delegations = new WeakMap<object, ParentDelegation>();
+  private readonly delegations = new Map<object, ParentDelegation>();
   private readonly runnerDelegationsByDigest = new Map<string, RunnerDelegation>();
   private readonly recordsByDigest = new Map<string, LeaseRecord>();
   private readonly recordsByLeaseId = new Map<string, LeaseRecord>();
@@ -443,7 +447,10 @@ export class RelayExposureLeaseAuthority {
     }
     const parent = this.delegations.get(parentConnection);
     if (!parent) return { ok: false, reason: "unauthorized_parent" };
-    if (parent.expiresAt <= now) return { ok: false, reason: "delegation_expired" };
+    if (parent.expiresAt <= now) {
+      this.delegations.delete(parentConnection);
+      return { ok: false, reason: "delegation_expired" };
+    }
     if (typeof options.rootRunId !== "string"
       || !options.rootRunId.trim()
       || Buffer.byteLength(options.rootRunId, "utf8") > MAX_RUN_ID_BYTES
@@ -464,6 +471,12 @@ export class RelayExposureLeaseAuthority {
       || options.maxChildIssues > this.maxRunnerChildIssues) {
       return { ok: false, reason: "invalid_child_issue_limit" };
     }
+    if (!Array.isArray(options.intentSources)
+      || options.intentSources.length === 0
+      || options.intentSources.some((source) => source !== "run" && source !== "agent" && source !== "fallback")) {
+      return { ok: false, reason: "invalid_runner_scope" };
+    }
+    const allowedIntentSources = new Set(options.intentSources);
     if (this.runnerDelegationsByDigest.size >= this.maxRunnerDelegations) {
       return { ok: false, reason: "runner_delegation_capacity_exceeded" };
     }
@@ -484,6 +497,7 @@ export class RelayExposureLeaseAuthority {
       maxLeaseTtlMs: options.maxLeaseTtlMs,
       maxChildIssues: options.maxChildIssues,
       childIssues: 0,
+      allowedIntentSources,
       leaseIds: new Set(),
     });
     return {
@@ -498,10 +512,11 @@ export class RelayExposureLeaseAuthority {
   issueForRunner(
     token: string,
     binding: RelayExposureBinding,
-    options: { ttlMs: number },
+    options: { ttlMs: number; intentSource: RelayExposureIntentSource },
   ): RelayExposureIssueResult | RunnerDelegationFailure {
     const runner = this.runnerDelegationForBinding(token, binding);
     if ("ok" in runner) return runner;
+    if (!runner.allowedIntentSources.has(options.intentSource)) return { ok: false, reason: "runner_intent_source_denied" };
     if (runner.childIssues >= runner.maxChildIssues) return { ok: false, reason: "runner_issue_capacity_exceeded" };
     if (!Number.isSafeInteger(options.ttlMs) || options.ttlMs <= 0) return { ok: false, reason: "invalid_ttl" };
     if (options.ttlMs > runner.maxLeaseTtlMs) return { ok: false, reason: "ttl_exceeds_runner_maximum" };
@@ -565,7 +580,10 @@ export class RelayExposureLeaseAuthority {
     return { ok: true, state: "released" };
   }
 
-  revokeParent(parentConnection: object): void {
+  revokeParent(
+    parentConnection: object,
+    reason: Extract<RelayExposureTransitionReason, "parent_revoked" | "parent_disconnected"> = "parent_disconnected",
+  ): void {
     this.delegations.delete(parentConnection);
     for (const [digest, runner] of this.runnerDelegationsByDigest) {
       if (runner.parentConnection === parentConnection) this.runnerDelegationsByDigest.delete(digest);
@@ -574,9 +592,23 @@ export class RelayExposureLeaseAuthority {
     this.prune(now);
     for (const record of this.recordsByDigest.values()) {
       if (record.parentConnection === parentConnection) {
-        this.terminate(record, "revoked", "parent_disconnected", now);
+        this.terminate(record, "revoked", reason, now);
       }
     }
+  }
+
+  /** Withdraw every live parent delegation in one exact workspace policy scope. */
+  revokeWorkspace(
+    workspaceId: string,
+    reason: Extract<RelayExposureTransitionReason, "parent_revoked"> = "parent_revoked",
+  ): number {
+    if (!UUID_PATTERN.test(workspaceId)) return 0;
+    const normalizedWorkspaceId = workspaceId.toLowerCase();
+    const parents = [...this.delegations.entries()]
+      .filter(([, delegation]) => delegation.parent.workspaceId.toLowerCase() === normalizedWorkspaceId)
+      .map(([connection]) => connection);
+    for (const parentConnection of parents) this.revokeParent(parentConnection, reason);
+    return parents.length;
   }
 
   issue(parentConnection: object, binding: RelayExposureBinding, options: { ttlMs: number }): RelayExposureIssueResult {
@@ -584,7 +616,10 @@ export class RelayExposureLeaseAuthority {
     if (!delegation) return { ok: false, reason: "unauthorized_parent" };
     const now = this.now();
     this.prune(now);
-    if (delegation.expiresAt <= now) return { ok: false, reason: "delegation_expired" };
+    if (delegation.expiresAt <= now) {
+      this.delegations.delete(parentConnection);
+      return { ok: false, reason: "delegation_expired" };
+    }
     if (!isRelayExposureBinding(binding)) return { ok: false, reason: "invalid_binding" };
     if (!Number.isSafeInteger(options.ttlMs) || options.ttlMs <= 0) return { ok: false, reason: "invalid_ttl" };
     if (options.ttlMs > delegation.maxLeaseTtlMs) return { ok: false, reason: "ttl_exceeds_maximum" };

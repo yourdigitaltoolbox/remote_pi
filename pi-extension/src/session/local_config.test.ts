@@ -38,8 +38,8 @@ describe("loadLocalConfig — file vs REMOTE_PI_DIRECT_CONFIG", () => {
     rmSync(cwd, { recursive: true, force: true });
   });
 
-  test("reads the on-disk file when env is unset", () => {
-    writeFileConfig(cwd, { agent_name: "fromfile", auto_start_relay: false });
+  test("reads legacy runtime fields but ignores unversioned child policy", () => {
+    writeFileConfig(cwd, { agent_name: "fromfile", auto_start_relay: false, child_exposure: "off" });
     expect(loadLocalConfig(cwd)).toEqual({ agent_name: "fromfile", auto_start_relay: false });
   });
 
@@ -70,9 +70,12 @@ describe("loadLocalConfig — file vs REMOTE_PI_DIRECT_CONFIG", () => {
     expect(loadLocalConfig(cwd)).toEqual({ agent_name: "fromfile" });
   });
 
-  test("only known fields are surfaced (unknown keys dropped)", () => {
-    process.env[ENV] = JSON.stringify({ agent_name: "a", auto_start_relay: true, session_name: "x", junk: 1 });
+  test("direct config surfaces runtime fields but cannot inject operator child policy", () => {
+    process.env[ENV] = JSON.stringify({ agent_name: "a", auto_start_relay: true, child_exposure: "relay", session_name: "x", junk: 1 });
     expect(loadLocalConfig(cwd)).toEqual({ agent_name: "a", auto_start_relay: true });
+
+    saveLocalConfig(cwd, { agent_name: "disk", child_exposure: "local" });
+    expect(loadLocalConfig(cwd)).toEqual({ agent_name: "a", auto_start_relay: true, child_exposure: "local" });
   });
 
   test("non-object env (array/number) falls back to the file", () => {
@@ -331,6 +334,13 @@ describe("saveLocalConfig — unaffected by env (still writes the file)", () => 
     saveLocalConfig(cwd, { agent_name: "saved" });
     delete process.env[ENV]; // ensure we read the file back, not any env
     expect(loadLocalConfig(cwd)).toEqual({ agent_name: "saved", auto_start_relay: true });
+  });
+
+  test("persists only valid operator-owned child exposure policy", () => {
+    saveLocalConfig(cwd, { agent_name: "saved", child_exposure: "relay" });
+    expect(loadLocalConfig(cwd)).toMatchObject({ agent_name: "saved", child_exposure: "relay" });
+    expect(() => saveLocalConfig(cwd, { child_exposure: "phone" } as never))
+      .toThrow(LocalConfigSecurityError);
   });
 
   test("never merges an ephemeral direct-config override into durable bytes", () => {

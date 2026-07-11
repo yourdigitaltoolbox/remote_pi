@@ -233,6 +233,16 @@ Cross-PC failure notes:
 
 ---
 
+## Child relay exposure is not mesh or YDTB authority
+
+A child may be visible on this local mesh while remaining absent from the phone
+relay. Do not infer relay permission from a descriptor, route, parent link,
+workspace/agent/process ID, runner token, or supervisor request. Child relay
+requires operator policy plus a separate bounded live-parent delegation and
+process lease; withdrawal, expiry, disconnect, and broker restart fail closed.
+These transport records never grant Git, credentials, writer, merge, publish,
+deploy, cleanup, or other YDTB/APEX authority.
+
 ## When in doubt
 
 - **Received a task you don't understand** → reply with `body.status:"error"`,

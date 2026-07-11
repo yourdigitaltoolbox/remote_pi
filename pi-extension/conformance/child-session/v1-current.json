@@ -15,6 +15,7 @@
     "parentAgentId": "33333333-3333-5333-8333-333333333333",
     "index": 2,
     "requestedExposure": "relay",
+    "intentSource": "run",
     "producer": {
       "name": "pi-subagents",
       "version": "0.34.0",
@@ -33,6 +34,6 @@
   "expected": {
     "classification": "child_current",
     "mode": "local",
-    "source": "descriptor"
+    "source": "run-request"
   }
 }

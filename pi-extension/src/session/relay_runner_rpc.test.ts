@@ -25,8 +25,12 @@ const token = `rprd1.44444444-4444-4444-8444-444444444444.${"a".repeat(43)}`;
       delegationTtlMs: 60_000,
       maxLeaseTtlMs: 30_000,
       maxChildIssues: 4,
+      intentSources: ["run", "fallback"],
     };
     expect(parseRelayRunnerDelegateRequest(request)).toEqual(request);
+    const { intentSources: _legacySources, ...legacyRequest } = request;
+    expect(parseRelayRunnerDelegateRequest(legacyRequest)).toEqual({ ...legacyRequest, intentSources: ["agent"] });
+    expect(parseRelayRunnerDelegateRequest({ ...request, intentSources: ["run", "run"] })).toBeUndefined();
     for (const extra of [{ capability: "forged" }, { workloadId: "forged" }, { nonce: "forged" }, { task: "secret" }]) {
       expect(parseRelayRunnerDelegateRequest({ ...request, ...extra })).toBeUndefined();
     }
@@ -48,8 +52,12 @@ const token = `rprd1.44444444-4444-4444-8444-444444444444.${"a".repeat(43)}`;
   });
 
   test("accepts exact issue, renew, close, revoke, and release requests only", () => {
+    const issue = { type: "relay_runner_issue", version: 1, requestId: "55555555-5555-4555-8555-555555555555", token, binding, ttlMs: 30_000, intentSource: "fallback" };
+    expect(parseRelayRunnerRequest(issue)).toEqual(issue);
+    const { intentSource: _legacySource, ...legacyIssue } = issue;
+    expect(parseRelayRunnerRequest(legacyIssue)).toEqual({ ...legacyIssue, intentSource: "agent" });
+    expect(parseRelayRunnerRequest({ ...issue, intentSource: "unknown" })).toBeUndefined();
     const requests = [
-      { type: "relay_runner_issue", version: 1, requestId: "55555555-5555-4555-8555-555555555555", token, binding, ttlMs: 30_000 },
       { type: "relay_runner_renew", version: 1, requestId: "55555555-5555-4555-8555-555555555555", token, relayExposureLeaseId: "66666666-6666-4666-8666-666666666666", renewalId: "77777777-7777-4777-8777-777777777777", binding, ttlMs: 30_000 },
       { type: "relay_runner_revoke", version: 1, requestId: "55555555-5555-4555-8555-555555555555", token, relayExposureLeaseId: "66666666-6666-4666-8666-666666666666", binding },
       { type: "relay_runner_close", version: 1, requestId: "55555555-5555-4555-8555-555555555555", token, relayExposureLeaseId: "66666666-6666-4666-8666-666666666666", binding, reason: "completed" },

@@ -31,6 +31,14 @@ async function makePeer(
   return peer;
 }
 
+async function waitFor(predicate: () => boolean, timeoutMs = 1_500): Promise<void> {
+  const deadline = Date.now() + timeoutMs;
+  while (!predicate()) {
+    if (Date.now() >= deadline) throw new Error(`condition not met within ${timeoutMs}ms`);
+    await wait(10);
+  }
+}
+
 async function runnerRpcBatch(sockPath: string, requests: Array<Record<string, unknown>>): Promise<Array<Record<string, unknown>>> {
   return new Promise((resolve, reject) => {
     const socket = createConnection({ path: sockPath });
@@ -1018,6 +1026,92 @@ describe("SessionPeer runtime identity", () => {
     await child.leave();
   });
 
+  test("lets a live parent withdraw its own delegation and closes every active child lease", async () => {
+    const sock = tmpSock();
+    const parent = await makePeer(
+      sock,
+      "parent-withdraw",
+      undefined,
+      identity("22222222-2222-4222-8222-222222222222", "33333333-3333-4333-8333-333333333333"),
+      "/workspace",
+    );
+    const child = await makePeer(
+      sock,
+      "child-withdraw",
+      undefined,
+      identity("44444444-4444-4444-8444-444444444444", "55555555-5555-4555-8555-555555555555"),
+      "/workspace",
+    );
+    const notices: Array<Record<string, unknown>> = [];
+    child.onMessage((env) => {
+      const body = env.body as Record<string, unknown> | null;
+      if (body?.["type"] === "relay_lease_closed") notices.push(body);
+    });
+    const broker = parent.localBroker()!;
+    broker.authorizeRelayParent(parent.address(), { delegationTtlMs: 120_000, maxLeaseTtlMs: 60_000 });
+    const binding = {
+      runId: "run-policy-withdrawal",
+      workspaceId,
+      agentId: child.identity()!.agentId,
+      processEpoch: child.identity()!.processEpoch,
+      mode: "relay" as const,
+    };
+    const promoted = await parent.request("broker", { type: "relay_lease_promote", binding, ttlMs: 30_000 }, 1000);
+    expect(promoted.body).toMatchObject({ ok: true, state: "promoted" });
+    const leaseId = (promoted.body as { lease: { relayExposureLeaseId: string } }).lease.relayExposureLeaseId;
+
+    const withdrawn = await parent.request("broker", { type: "relay_parent_deauthorize" }, 1000);
+    expect(withdrawn.body).toEqual({ type: "relay_parent_deauthorize_result", ok: true });
+    await waitFor(() => notices.length === 1);
+    expect(notices).toEqual([expect.objectContaining({
+      relayExposureLeaseId: leaseId,
+      reason: "parent_revoked",
+    })]);
+    expect((await parent.request("broker", { type: "relay_lease_issue", binding: { ...binding, runId: "after-withdrawal" }, ttlMs: 1_000 }, 1000)).body)
+      .toEqual({ type: "relay_lease_issue_result", ok: false, reason: "unauthorized_parent" });
+
+    await child.leave();
+    await parent.leave();
+  });
+
+  test("workspace policy withdrawal revokes every selected parent route and active child lease", async () => {
+    const sock = tmpSock();
+    const parentA = await makePeer(sock, "parent-policy-a", undefined, identity("22222222-2222-4222-8222-222222222222", "33333333-3333-4333-8333-333333333333"), "/workspace");
+    const parentB = await makePeer(sock, "parent-policy-b", undefined, identity("44444444-4444-4444-8444-444444444444", "55555555-5555-4555-8555-555555555555"), "/workspace");
+    const childA = await makePeer(sock, "child-policy-a", undefined, identity("66666666-6666-4666-8666-666666666666", "77777777-7777-4777-8777-777777777777"), "/workspace");
+    const childB = await makePeer(sock, "child-policy-b", undefined, identity("88888888-8888-4888-8888-888888888888", "99999999-9999-4999-8999-999999999999"), "/workspace");
+    const noticesA: Array<Record<string, unknown>> = [];
+    const noticesB: Array<Record<string, unknown>> = [];
+    childA.onMessage((env) => {
+      const body = env.body as Record<string, unknown> | null;
+      if (body?.["type"] === "relay_lease_closed") noticesA.push(body);
+    });
+    childB.onMessage((env) => {
+      const body = env.body as Record<string, unknown> | null;
+      if (body?.["type"] === "relay_lease_closed") noticesB.push(body);
+    });
+    const broker = parentA.localBroker()!;
+    expect(broker.authorizeRelayParent(parentA.address())).toMatchObject({ ok: true });
+    expect(broker.authorizeRelayParent(parentB.address())).toMatchObject({ ok: true });
+    const bindingA = { runId: "policy-a", workspaceId, agentId: childA.identity()!.agentId, processEpoch: childA.identity()!.processEpoch, mode: "relay" as const };
+    const bindingB = { runId: "policy-b", workspaceId, agentId: childB.identity()!.agentId, processEpoch: childB.identity()!.processEpoch, mode: "relay" as const };
+    expect((await parentA.request("broker", { type: "relay_lease_promote", binding: bindingA, ttlMs: 30_000 }, 1000)).body).toMatchObject({ ok: true });
+    expect((await parentB.request("broker", { type: "relay_lease_promote", binding: bindingB, ttlMs: 30_000 }, 1000)).body).toMatchObject({ ok: true });
+
+    const withdrawn = await parentA.request("broker", { type: "relay_policy_withdraw" }, 1000);
+    expect(withdrawn.body).toEqual({ type: "relay_policy_withdraw_result", ok: true, revokedParents: 2 });
+    await waitFor(() => noticesA.length === 1 && noticesB.length === 1);
+    expect(noticesA[0]).toMatchObject({ reason: "parent_revoked" });
+    expect(noticesB[0]).toMatchObject({ reason: "parent_revoked" });
+    expect((await parentB.request("broker", { type: "relay_lease_issue", binding: { ...bindingB, runId: "after-policy-withdraw" }, ttlMs: 1_000 }, 1000)).body)
+      .toEqual({ type: "relay_lease_issue_result", ok: false, reason: "unauthorized_parent" });
+
+    await childB.leave();
+    await childA.leave();
+    await parentB.leave();
+    await parentA.leave();
+  });
+
   test("atomically live-promotes and demotes only the exact current child", async () => {
     const sock = tmpSock();
     const parent = await makePeer(
@@ -1616,7 +1710,7 @@ describe("SessionPeer runtime identity", () => {
     }, 1000)).body).toMatchObject({ ok: true, state: "renewed" });
     expect((await parent.request("broker", renewalA, 1000)).body).toMatchObject({ ok: true, state: "idempotent" });
 
-    await wait(230);
+    await waitFor(() => notices.length === 1);
     expect(notices).toEqual([expect.objectContaining({
       relayExposureLeaseId: issuedBody.lease.relayExposureLeaseId,
       reason: "expired",

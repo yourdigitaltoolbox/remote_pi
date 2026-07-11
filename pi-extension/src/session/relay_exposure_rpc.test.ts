@@ -49,8 +49,11 @@ describe("relay exposure broker RPC schemas", () => {
       method: "issue",
       binding,
       ttlMs: 30_000,
+      intentSource: "agent" as const,
     };
     expect(parseRelayExposureIssueRequest(request)).toEqual(request);
+    const { intentSource: _legacySource, ...legacyRequest } = request;
+    expect(parseRelayExposureIssueRequest(legacyRequest)).toEqual({ ...legacyRequest, intentSource: "agent" });
     expect(parseRelayExposureIssueRequest({ ...request, version: 2 })).toBeUndefined();
     expect(parseRelayExposureIssueRequest({ ...request, requestId: "not-a-uuid" })).toBeUndefined();
     expect(parseRelayExposureIssueRequest({ ...request, workloadId: "forged" })).toBeUndefined();
@@ -58,7 +61,7 @@ describe("relay exposure broker RPC schemas", () => {
       ...request,
       binding: { ...binding, role: "writer" },
     })).toBeUndefined();
-    const promote = { ...request, method: "promote" };
+    const promote = { ...legacyRequest, method: "promote" };
     expect(parseRelayExposurePromoteRequest(promote)).toEqual(promote);
     expect(parseRelayExposurePromoteRequest({ ...promote, capability })).toBeUndefined();
 
@@ -97,8 +100,12 @@ describe("relay exposure broker RPC schemas", () => {
       delegationTtlMs: 60_000,
       maxLeaseTtlMs: 30_000,
       maxChildIssues: 4,
+      intentSources: ["agent", "fallback"] as const,
     };
     expect(parseRelayRunnerDelegateEventRequest(delegateRunner)).toEqual(delegateRunner);
+    const { intentSources: _legacyRunnerSources, ...legacyRunner } = delegateRunner;
+    expect(parseRelayRunnerDelegateEventRequest(legacyRunner)).toEqual({ ...legacyRunner, intentSources: ["agent"] });
+    expect(parseRelayRunnerDelegateEventRequest({ ...delegateRunner, intentSources: ["run", "run"] })).toBeUndefined();
     expect(parseRelayRunnerDelegateEventRequest({ ...delegateRunner, capability: "forged" })).toBeUndefined();
     expect(parseRelayRunnerDelegateEventRequest({ ...delegateRunner, workloadId: "forged" })).toBeUndefined();
 

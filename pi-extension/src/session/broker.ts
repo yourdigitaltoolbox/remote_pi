@@ -267,12 +267,35 @@ export class Broker {
   authorizeRelayParent(
     route: string,
     options: ParentDelegationOptions = {},
+    policyWorkspaceId?: string,
+  ): { ok: true; parent: RuntimeIdentity } | { ok: false; reason: "peer_not_found" | "legacy_peer" | "workspace_mismatch" } {
+    const peer = this._peerAt(route);
+    if (!peer) return { ok: false, reason: "peer_not_found" };
+    if (!peer.identity) return { ok: false, reason: "legacy_peer" };
+    if (policyWorkspaceId && peer.identity.workspaceId.toLowerCase() !== policyWorkspaceId.toLowerCase()) {
+      return { ok: false, reason: "workspace_mismatch" };
+    }
+    this.relayExposureLeases.authorizeParent(peer, peer.identity, options);
+    return { ok: true, parent: { ...peer.identity } };
+  }
+
+  /** Privileged leader-local withdrawal for one exact displayed parent route. */
+  deauthorizeRelayParent(
+    route: string,
   ): { ok: true; parent: RuntimeIdentity } | { ok: false; reason: "peer_not_found" | "legacy_peer" } {
     const peer = this._peerAt(route);
     if (!peer) return { ok: false, reason: "peer_not_found" };
     if (!peer.identity) return { ok: false, reason: "legacy_peer" };
-    this.relayExposureLeases.authorizeParent(peer, peer.identity, options);
+    this.relayExposureLeases.revokeParent(peer, "parent_revoked");
+    this._reconcileRelayExposureTransitions();
     return { ok: true, parent: { ...peer.identity } };
+  }
+
+  /** Privileged policy withdrawal for every delegated parent in one workspace. */
+  deauthorizeRelayWorkspace(workspaceId: string): { ok: true; revokedParents: number } {
+    const revokedParents = this.relayExposureLeases.revokeWorkspace(workspaceId, "parent_revoked");
+    this._reconcileRelayExposureTransitions();
+    return { ok: true, revokedParents };
   }
 
   private _scheduleRelayExposureExpiry(lease: RelayExposureLease): void {
@@ -646,7 +669,10 @@ export class Broker {
     | ReturnType<RelayExposureLeaseAuthority["releaseRunner"]> {
     switch (request.type) {
       case "relay_runner_issue": {
-        const issued = this.relayExposureLeases.issueForRunner(request.token, request.binding, { ttlMs: request.ttlMs });
+        const issued = this.relayExposureLeases.issueForRunner(request.token, request.binding, {
+          ttlMs: request.ttlMs,
+          intentSource: request.intentSource,
+        });
         return issued.ok ? { ...issued, state: "issued" } : issued;
       }
       case "relay_runner_renew":
@@ -873,6 +899,26 @@ export class Broker {
   private _handleBrokerMessage(env: Envelope, peer: PeerConn): void {
     const body = env.body as Record<string, unknown> | null;
     if (!body || typeof body !== "object" || Array.isArray(body)) return;
+    if (body["type"] === "relay_parent_deauthorize") {
+      if (Object.keys(body).length !== 1) {
+        this._sendBrokerReply(peer, env, { type: "relay_parent_deauthorize_result", ok: false, reason: "invalid_request" });
+        return;
+      }
+      this.relayExposureLeases.revokeParent(peer, "parent_revoked");
+      this._sendBrokerReply(peer, env, { type: "relay_parent_deauthorize_result", ok: true });
+      this._reconcileRelayExposureTransitions();
+      return;
+    }
+    if (body["type"] === "relay_policy_withdraw") {
+      if (Object.keys(body).length !== 1 || !peer.identity) {
+        this._sendBrokerReply(peer, env, { type: "relay_policy_withdraw_result", ok: false, reason: "invalid_request" });
+        return;
+      }
+      const revokedParents = this.relayExposureLeases.revokeWorkspace(peer.identity.workspaceId, "parent_revoked");
+      this._sendBrokerReply(peer, env, { type: "relay_policy_withdraw_result", ok: true, revokedParents });
+      this._reconcileRelayExposureTransitions();
+      return;
+    }
     if (body["type"] === "relay_runner_delegate") {
       const request = parseRelayRunnerDelegateRequest(body);
       const result = request

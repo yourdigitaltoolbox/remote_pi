@@ -319,7 +319,9 @@ describe("extension default export", () => {
     expect(registeredCommands).toContain("remote-pi uninstall");
     // Cross-PC peer inventory (plan/25 W D)
     expect(registeredCommands).toContain("remote-pi peers");
+    expect(registeredCommands).toContain("remote-pi child-policy");
     expect(registeredCommands).toContain("remote-pi relay-parent authorize");
+    expect(registeredCommands).toContain("remote-pi relay-parent revoke");
   });
 
   test("restart-supervisor maps to the right OS command sequence per platform", () => {
@@ -343,8 +345,8 @@ describe("extension default export", () => {
     (extension as ExtensionFactory)(pi);
     // 8 plan-25 + 2 daemon registry (W1) + 6 fleet ops (W2) + 2 install (W3)
     // + 1 cross-PC inventory (plan-25 W D) + 1 cron (plan-39) + 1 rename (plan/41)
-    // + 1 leader-local relay-parent delegation command (issue #65 Slice 4).
-    expect(registeredCommands).toHaveLength(22);
+    // + child-policy and relay-parent authorize/revoke commands (issue #65).
+    expect(registeredCommands).toHaveLength(24);
     for (const removed of [
       "remote-pi join", "remote-pi leave", "remote-pi sessions",
       "remote-pi relay", "remote-pi relay start", "remote-pi relay stop",
@@ -1990,6 +1992,7 @@ describe("/remote-pi set-relay + config", () => {
 
     const text = (ctx.ui.notify.mock.calls[0]![0]) as string;
     expect(text).toContain("https://relay-rp1.jacobmoura.work");
+    expect(text).toContain("Exposure: effective local; requested relay");
   });
 
   test("/remote-pi status reflects env override (canonicalized to https://)", async () => {
@@ -3813,16 +3816,51 @@ describe("relay control channel + relay-state event", () => {
     expect(_getRuntimePresentationForTest()).toBe("Concurrent");
   });
 
-  test("operator command delegates only this broker leader's selected live connection", async () => {
+  test("operator commands delegate and withdraw only the selected live parent connection", async () => {
     captureHandler("remote-pi");
     _setPiForTest(makeSpyPi(vi.fn()));
     await _connectForTest(makeMockCtx(controlCwd));
     const authorize = captureHandler("remote-pi relay-parent authorize");
+    const revoke = captureHandler("remote-pi relay-parent revoke");
     const ctx = makeMockCtx(controlCwd);
 
     await authorize("", ctx);
-
     expect(ctx.ui.notify).toHaveBeenCalledWith(expect.stringMatching(/relay parent authorized.*live connection/i), "info");
+    await revoke("", ctx);
+    expect(ctx.ui.notify).toHaveBeenCalledWith(expect.stringMatching(/delegation revoked.*leases are closing/i), "info");
+  });
+
+  test("operator child-policy persists the project fallback and withdrawal revokes live parent delegation", async () => {
+    captureHandler("remote-pi");
+    _setPiForTest(makeSpyPi(vi.fn()));
+    await _connectForTest(makeMockCtx(controlCwd));
+    const childPolicy = captureHandler("remote-pi child-policy");
+    const authorize = captureHandler("remote-pi relay-parent authorize");
+    const ctx = makeMockCtx(controlCwd);
+
+    await childPolicy("relay", ctx);
+    const localConfig = await import("./session/local_config.js");
+    expect(localConfig.loadLocalConfig(controlCwd)).toMatchObject({ child_exposure: "relay" });
+    await authorize("", ctx);
+    await childPolicy("local", ctx);
+    expect(localConfig.loadLocalConfig(controlCwd)).toMatchObject({ child_exposure: "local" });
+    expect(ctx.ui.notify).toHaveBeenCalledWith(expect.stringMatching(/live parent delegation.*withdrawn/i), "info");
+  });
+
+  test("lowering a persisted relay child policy without a mesh fails closed", async () => {
+    const childPolicy = captureHandler("remote-pi child-policy");
+    const ctx = makeMockCtx(controlCwd);
+    const localConfig = await import("./session/local_config.js");
+
+    await childPolicy("relay", ctx);
+    expect(localConfig.loadLocalConfig(controlCwd)).toMatchObject({ child_exposure: "relay" });
+    await childPolicy("local", ctx);
+
+    expect(localConfig.loadLocalConfig(controlCwd)).toMatchObject({ child_exposure: "relay" });
+    expect(ctx.ui.notify).toHaveBeenCalledWith(
+      expect.stringMatching(/join the local mesh.*withdrawal can be confirmed.*not changed/i),
+      "warning",
+    );
   });
 
   test("same-process relay exposure RPC issues through the authorized parent connection", async () => {
@@ -3846,6 +3884,35 @@ describe("relay control channel + relay-state event", () => {
     await authorize("", makeMockCtx(controlCwd));
 
     const rpc = await import("./session/relay_exposure_rpc.js");
+    const deniedRequestId = "80808080-8080-4080-8080-808080808080";
+    const deniedReply = new Promise<unknown>((resolve) => {
+      events.on(rpc.relayExposureReplyEvent(deniedRequestId), resolve);
+    });
+    events.emit(rpc.RELAY_EXPOSURE_REQUEST_EVENT, {
+      version: 1,
+      requestId: deniedRequestId,
+      method: "delegate_runner",
+      rootRunId: "run-fallback-denied",
+      workspaceId: _getRuntimeIdentityForTest()!.workspaceId,
+      delegationTtlMs: 60_000,
+      maxLeaseTtlMs: 30_000,
+      maxChildIssues: 4,
+      intentSources: ["fallback"],
+    });
+    await expect(deniedReply).resolves.toEqual({
+      version: 1,
+      requestId: deniedRequestId,
+      success: false,
+      reason: "policy_denied",
+    });
+
+    const localConfig = await import("./session/local_config.js");
+    const inspection = localConfig.inspectLocalConfig(controlCwd);
+    localConfig.saveLocalConfig(controlCwd, { child_exposure: "relay" }, {
+      expectedRevision: inspection.revision,
+      expectedState: inspection.state,
+      expectedHash: "hash" in inspection ? inspection.hash ?? null : null,
+    });
     const delegateRequestId = "81818181-8181-4181-8181-818181818181";
     const delegateReply = new Promise<unknown>((resolve) => {
       events.on(rpc.relayExposureReplyEvent(delegateRequestId), resolve);
@@ -3859,6 +3926,7 @@ describe("relay control channel + relay-state event", () => {
       delegationTtlMs: 60_000,
       maxLeaseTtlMs: 30_000,
       maxChildIssues: 4,
+      intentSources: ["fallback"],
     });
     await expect(delegateReply).resolves.toMatchObject({
       version: 1,

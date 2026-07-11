@@ -96,17 +96,37 @@ separate relay authorization is present. A cwd's `auto_start_relay: true` is
 normal-session consent and never promotes a child by itself.
 
 Descriptor v1 carries non-authoritative run, logical-agent, process-epoch,
-parent/index, requested-exposure, launcher version/manifest hash, and remote-pi
-preflight version/manifest hash fields. The package advertises accepted versions
+parent/index, requested-exposure, the winning launcher intent source
+(`run`, `agent`, or unresolved `fallback`), launcher version/manifest hash, and
+remote-pi preflight version/manifest hash fields. Child mode resolves in strict
+order: explicit run request → agent default → protected project
+`child_exposure` policy → built-in `local`. Normal-session `auto_start_relay`
+never participates in that chain. The package advertises accepted versions
 under `pi.remotePi.childSessionProtocol`; compatible launchers verify that
 metadata before child Pi wake. The initial previous-version contract is the
 legacy marker, which is always local-only. Missing required v1 fields,
-malformed metadata, and unknown/future versions fail closed to local.
+malformed metadata, and unknown/future versions fail closed to local. Authority
+RPCs from the source-less pre-D8 v1 build remain compatible but normalize to
+the lower-precedence explicit `agent` layer; omission never manufactures `run`
+or protected `fallback` authority.
 
 Child/Pi session names are runtime presentation only. They may label the live
 mesh peer, but they never overwrite the shared cwd
-`.pi/remote-pi/config.json`. `/remote-pi status` reports the effective exposure
-mode, classification, policy source, and safe protocol/source diagnostics.
+`.pi/remote-pi/config.json`. `/remote-pi child-policy <off|local|relay>` is the
+operator-only protected project policy surface; supervisor-injected direct
+config cannot set it. `/remote-pi status` reports requested policy mode,
+lease-backed effective exposure, classification, winning policy source, and
+safe protocol/source diagnostics.
+
+A relay request still needs a separate transient live-parent delegation from
+`/remote-pi relay-parent authorize [route]`. `/remote-pi relay-parent revoke
+[route]` withdraws one exact parent. Changing child policy away from `relay`
+revokes every delegated parent, detached-runner token, and active child lease
+in that workspace; disconnect and broker restart also fail closed. Lowering a
+persisted relay child policy requires a joined local mesh so that workspace
+withdrawal can be confirmed before the config CAS. Detached
+runner delegation preserves per-child intent source, so an agent/run-authorized
+sibling cannot elevate a fallback child when project policy denies fallback.
 Claimed-child metadata never authorizes relay or privileged work and does not
 disable other extensions.
 
@@ -389,6 +409,9 @@ Current peers can share a display name because immutable IDs own their routes.
 | `/remote-pi devices` | List paired mobile devices (online/offline per device) |
 | `/remote-pi revoke <shortid>` | Revoke a paired device by its shortid |
 | `/remote-pi set-relay <url>` | Persist a new relay URL (http:// or https://) |
+| `/remote-pi child-policy <off\|local\|relay>` | Set the protected project fallback for child sessions; moving away from relay withdraws workspace relay authority |
+| `/remote-pi relay-parent authorize [route]` | Transiently delegate child relay issuance to one live parent in this workspace (broker leader only) |
+| `/remote-pi relay-parent revoke [route]` | Revoke one exact parent delegation and its active child relay leases |
 
 ### Daemon fleet (one supervisor, N background Pis — see [Daemon mode](#daemon-mode))
 

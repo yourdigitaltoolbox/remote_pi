@@ -16,11 +16,21 @@ export const RELAY_EXPOSURE_REPLY_EVENT_PREFIX = "remote-pi:relay-exposure:v1:re
 export const RELAY_EXPOSURE_CAPABILITY_ENV = "PI_SUBAGENT_RELAY_EXPOSURE_CAPABILITY";
 
 const UUID_PATTERN = /^[0-9a-f]{8}-[0-9a-f]{4}-[1-5][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i;
-const REQUEST_KEYS = new Set(["version", "requestId", "method", "binding", "ttlMs"]);
+const ISSUE_REQUEST_KEYS = new Set(["version", "requestId", "method", "binding", "ttlMs", "intentSource"]);
+const PROMOTE_REQUEST_KEYS = new Set(["version", "requestId", "method", "binding", "ttlMs"]);
+const LEGACY_ISSUE_REQUEST_KEYS = PROMOTE_REQUEST_KEYS;
 const RENEW_REQUEST_KEYS = new Set(["version", "requestId", "method", "relayExposureLeaseId", "renewalId", "binding", "ttlMs"]);
 const REVOKE_REQUEST_KEYS = new Set(["version", "requestId", "method", "relayExposureLeaseId", "binding"]);
 const CLOSE_REQUEST_KEYS = new Set(["version", "requestId", "method", "relayExposureLeaseId", "binding", "reason"]);
 const RUNNER_DELEGATE_EVENT_KEYS = new Set([
+  "version", "requestId", "method", "rootRunId", "workspaceId",
+  "delegationTtlMs", "maxLeaseTtlMs", "maxChildIssues", "intentSources",
+]);
+const SINGULAR_RUNNER_DELEGATE_EVENT_KEYS = new Set([
+  "version", "requestId", "method", "rootRunId", "workspaceId",
+  "delegationTtlMs", "maxLeaseTtlMs", "maxChildIssues", "intentSource",
+]);
+const LEGACY_RUNNER_DELEGATE_EVENT_KEYS = new Set([
   "version", "requestId", "method", "rootRunId", "workspaceId",
   "delegationTtlMs", "maxLeaseTtlMs", "maxChildIssues",
 ]);
@@ -86,12 +96,15 @@ const BINDING_FIELDS = new Set<keyof RelayExposureBinding>([
   "mode",
 ]);
 
+export type RelayExposureIntentSource = "run" | "agent" | "fallback";
+
 export interface RelayExposureIssueRequestV1 {
   version: 1;
   requestId: string;
   method: "issue";
   binding: RelayExposureBinding;
   ttlMs: number;
+  intentSource: RelayExposureIntentSource;
 }
 
 export interface RelayExposurePromoteRequestV1 {
@@ -138,6 +151,7 @@ export interface RelayRunnerDelegateEventRequestV1 {
   delegationTtlMs: number;
   maxLeaseTtlMs: number;
   maxChildIssues: number;
+  intentSources: RelayExposureIntentSource[];
 }
 
 export type RelayExposureRequestV1 =
@@ -276,10 +290,14 @@ export function relayExposureReplyEvent(requestId: string): string {
 
 export function parseRelayExposureIssueRequest(value: unknown): RelayExposureIssueRequestV1 | undefined {
   const input = record(value);
-  if (!input || !hasExactKeys(input, REQUEST_KEYS)) return undefined;
+  if (!input || (!hasExactKeys(input, ISSUE_REQUEST_KEYS) && !hasExactKeys(input, LEGACY_ISSUE_REQUEST_KEYS))) return undefined;
   if (input["version"] !== RELAY_EXPOSURE_RPC_VERSION || input["method"] !== "issue") return undefined;
   if (typeof input["requestId"] !== "string" || !UUID_PATTERN.test(input["requestId"])) return undefined;
   if (!isRelayExposureBinding(input["binding"])) return undefined;
+  if (input["intentSource"] !== undefined
+    && input["intentSource"] !== "run"
+    && input["intentSource"] !== "agent"
+    && input["intentSource"] !== "fallback") return undefined;
   if (typeof input["ttlMs"] !== "number" || !Number.isSafeInteger(input["ttlMs"]) || input["ttlMs"] <= 0) return undefined;
   return {
     version: 1,
@@ -287,12 +305,17 @@ export function parseRelayExposureIssueRequest(value: unknown): RelayExposureIss
     method: "issue",
     binding: { ...input["binding"] },
     ttlMs: input["ttlMs"],
+    // Source-less v1 came from pre-D8 launchers that could request relay only
+    // through explicit launcher/agent configuration (never policy fallback).
+    // Preserve compatibility at the least-privileged explicit layer rather
+    // than upgrading an unknown source to highest-precedence `run`.
+    intentSource: input["intentSource"] ?? "agent",
   };
 }
 
 export function parseRelayExposurePromoteRequest(value: unknown): RelayExposurePromoteRequestV1 | undefined {
   const input = record(value);
-  if (!input || !hasExactKeys(input, REQUEST_KEYS)
+  if (!input || !hasExactKeys(input, PROMOTE_REQUEST_KEYS)
     || input["version"] !== 1
     || input["method"] !== "promote"
     || typeof input["requestId"] !== "string"
@@ -354,7 +377,9 @@ export function parseRelayExposureCloseRequest(value: unknown): RelayExposureClo
 
 export function parseRelayRunnerDelegateEventRequest(value: unknown): RelayRunnerDelegateEventRequestV1 | undefined {
   const input = record(value);
-  if (!input || !hasExactKeys(input, RUNNER_DELEGATE_EVENT_KEYS)
+  if (!input || (!hasExactKeys(input, RUNNER_DELEGATE_EVENT_KEYS)
+    && !hasExactKeys(input, SINGULAR_RUNNER_DELEGATE_EVENT_KEYS)
+    && !hasExactKeys(input, LEGACY_RUNNER_DELEGATE_EVENT_KEYS))
     || input["version"] !== 1
     || input["method"] !== "delegate_runner"
     || typeof input["requestId"] !== "string"
@@ -373,7 +398,19 @@ export function parseRelayRunnerDelegateEventRequest(value: unknown): RelayRunne
     || typeof input["maxChildIssues"] !== "number"
     || !Number.isSafeInteger(input["maxChildIssues"])
     || input["maxChildIssues"] <= 0) return undefined;
-  return input as unknown as RelayRunnerDelegateEventRequestV1;
+  const singular = input["intentSource"];
+  if (singular !== undefined && singular !== "run" && singular !== "agent" && singular !== "fallback") return undefined;
+  const plural = input["intentSources"];
+  if (plural !== undefined && (!Array.isArray(plural)
+    || plural.length === 0
+    || plural.length > 3
+    || plural.some((source) => source !== "run" && source !== "agent" && source !== "fallback")
+    || new Set(plural).size !== plural.length)) return undefined;
+  // See issue parsing above: an omitted legacy source is explicit but
+  // unknowable, so normalize it to the lower-precedence `agent` layer.
+  const sources = plural ?? (singular === undefined ? ["agent"] : [singular]);
+  const { intentSource: _singular, ...normalized } = input;
+  return { ...normalized, intentSources: [...sources] } as unknown as RelayRunnerDelegateEventRequestV1;
 }
 
 export function parseRelayExposureRequest(value: unknown): RelayExposureRequestV1 | undefined {

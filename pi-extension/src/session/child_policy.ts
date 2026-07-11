@@ -13,6 +13,10 @@ export type ExposureMode = "off" | "local" | "relay";
 
 export type ExposurePolicySource =
   | "normal-config"
+  | "run-request"
+  | "agent-default"
+  | "remote-child-policy"
+  | "built-in-local"
   | "descriptor"
   | "legacy-marker"
   | "invalid-descriptor"
@@ -30,6 +34,8 @@ export interface ChildSessionDescriptorV1 {
   parentAgentId?: string;
   index: number;
   requestedExposure: ExposureMode;
+  /** Additive v1 source metadata; absent means a legacy v1 launcher. */
+  intentSource?: "run" | "agent" | "fallback";
   producer: {
     name: "pi-subagents";
     version: string;
@@ -54,10 +60,12 @@ export interface SessionExposurePolicy {
   source: ExposurePolicySource;
   diagnostic?: string;
   descriptor?: ChildSessionDescriptorV1;
+  /** Desired child mode before the separate relay capability/lease gate. */
+  requestedMode?: ExposureMode;
 }
 
 type Environment = Record<string, string | undefined>;
-type RelayConfig = { auto_start_relay?: boolean };
+type RelayConfig = { auto_start_relay?: boolean; child_exposure?: ExposureMode };
 
 function nonEmpty(value: unknown): value is string {
   return typeof value === "string" && value.trim().length > 0;
@@ -110,6 +118,10 @@ function parseDescriptor(raw: string, loadedRemotePi?: RemotePiPackageIdentity):
   if (requested !== "off" && requested !== "local" && requested !== "relay") {
     return { ok: false, diagnostic: "child descriptor requestedExposure is invalid" };
   }
+  const intentSource = value["intentSource"];
+  if (intentSource !== undefined && intentSource !== "run" && intentSource !== "agent" && intentSource !== "fallback") {
+    return { ok: false, diagnostic: "child descriptor intentSource is invalid" };
+  }
   const producer = value["producer"];
   if (!producer || typeof producer !== "object" || Array.isArray(producer)) {
     return { ok: false, diagnostic: "child descriptor producer metadata is required" };
@@ -152,6 +164,7 @@ function parseDescriptor(raw: string, loadedRemotePi?: RemotePiPackageIdentity):
     processEpoch: value["processEpoch"],
     index: value["index"] as number,
     requestedExposure: requested,
+    ...(intentSource !== undefined ? { intentSource } : {}),
     producer: {
       name: "pi-subagents",
       version: producerValue["version"] as string,
@@ -206,11 +219,23 @@ export function resolveSessionExposure(
         diagnostic: "current descriptor conflicts with legacy child marker",
       };
     }
-    const requested = parsed.descriptor.requestedExposure;
+    const intentSource = parsed.descriptor.intentSource;
+    const configuredChildMode = config.child_exposure;
+    const requested = intentSource === "fallback"
+      ? (configuredChildMode ?? "local")
+      : parsed.descriptor.requestedExposure;
+    const source: ExposurePolicySource = intentSource === "run"
+      ? "run-request"
+      : intentSource === "agent"
+        ? "agent-default"
+        : intentSource === "fallback"
+          ? (configuredChildMode === undefined ? "built-in-local" : "remote-child-policy")
+          : "descriptor";
     return {
       classification: "child_current",
       mode: requested === "off" ? "off" : "local",
-      source: "descriptor",
+      requestedMode: requested,
+      source,
       ...(requested === "relay"
         ? { diagnostic: "relay authorization capability is required; request capped at local" }
         : {}),
@@ -244,4 +269,21 @@ export function resolveSessionExposure(
 
 export function isChildSession(policy: SessionExposurePolicy): boolean {
   return policy.classification !== "normal";
+}
+
+/**
+ * Report actual transport exposure, not merely requested policy. Current child
+ * sessions require both a live relay transport and the exact current
+ * lease/epoch; normal sessions retain their historical global relay status.
+ */
+export function effectiveExposureForStatus(
+  policy: SessionExposurePolicy,
+  relayStarted: boolean,
+  hasCurrentChildLease: boolean,
+): ExposureMode {
+  if (policy.mode === "off") return "off";
+  if (!isChildSession(policy)) return relayStarted ? "relay" : "local";
+  return policy.classification === "child_current" && relayStarted && hasCurrentChildLease
+    ? "relay"
+    : "local";
 }

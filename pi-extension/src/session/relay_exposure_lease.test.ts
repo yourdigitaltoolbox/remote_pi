@@ -424,6 +424,63 @@ describe("relay exposure lease authority", () => {
       ok: false,
       reason: "revoked_capability",
     });
+
+    const withdrawn = issueFixture();
+    expect(withdrawn.authority.activate(withdrawn.issued.capability, CHILD, withdrawn.childConnection))
+      .toMatchObject({ ok: true, state: "activated" });
+    withdrawn.authority.revokeParent(withdrawn.parentConnection, "parent_revoked");
+    expect(withdrawn.authority.drainTransitions()).toEqual([expect.objectContaining({
+      reason: "parent_revoked",
+      childConnection: withdrawn.childConnection,
+    })]);
+    expect(withdrawn.authority.issue(withdrawn.parentConnection, { ...CHILD, runId: "after-policy-withdrawal" }, { ttlMs: 1_000 }))
+      .toEqual({ ok: false, reason: "unauthorized_parent" });
+  });
+
+  test("workspace policy withdrawal revokes every selected parent and runner in scope only", () => {
+    const authority = new RelayExposureLeaseAuthority();
+    const parentA = {};
+    const parentB = {};
+    const otherParent = {};
+    const parentBIdentity = { ...PARENT, agentId: "66666666-6666-4666-8666-666666666666" };
+    const otherIdentity = {
+      workspaceId: "77777777-7777-4777-8777-777777777777",
+      agentId: "88888888-8888-4888-8888-888888888888",
+      processEpoch: "99999999-9999-4999-8999-999999999999",
+    };
+    authority.authorizeParent(parentA, PARENT);
+    authority.authorizeParent(parentB, parentBIdentity);
+    authority.authorizeParent(otherParent, otherIdentity);
+    const issuedA = authority.issue(parentA, CHILD, { ttlMs: 1_000 });
+    const childB = { ...CHILD, runId: "run-b", agentId: "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa" };
+    const issuedB = authority.issue(parentB, childB, { ttlMs: 1_000 });
+    expect(issuedA.ok).toBe(true);
+    expect(issuedB.ok).toBe(true);
+    if (!issuedA.ok || !issuedB.ok) throw new Error("expected issued leases");
+    expect(authority.activate(issuedA.capability, CHILD, {})).toMatchObject({ ok: true });
+    expect(authority.activate(issuedB.capability, childB, {})).toMatchObject({ ok: true });
+    const runner = authority.delegateRunner(parentB, {
+      rootRunId: "runner-b",
+      workspaceId: PARENT.workspaceId,
+      delegationTtlMs: 1_000,
+      maxLeaseTtlMs: 1_000,
+      maxChildIssues: 1,
+      intentSources: ["run"],
+    });
+    expect(runner.ok).toBe(true);
+    if (!runner.ok) throw new Error(runner.reason);
+
+    expect(authority.revokeWorkspace(PARENT.workspaceId)).toBe(2);
+    expect(authority.drainTransitions()).toHaveLength(2);
+    expect(authority.issue(parentA, { ...CHILD, runId: "after-a" }, { ttlMs: 1_000 }))
+      .toEqual({ ok: false, reason: "unauthorized_parent" });
+    expect(authority.issueForRunner(runner.token, { ...CHILD, runId: "runner-b" }, { ttlMs: 500, intentSource: "run" }))
+      .toEqual({ ok: false, reason: "invalid_runner_delegation" });
+    expect(authority.issue(otherParent, {
+      ...CHILD,
+      runId: "other-workspace",
+      workspaceId: otherIdentity.workspaceId,
+    }, { ttlMs: 1_000 })).toMatchObject({ ok: true });
   });
 
   test("issues bounded digest-only runner subdelegation and fences its child lifecycle", () => {
@@ -434,13 +491,18 @@ describe("relay exposure lease authority", () => {
       delegationTtlMs: 60_000,
       maxLeaseTtlMs: 30_000,
       maxChildIssues: 2,
+      intentSources: ["run"],
     });
     expect(delegated.ok).toBe(true);
     if (!delegated.ok) throw new Error(delegated.reason);
     expect(delegated.token).toMatch(/^rprd1\./);
     expect(JSON.stringify(authority)).not.toContain(delegated.token);
 
-    const issued = authority.issueForRunner(delegated.token, CHILD, { ttlMs: 20_000 });
+    expect(authority.issueForRunner(delegated.token, CHILD, { ttlMs: 20_000, intentSource: "fallback" }))
+      .toEqual({ ok: false, reason: "runner_intent_source_denied" });
+    expect(authority.issueForRunner(delegated.token, CHILD, { ttlMs: 20_000, intentSource: "agent" }))
+      .toEqual({ ok: false, reason: "runner_intent_source_denied" });
+    const issued = authority.issueForRunner(delegated.token, CHILD, { ttlMs: 20_000, intentSource: "run" });
     expect(issued.ok).toBe(true);
     if (!issued.ok) throw new Error(issued.reason);
     expect(authority.activate(issued.capability, CHILD, childConnection)).toMatchObject({ ok: true, state: "activated" });
@@ -458,7 +520,7 @@ describe("relay exposure lease authority", () => {
     expect(authority.issueForRunner(delegated.token, {
       ...CHILD,
       agentId: "66666666-6666-4666-8666-666666666666",
-    }, { ttlMs: 20_000 })).toEqual({ ok: false, reason: "invalid_runner_delegation" });
+    }, { ttlMs: 20_000, intentSource: "run" })).toEqual({ ok: false, reason: "invalid_runner_delegation" });
   });
 
   test("abandoned runner authority expires its active child lease without forging normal close", () => {
@@ -469,10 +531,11 @@ describe("relay exposure lease authority", () => {
       delegationTtlMs: 5_000,
       maxLeaseTtlMs: 1_000,
       maxChildIssues: 1,
+      intentSources: ["fallback"],
     });
     expect(delegated.ok).toBe(true);
     if (!delegated.ok) throw new Error(delegated.reason);
-    const issued = authority.issueForRunner(delegated.token, CHILD, { ttlMs: 1_000 });
+    const issued = authority.issueForRunner(delegated.token, CHILD, { ttlMs: 1_000, intentSource: "fallback" });
     expect(issued.ok).toBe(true);
     if (!issued.ok) throw new Error(issued.reason);
     expect(authority.activate(issued.capability, CHILD, childConnection)).toMatchObject({ ok: true, state: "activated" });
@@ -512,26 +575,27 @@ describe("relay exposure lease authority", () => {
       delegationTtlMs: 40_000,
       maxLeaseTtlMs: 20_000,
       maxChildIssues: 1,
+      intentSources: ["run"],
     });
     expect(delegated.ok).toBe(true);
     if (!delegated.ok) throw new Error(delegated.reason);
 
-    expect(authority.issueForRunner("rprd1.77777777-7777-4777-8777-777777777777.forged", CHILD, { ttlMs: 10_000 }))
+    expect(authority.issueForRunner("rprd1.77777777-7777-4777-8777-777777777777.forged", CHILD, { ttlMs: 10_000, intentSource: "run" }))
       .toEqual({ ok: false, reason: "invalid_runner_delegation" });
-    expect(authority.issueForRunner(delegated.token, { ...CHILD, runId: "other-run" }, { ttlMs: 10_000 }))
+    expect(authority.issueForRunner(delegated.token, { ...CHILD, runId: "other-run" }, { ttlMs: 10_000, intentSource: "run" }))
       .toEqual({ ok: false, reason: "runner_binding_mismatch", field: "runId" });
     expect(authority.issueForRunner(delegated.token, {
       ...CHILD,
       workspaceId: "77777777-7777-4777-8777-777777777777",
-    }, { ttlMs: 10_000 })).toEqual({ ok: false, reason: "runner_binding_mismatch", field: "workspaceId" });
-    expect(authority.issueForRunner(delegated.token, CHILD, { ttlMs: 20_001 }))
+    }, { ttlMs: 10_000, intentSource: "run" })).toEqual({ ok: false, reason: "runner_binding_mismatch", field: "workspaceId" });
+    expect(authority.issueForRunner(delegated.token, CHILD, { ttlMs: 20_001, intentSource: "run" }))
       .toEqual({ ok: false, reason: "ttl_exceeds_runner_maximum" });
-    expect(authority.issueForRunner(delegated.token, CHILD, { ttlMs: 10_000 })).toMatchObject({ ok: true });
+    expect(authority.issueForRunner(delegated.token, CHILD, { ttlMs: 10_000, intentSource: "run" })).toMatchObject({ ok: true });
     expect(authority.issueForRunner(delegated.token, {
       ...CHILD,
       agentId: "77777777-7777-4777-8777-777777777777",
       processEpoch: "88888888-8888-4888-8888-888888888888",
-    }, { ttlMs: 10_000 })).toEqual({ ok: false, reason: "runner_issue_capacity_exceeded" });
+    }, { ttlMs: 10_000, intentSource: "run" })).toEqual({ ok: false, reason: "runner_issue_capacity_exceeded" });
 
     const expiring = authority.delegateRunner(parentConnection, {
       rootRunId: "expiring-run",
@@ -539,15 +603,16 @@ describe("relay exposure lease authority", () => {
       delegationTtlMs: 1_000,
       maxLeaseTtlMs: 1_000,
       maxChildIssues: 1,
+      intentSources: ["run"],
     });
     expect(expiring.ok).toBe(true);
     if (!expiring.ok) throw new Error(expiring.reason);
     advance(1_001);
-    expect(authority.issueForRunner(expiring.token, { ...CHILD, runId: "expiring-run" }, { ttlMs: 500 }))
+    expect(authority.issueForRunner(expiring.token, { ...CHILD, runId: "expiring-run" }, { ttlMs: 500, intentSource: "run" }))
       .toEqual({ ok: false, reason: "runner_delegation_expired" });
 
     authority.revokeParent(parentConnection);
-    expect(authority.issueForRunner(delegated.token, CHILD, { ttlMs: 10_000 }))
+    expect(authority.issueForRunner(delegated.token, CHILD, { ttlMs: 10_000, intentSource: "run" }))
       .toEqual({ ok: false, reason: "invalid_runner_delegation" });
   });
 });
