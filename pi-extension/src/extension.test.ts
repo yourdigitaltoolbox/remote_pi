@@ -6,7 +6,7 @@
  */
 import { describe, expect, test, vi, beforeEach, afterEach } from "vitest";
 import { EventEmitter } from "node:events";
-import { mkdirSync, mkdtempSync, readdirSync, readFileSync, rmSync, writeFileSync } from "node:fs";
+import { existsSync, mkdirSync, mkdtempSync, readdirSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { fileURLToPath } from "node:url";
@@ -159,6 +159,8 @@ const {
   _getActivePeerCountForTest,
   _restartSupervisorCommand,
   _setDisposedForTest,
+  _setAutoInitedForTest,
+  _startRelayForTest,
   _hasMeshNodeForTest,
   _getLockedNameForTest,
   _resetCwdLockForTest,
@@ -2966,6 +2968,159 @@ describe("pi session name → remote-pi mesh name sync", () => {
     const stop = captureHandler("remote-pi stop");
     await stop("", makeMockCtx(syncCwd));
     _resetCwdLockForTest();
+  });
+});
+
+// ── child-safe legacy exposure ────────────────────────────────────────────────
+
+describe("child-safe legacy exposure", () => {
+  let childCwd: string;
+
+  beforeEach(async () => {
+    delete process.env["PI_SUBAGENT_DESCRIPTOR"];
+    delete process.env["PI_SUBAGENT_CHILD"];
+    delete process.env["REMOTE_PI_DIRECT_CONFIG"];
+    childCwd = mkdtempSync(join(tmpdir(), "remote-pi-child-"));
+    relayRef.current = null;
+    relayInstances.length = 0;
+    _setDisposedForTest(false);
+    _setAutoInitedForTest(false);
+    _resetCwdLockForTest();
+    const stop = captureHandler("remote-pi stop");
+    await stop("", makeMockCtx(childCwd));
+  });
+
+  afterEach(async () => {
+    const stop = captureHandler("remote-pi stop");
+    await stop("", makeMockCtx(childCwd));
+    _resetCwdLockForTest();
+    _setAutoInitedForTest(false);
+    delete process.env["PI_SUBAGENT_DESCRIPTOR"];
+    delete process.env["PI_SUBAGENT_CHILD"];
+    delete process.env["REMOTE_PI_DIRECT_CONFIG"];
+    rmSync(childCwd, { recursive: true, force: true });
+  });
+
+  test("session_start auto-joins a legacy child locally without config or relay", async () => {
+    process.env["PI_SUBAGENT_CHILD"] = "1";
+    const sessionStart = captureEventHandler("session_start") as unknown as (
+      event: AnyEvent,
+      ctx: ReturnType<typeof makeMockCtx>,
+    ) => void;
+    _setPiForTest({
+      getSessionName: () => "ephemeral-reviewer",
+      sendMessage: () => undefined,
+      sendUserMessage: () => undefined,
+    } as unknown as ExtensionAPI);
+
+    sessionStart({ type: "session_start" }, makeMockCtx(childCwd));
+
+    await vi.waitFor(() => expect(_hasMeshNodeForTest()).toBe(true));
+    expect(_getLockedNameForTest()?.replace(/#\d+$/, "")).toBe("ephemeral-reviewer");
+    expect(_getState()).toBe("idle");
+    expect(relayInstances).toHaveLength(0);
+    expect(existsSync(join(childCwd, ".pi", "remote-pi", "config.json"))).toBe(false);
+  });
+
+  test("cwd auto_start_relay cannot promote a legacy child", async () => {
+    process.env["PI_SUBAGENT_CHILD"] = "1";
+    process.env["REMOTE_PI_DIRECT_CONFIG"] = JSON.stringify({
+      agent_name: "durable-parent",
+      auto_start_relay: true,
+    });
+    const root = captureHandler("remote-pi");
+    const ctx = makeMockCtx(childCwd);
+
+    await root("", ctx);
+
+    expect(_hasMeshNodeForTest()).toBe(true);
+    expect(_getState()).toBe("idle");
+    expect(relayInstances).toHaveLength(0);
+    expect(ctx.ui.notify).toHaveBeenCalledWith(expect.stringContaining("source: legacy-marker"), "info");
+  });
+
+  test("an explicit relay start is denied for a legacy child", async () => {
+    process.env["PI_SUBAGENT_CHILD"] = "1";
+    process.env["REMOTE_PI_DIRECT_CONFIG"] = JSON.stringify({ auto_start_relay: true });
+    captureHandler("remote-pi"); // captures immutable launch classification
+    const ctx = makeMockCtx(childCwd);
+
+    await _startRelayForTest(ctx);
+
+    expect(_getState()).toBe("idle");
+    expect(relayInstances).toHaveLength(0);
+    expect(ctx.ui.notify).toHaveBeenCalledWith(expect.stringContaining("Relay denied"), "warning");
+  });
+
+  test("removing the marker after extension initialization cannot self-promote", async () => {
+    process.env["PI_SUBAGENT_CHILD"] = "1";
+    captureHandler("remote-pi");
+    delete process.env["PI_SUBAGENT_CHILD"];
+    const ctx = makeMockCtx(childCwd);
+
+    await _startRelayForTest(ctx);
+
+    expect(_getState()).toBe("idle");
+    expect(relayInstances).toHaveLength(0);
+    expect(ctx.ui.notify).toHaveBeenCalledWith(expect.stringContaining("Relay denied"), "warning");
+  });
+
+  test("child Pi names remain runtime-only and never create shared config", async () => {
+    process.env["PI_SUBAGENT_CHILD"] = "1";
+    captureHandler("remote-pi"); // captures immutable launch classification
+    const previousCwd = process.cwd();
+    process.chdir(childCwd);
+    try {
+      _setPiForTest({
+        getSessionName: () => "ephemeral-writer",
+        sendMessage: () => undefined,
+        sendUserMessage: () => undefined,
+      } as unknown as ExtensionAPI);
+      await _syncNameFromPiForTest();
+      expect(existsSync(join(childCwd, ".pi", "remote-pi", "config.json"))).toBe(false);
+    } finally {
+      process.chdir(previousCwd);
+    }
+  });
+
+  test("child setup cannot rewrite durable cwd configuration", async () => {
+    process.env["PI_SUBAGENT_CHILD"] = "1";
+    const configDir = join(childCwd, ".pi", "remote-pi");
+    const configPath = join(configDir, "config.json");
+    mkdirSync(configDir, { recursive: true });
+    const before = '{\n  "agent_name": "durable-parent",\n  "auto_start_relay": true\n}\n';
+    writeFileSync(configPath, before);
+    const setup = captureHandler("remote-pi setup");
+    const ctx = makeMockCtx(childCwd);
+
+    await setup("", ctx);
+
+    expect(readFileSync(configPath, "utf8")).toBe(before);
+    expect(ctx.ui.notify).toHaveBeenCalledWith(expect.stringContaining("disabled for child sessions"), "warning");
+  });
+
+  test("child name sync leaves an existing durable config byte-for-byte unchanged", async () => {
+    process.env["PI_SUBAGENT_CHILD"] = "1";
+    captureHandler("remote-pi"); // captures immutable launch classification
+    const configDir = join(childCwd, ".pi", "remote-pi");
+    const configPath = join(configDir, "config.json");
+    mkdirSync(configDir, { recursive: true });
+    const before = '{\n  "agent_name": "durable-parent",\n  "auto_start_relay": true\n}\n';
+    writeFileSync(configPath, before);
+    const previousCwd = process.cwd();
+    process.chdir(childCwd);
+    try {
+      _setPiForTest({
+        getSessionName: () => "ephemeral-reviewer",
+        sendMessage: () => undefined,
+        sendUserMessage: () => undefined,
+      } as unknown as ExtensionAPI);
+      await _syncNameFromPiForTest();
+      await _handleControl("rename:child-chosen-name");
+      expect(readFileSync(configPath, "utf8")).toBe(before);
+    } finally {
+      process.chdir(previousCwd);
+    }
   });
 });
 

@@ -96,6 +96,11 @@ import {
   sanitizeSegment,
 } from "./session/local_config.js";
 import { runSetupWizard, type WizardUI } from "./session/setup_wizard.js";
+import {
+  isChildSession,
+  resolveSessionExposure,
+  type SessionExposurePolicy,
+} from "./session/child_policy.js";
 import { updateFooter, type FooterState } from "./ui/footer.js";
 import { join, dirname, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
@@ -195,6 +200,22 @@ let _disposed = false;
 // remote-pi for ANY session whose local config has auto_start_relay (default
 // true) — interactive AND daemon — instead of only REMOTE_PI_DAEMON=1.
 let _autoInited = false;
+
+// Snapshot only the non-secret launch classification fields. Child status must
+// not become mutable policy merely because another extension changes
+// process.env after remote-pi has been initialized.
+function _snapshotSessionClaim(): Record<string, string | undefined> {
+  return {
+    PI_SUBAGENT_CHILD: process.env["PI_SUBAGENT_CHILD"],
+    PI_SUBAGENT_DESCRIPTOR: process.env["PI_SUBAGENT_DESCRIPTOR"],
+  };
+}
+let _sessionClaim = _snapshotSessionClaim();
+
+/** Resolve captured launch classification + this cwd's durable normal config. */
+function _sessionExposure(cwd: string): SessionExposurePolicy {
+  return resolveSessionExposure(_sessionClaim, loadLocalConfig(cwd));
+}
 
 // Cached state of global pairings (`peers.json`). Pairing is per-machine, so a
 // device paired in any Pi process is paired everywhere. Refreshed on boot,
@@ -355,6 +376,9 @@ export async function _stopForTest(ctx: unknown): Promise<void> {
  *  module across cases, so they reset it to avoid cross-test pollution. */
 export function _getDisposedForTest(): boolean { return _disposed; }
 export function _setDisposedForTest(v: boolean): void { _disposed = v; }
+
+/** Test-only: reset the one-shot session_start auto-init latch. */
+export function _setAutoInitedForTest(v: boolean): void { _autoInited = v; }
 
 /** Test-only: true when this instance holds a live local-mesh node. */
 export function _hasMeshNodeForTest(): boolean { return _meshNode !== null; }
@@ -628,8 +652,12 @@ async function _syncNameFromPi(): Promise<void> {
   const requested = sanitizeSegment(piName.trim());
   if (!requested) return;
   const cwd = process.cwd();
-  if (loadLocalConfig(cwd).agent_name !== requested)
+  const exposure = _sessionExposure(cwd);
+  // A child name belongs to this logical runtime only. It may rename the live
+  // peer, but it must never overwrite the shared cwd's durable agent_name.
+  if (!isChildSession(exposure) && loadLocalConfig(cwd).agent_name !== requested) {
     saveLocalConfig(cwd, { agent_name: requested });
+  }
   if (!_meshNode) return;
   const base = _meshNode.name().replace(/#\d+$/, "");
   if (base === requested) return;
@@ -921,16 +949,21 @@ export async function _handleControl(cmd: string): Promise<void> {
  *      inherent cost of room-per-name). Skipped when the relay was off.
  * Finally re-emits `remote-pi:name-assigned` so the Cockpit updates its label.
  *
- * The explicit name IS persisted (decision E only skips the runtime `#N`).
+ * Normal-session explicit names persist (decision E only skips runtime `#N`).
+ * Child-session names are always runtime-only, including an explicit rename.
  */
 async function _renameAgent(newName: string): Promise<void> {
   if (!newName) return;  // empty rename → no-op
   const ctx = _controlCtx();
   const cwd = process.cwd();
-  saveLocalConfig(cwd, { agent_name: newName });
+  const exposure = _sessionExposure(cwd);
+  if (!isChildSession(exposure)) {
+    saveLocalConfig(cwd, { agent_name: newName });
+  }
 
   if (!_meshNode) {
-    // Not on the mesh yet — config persisted; applies on the next join.
+    // Normal sessions persisted above; a child with no live mesh has no durable
+    // rename target, so its runtime-only request intentionally ends here.
     return;
   }
 
@@ -1266,6 +1299,7 @@ const extension: ExtensionFactory = (pi: ExtensionAPI): void => {
   if (applied.has(pi)) return;  // this session's pi was already wired
   applied.add(pi);
 
+  _sessionClaim = _snapshotSessionClaim();
   _pi = pi;
 
   // Plano 19: ensure ~/.pi/remote/{sessions,skills}/ exist and deploy the
@@ -1522,12 +1556,22 @@ const extension: ExtensionFactory = (pi: ExtensionAPI): void => {
       // the wizard path.
       const isDaemon = process.env["REMOTE_PI_DAEMON"] === "1";
       const cwd = isDaemon ? process.cwd() : "cwd" in ctx ? ctx.cwd : undefined;
-      if (cwd && localConfigExists(cwd) && effectiveAutoStartRelay(loadLocalConfig(cwd))) {
-        _autoInited = true;
-        const initCtx = isDaemon
-          ? ({ ui: _headlessUi(), cwd: process.cwd() } as Pick<ExtensionContext, "ui" | "cwd">)
-          : ctx;
-        void _cmdRoot(initCtx);
+      if (cwd) {
+        const exposure = _sessionExposure(cwd);
+        // Normal sessions keep the existing "configured + auto relay" boot
+        // behavior. Classified children auto-init independently of cwd relay
+        // consent: local joins the mesh, off stays idle, and no child reaches
+        // relay startup without a separately authorized relay policy.
+        const shouldInit = isChildSession(exposure)
+          ? exposure.mode !== "off"
+          : localConfigExists(cwd) && exposure.mode === "relay";
+        if (shouldInit) {
+          _autoInited = true;
+          const initCtx = isDaemon
+            ? ({ ui: _headlessUi(), cwd: process.cwd() } as Pick<ExtensionContext, "ui" | "cwd">)
+            : ctx;
+          void _cmdRoot(initCtx);
+        }
       }
     }
   });
@@ -1706,8 +1750,10 @@ export default extension;
  * Reuses the same icons as the footer so terminal + status output stay
  * visually consistent.
  */
-function _cmdStatus(ctx: Pick<ExtensionContext, "ui">): void {
+function _cmdStatus(ctx: Pick<ExtensionContext, "ui"> & Partial<Pick<ExtensionContext, "cwd">>): void {
   const relayUrl = _relayUrl ?? resolveRelayUrl().url;
+  const cwd = ctx.cwd ?? process.cwd();
+  const exposure = _sessionExposure(cwd);
 
   // Mesh line
   let meshLine: string;
@@ -1732,7 +1778,9 @@ function _cmdStatus(ctx: Pick<ExtensionContext, "ui">): void {
       : `🟡 Relay: on, waiting for first pairing (${relayUrl})`;
   }
 
-  ctx.ui.notify(`[remote-pi]\n  ${meshLine}\n  ${relayLine}`, "info");
+  const exposureLine = `Exposure: ${exposure.mode} (${exposure.classification}, source: ${exposure.source})`;
+  const diagnosticLine = exposure.diagnostic ? `\n  Policy diagnostic: ${exposure.diagnostic}` : "";
+  ctx.ui.notify(`[remote-pi]\n  ${meshLine}\n  ${relayLine}\n  ${exposureLine}${diagnosticLine}`, "info");
 }
 
 /**
@@ -1777,6 +1825,11 @@ async function _cmdRoot(ctx: Pick<ExtensionContext, "ui" | "cwd">): Promise<void
   if (_disposed) return;
 
   const cwd = "cwd" in ctx ? (ctx as ExtensionCommandContext).cwd : process.cwd();
+  const exposure = _sessionExposure(cwd);
+  if (isChildSession(exposure) && exposure.mode === "off") {
+    _cmdStatus(ctx);
+    return;
+  }
   // Lock identity is (cwd, name). Several agents may run in the SAME folder; the
   // requested name just has to be made unique. Derive the name the same way
   // `_cmdJoin` does so the lock and the mesh registration agree on identity.
@@ -1819,7 +1872,16 @@ async function _cmdRoot(ctx: Pick<ExtensionContext, "ui" | "cwd">): Promise<void
     }
   }
 
-  // First-time wizard: no local config in this cwd → run interactive setup.
+  // Child startup must never open the first-run wizard or persist generated
+  // identity. It can join the local mesh with runtime/default naming even when
+  // this cwd has no remote-pi config yet.
+  if (!localConfigExists(cwd) && isChildSession(exposure)) {
+    if (exposure.mode !== "off" && !_meshNode) await _cmdJoin(ctx);
+    _cmdStatus(ctx);
+    return;
+  }
+
+  // First-time normal session: no local config in this cwd → run setup.
   if (!localConfigExists(cwd)) {
     const ui = ctx.ui as unknown as WizardUI;
     if (typeof ui.select !== "function") {
@@ -1852,13 +1914,17 @@ async function _cmdRoot(ctx: Pick<ExtensionContext, "ui" | "cwd">): Promise<void
   // the field's documented intent) — previously a false flag skipped the mesh
   // join entirely, leaving the agent (incl. daemons) fully idle.
   const config = loadLocalConfig(cwd);
+  if (exposure.mode === "off") {
+    _cmdStatus(ctx);
+    return;
+  }
   if (!_meshNode) await _cmdJoin(ctx);
   // `_cmdJoin` aborts cleanly when a `session_shutdown` lands mid-connect, but
   // returns void — so recheck here before bringing the relay up, or we'd start
   // a ghost relay connection on an already-disposed instance (the replacement
   // instance owns the live connect).
   if (_disposed) return;
-  if (effectiveAutoStartRelay(config) && _state === "idle") await _cmdStart(ctx);
+  if (exposure.mode === "relay" && effectiveAutoStartRelay(config) && _state === "idle") await _cmdStart(ctx);
   _cmdStatus(ctx);
 }
 
@@ -1868,6 +1934,11 @@ async function _cmdRoot(ctx: Pick<ExtensionContext, "ui" | "cwd">): Promise<void
  */
 async function _cmdSetup(ctx: Pick<ExtensionContext, "ui" | "cwd">): Promise<void> {
   const cwd = "cwd" in ctx ? (ctx as ExtensionCommandContext).cwd : process.cwd();
+  const exposure = _sessionExposure(cwd);
+  if (isChildSession(exposure)) {
+    ctx.ui.notify("[remote-pi] Setup is disabled for child sessions; durable cwd configuration is unchanged.", "warning");
+    return;
+  }
   const ui = ctx.ui as unknown as WizardUI;
   if (typeof ui.select !== "function") {
     ctx.ui.notify("[remote-pi] Setup requires an interactive UI.", "warning");
@@ -1891,6 +1962,15 @@ async function _cmdSetup(ctx: Pick<ExtensionContext, "ui" | "cwd">): Promise<voi
 }
 
 async function _cmdStart(ctx: Pick<ExtensionContext, "ui" | "cwd">): Promise<void> {
+  const cwd = "cwd" in ctx ? (ctx as ExtensionCommandContext).cwd : process.cwd();
+  const exposure = _sessionExposure(cwd);
+  if (isChildSession(exposure) && exposure.mode !== "relay") {
+    ctx.ui.notify(
+      `[remote-pi] Relay denied for ${exposure.classification}; effective child exposure is ${exposure.mode} (source: ${exposure.source}).`,
+      "warning",
+    );
+    return;
+  }
   if (_state !== "idle") {
     ctx.ui.notify("[remote-pi] Already started.", "warning");
     return;
@@ -1922,7 +2002,6 @@ async function _cmdStart(ctx: Pick<ExtensionContext, "ui" | "cwd">): Promise<voi
   const { url: relayUrl, source } = resolveRelayUrl();
   const myShort = Buffer.from(edKp.publicKey).toString("base64").slice(0, 8);
 
-  const cwd = "cwd" in ctx ? (ctx as ExtensionCommandContext).cwd : process.cwd();
   // Same name we send in pair_ok — keeps room_meta.name and the per-pair
   // session_name aligned so the app shows consistent labels.
   const sessionName = _displayName(cwd);

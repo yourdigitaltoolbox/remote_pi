@@ -89,6 +89,22 @@ This is purely local: the agents talk over a Unix domain socket at
 Useful for splitting work across roles (`backend`, `frontend`, `tests`,
 `orchestrator`, …) and letting them coordinate.
 
+#### Child-agent safety
+
+Pi launchers may classify a process as a child with the legacy
+`PI_SUBAGENT_CHILD=1` marker or the versioned `PI_SUBAGENT_DESCRIPTOR` JSON
+contract. Classified children still load their ordinary Pi extensions and join
+the local mesh, but remote-pi caps them at **local-only** exposure unless a
+separate relay authorization is present. A cwd's `auto_start_relay: true` is
+normal-session consent and never promotes a child by itself.
+
+Child/Pi session names are runtime presentation only. They may label the live
+mesh peer, but they never overwrite the shared cwd
+`.pi/remote-pi/config.json`. `/remote-pi status` reports the effective exposure
+mode, classification, and policy source. Malformed or unsupported claimed-child
+metadata fails closed to local-only with diagnostics; it does not disable other
+extensions.
+
 The first agent to enter a session becomes the *leader* (hosts the broker);
 the rest are *followers*. If the leader exits, a follower automatically takes
 over — the failover is invisible to the LLMs.
