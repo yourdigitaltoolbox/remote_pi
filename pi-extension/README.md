@@ -51,22 +51,19 @@ In terminal A (say it ended up named `agent-A`):
 Who else is connected in our agent session? List them.
 ```
 
-The LLM calls `agent_send` to `broker` with `{ type: "list_peers" }` and
-replies with the names it sees.
+The LLM calls `list_peers` and sees opaque routes. Current peers use immutable
+`~identity/<workspaceId>/<agentId>` routes; legacy peers may still appear as
+cwd/name aliases.
 
 Then, still in terminal A:
 
 ```text
-Send a ping to agent-B and wait for a reply.
+Send a ping to the listed route for agent-B and wait for a reply.
 ```
 
-Pi calls `agent_request({ to: "agent-B", body: { type: "ping" } })`. The
-message arrives in terminal B as a user-facing turn — terminal B's LLM
-answers, and the reply lands back in terminal A. Two agents, one prompt
-each, full round trip.
-
-(Replace `agent-B` with whatever name terminal B reports for itself — the
-wizard's default is the directory name plus a `#N` suffix on collision.)
+Pi passes that listed route verbatim to `agent_request`/`agent_send`. The
+message arrives in terminal B as a user-facing turn; replies use the immutable
+sender route carried in the envelope. Names remain display metadata only.
 
 ---
 
@@ -88,6 +85,50 @@ This is purely local: the agents talk over a Unix domain socket at
 `~/.pi/remote/sessions/<session-name>/broker.sock`. No network involved.
 Useful for splitting work across roles (`backend`, `frontend`, `tests`,
 `orchestrator`, …) and letting them coordinate.
+
+#### Child-agent safety
+
+Pi launchers may classify a process as a child with the legacy
+`PI_SUBAGENT_CHILD=1` marker or the versioned `PI_SUBAGENT_DESCRIPTOR` JSON
+contract. Classified children still load their ordinary Pi extensions and join
+the local mesh, but remote-pi caps them at **local-only** exposure unless a
+separate relay authorization is present. A cwd's `auto_start_relay: true` is
+normal-session consent and never promotes a child by itself.
+
+Descriptor v1 carries non-authoritative run, logical-agent, process-epoch,
+parent/index, requested-exposure, the winning launcher intent source
+(`run`, `agent`, or unresolved `fallback`), launcher version/manifest hash, and
+remote-pi preflight version/manifest hash fields. Child mode resolves in strict
+order: explicit run request → agent default → protected project
+`child_exposure` policy → built-in `local`. Normal-session `auto_start_relay`
+never participates in that chain. The package advertises accepted versions
+under `pi.remotePi.childSessionProtocol`; compatible launchers verify that
+metadata before child Pi wake. The initial previous-version contract is the
+legacy marker, which is always local-only. Missing required v1 fields,
+malformed metadata, and unknown/future versions fail closed to local. Authority
+RPCs from the source-less pre-D8 v1 build remain compatible but normalize to
+the lower-precedence explicit `agent` layer; omission never manufactures `run`
+or protected `fallback` authority.
+
+Child/Pi session names are runtime presentation only. They may label the live
+mesh peer, but they never overwrite the shared cwd
+`.pi/remote-pi/config.json`. `/remote-pi child-policy <off|local|relay>` is the
+operator-only protected project policy surface; supervisor-injected direct
+config cannot set it. `/remote-pi status` reports requested policy mode,
+lease-backed effective exposure, classification, winning policy source, and
+safe protocol/source diagnostics.
+
+A relay request still needs a separate transient live-parent delegation from
+`/remote-pi relay-parent authorize [route]`. `/remote-pi relay-parent revoke
+[route]` withdraws one exact parent. Changing child policy away from `relay`
+revokes every delegated parent, detached-runner token, and active child lease
+in that workspace; disconnect and broker restart also fail closed. Lowering a
+persisted relay child policy requires a joined local mesh so that workspace
+withdrawal can be confirmed before the config CAS. Detached
+runner delegation preserves per-child intent source, so an agent/run-authorized
+sibling cannot elevate a fallback child when project policy denies fallback.
+Claimed-child metadata never authorizes relay or privileged work and does not
+disable other extensions.
 
 The first agent to enter a session becomes the *leader* (hosts the broker);
 the rest are *followers*. If the leader exits, a follower automatically takes
@@ -195,8 +236,8 @@ Behavior depends on whether there's a local config for this directory:
 
 The wizard asks three questions:
 
-1. **Agent name** — how other agents will address you in `agent_send` /
-   `agent_request`. Defaults to the directory name.
+1. **Agent name** — the human-facing label shown for this runtime. Current
+   routing uses immutable IDs; the label defaults to the directory name.
 2. **Default session** — the name of the agent-network room for this
    directory. Multiple terminals in the same directory join the same session.
 3. **Auto-start relay (for mobile app access)?** — `Yes` if you want
@@ -317,28 +358,26 @@ both pointing at the same relay.
 
 ## Agent network: deeper look
 
-Each session is one Unix-domain-socket broker plus N peers. The broker
-multiplexes messages by `to` name and broadcasts system events
-(`peer_joined`, `peer_left`).
+Each session is one Unix-domain-socket broker plus N peers. Current peer
+ownership and public routing use immutable workspaceId+agentId. The broker
+retains `<cwd>@<name>` only as a mixed-version compatibility alias and
+broadcasts system lifecycle events.
 
-Inside the LLM, the agent skill registers two tools:
+Inside the LLM, call `list_peers` first and echo one returned route verbatim:
 
 ```jsonc
-// Fire-and-forget
+const { peers } = list_peers()
 agent_send({
-  to: "backend",      // peer name (or array for multicast)
+  to: peers[0],
   body: { task: "add /healthz endpoint" },
-  re: "<id>"          // optional — set when replying to a previous request
-})
-
-// Send + await reply (default 30s timeout)
-agent_request({
-  to: "backend",
-  body: { question: "is the migration applied?" }
+  re: "<id>" // set only when replying to a previous message
 })
 ```
 
-The wire format is a 5-field envelope `{ from, to, id, re, body }` serialized
+Current local routes have the form `~identity/<workspaceId>/<agentId>`;
+cross-PC routes prefix that with `<pc>:`. Legacy aliases remain routable but
+are not authoritative ownership keys. The wire format is a 5-field envelope
+`{ from, to, id, re, body }` serialized
 as one JSON line per message. The leader's broker writes an `audit.jsonl`
 log at `~/.pi/remote/sessions/<name>/audit.jsonl` for postmortem inspection.
 
@@ -349,11 +388,10 @@ Useful commands:
 | `/remote-pi join [name]` | Join (or create) a session — only needed manually if `auto_start_relay=false` |
 | `/remote-pi leave` | Leave the current session |
 | `/remote-pi sessions` | List local sessions and which are live |
-| `/remote-pi rename <new>` | Rename this agent in the current session |
+| `/remote-pi rename <new>` | Persist display metadata with revision/hash CAS; immutable route/room unchanged |
 
-Name collisions inside a session get a numeric suffix automatically
-(`backend`, `backend#2`, `backend#3`). The broker assigns it and returns the
-real name to the peer.
+Legacy alias collisions may receive numeric suffixes (`backend#2`, …).
+Current peers can share a display name because immutable IDs own their routes.
 
 ---
 
@@ -371,6 +409,9 @@ real name to the peer.
 | `/remote-pi devices` | List paired mobile devices (online/offline per device) |
 | `/remote-pi revoke <shortid>` | Revoke a paired device by its shortid |
 | `/remote-pi set-relay <url>` | Persist a new relay URL (http:// or https://) |
+| `/remote-pi child-policy <off\|local\|relay>` | Set the protected project fallback for child sessions; moving away from relay withdraws workspace relay authority |
+| `/remote-pi relay-parent authorize [route]` | Transiently delegate child relay issuance to one live parent in this workspace (broker leader only) |
+| `/remote-pi relay-parent revoke [route]` | Revoke one exact parent delegation and its active child relay leases |
 
 ### Daemon fleet (one supervisor, N background Pis — see [Daemon mode](#daemon-mode))
 
@@ -533,8 +574,9 @@ with a `[<cwd>]` prefix, so a single log stream shows every agent.
 - **Single supervisor.** If `pi-supervisord` crashes all daemons go
   down with it. systemd/launchd restarts it within seconds; daemons
   come back automatically.
-- **One daemon per cwd.** The `roomIdForCwd` derivation makes daemons
-  by-path; two daemons in the same folder is rejected at `create` time.
+- **One daemon registration per cwd.** Duplicate registrations for the same
+  normalized cwd are rejected. The registry retains a stable `workspaceId`,
+  while relay rooms use immutable workspace/logical-agent identity.
 
 ---
 
@@ -542,11 +584,27 @@ with a `[<cwd>]` prefix, so a single log stream shows every agent.
 
 | Path | Scope | What's in it |
 |---|---|---|
-| `<cwd>/.pi/remote-pi/config.json` | Per-directory | `agent_name`, `session_name`, `auto_start_relay` |
+| `<cwd>/.pi/remote-pi/config.json` | Per-directory | schema/revision, `workspace_id`, `agent_name`, `auto_start_relay` (private `0700/0600`) |
+| `~/.pi/remote/daemons.json` | Per-machine | protected schema/revision, daemon cwd/name, stable generic `workspaceId` (`0700/0600`) |
 | `~/.pi/remote/config.json` | Per-user | `relay` URL |
 | `~/.pi/remote/peers.json` | Per-machine | Paired mobile devices |
 | `~/.pi/remote/sessions/<name>/` | Per-session | Broker socket + `audit.jsonl` |
 | `~/.pi/remote/skills/agent-network/SKILL.md` | Per-user | Agent skill the LLM reads |
+
+The per-directory config and daemon-registry boundaries reject pre-existing
+symlink components, read trusted bytes and protection metadata from the same
+no-follow file descriptor, use private modes, and serialize cooperative
+writers with exclusive revision/hash CAS locks. Portable Node does not expose contained `openat2` /
+`unlinkat` or a cross-platform `flock`, so this boundary does not claim to
+resist a malicious process already executing as the same OS user and racing
+path replacement between syscalls. Such a process can already rewrite the
+user's `0600` config and inspect the Pi process; treat that as local-user
+compromise. Detected replacements fail closed, and these generic IDs never
+convey relay authorization or privileged YDTB authority. Stale writer locks
+are intentionally not auto-unlinked through a racy pathname; after confirming
+that no writer is live, recovery requires deliberate removal of
+`.pi/remote-pi/config.lock` (or `~/.pi/remote/daemons.lock` for the registry)
+before retrying the revision-checked write.
 
 Override the relay for a single run without persisting:
 

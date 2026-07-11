@@ -1,10 +1,10 @@
 import { afterEach, beforeEach, describe, expect, test } from "vitest";
-import { mkdtempSync, rmSync } from "node:fs";
+import { existsSync, mkdtempSync, rmSync, symlinkSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { createConnection } from "node:net";
 import { join } from "node:path";
 import { Supervisor, decideFireAction, getSupervisorSockPath } from "./supervisor.js";
-import { addDaemon } from "./registry.js";
+import { addDaemon, DaemonRegistryCorruptError, DaemonRegistrySecurityError, registryPath } from "./registry.js";
 import { readCronLog } from "./cron_log.js";
 import {
   encodeRequest,
@@ -78,6 +78,30 @@ describe("Supervisor — control UDS surface", () => {
   test("list returns empty daemons array when registry is empty", async () => {
     const r = await ask({ op: "list" });
     expect(r).toMatchObject({ ok: true, data: { daemons: [] } });
+  });
+
+  test("startup surfaces corrupt registry bytes before binding or spawning", async () => {
+    await supervisor!.stop();
+    supervisor = null;
+    writeFileSync(registryPath(), "{not-json", { mode: 0o600 });
+    const blocked = new Supervisor({ extensionPath: "/no/such/extension.js", piBin: process.execPath });
+    await expect(blocked.start()).rejects.toThrow(DaemonRegistryCorruptError);
+  });
+
+  test("startup rejects a symlinked registry ancestor before creating supervisor directories through it", async () => {
+    await supervisor!.stop();
+    supervisor = null;
+    rmSync(join(testHome, ".pi"), { recursive: true, force: true });
+    const symlinkTarget = mkdtempSync(join(tmpdir(), "pi-sv-symlink-target-"));
+    try {
+      symlinkSync(symlinkTarget, join(testHome, ".pi"), "dir");
+      const blocked = new Supervisor({ extensionPath: "/no/such/extension.js", piBin: process.execPath });
+      await expect(blocked.start()).rejects.toThrow(DaemonRegistrySecurityError);
+      expect(existsSync(join(symlinkTarget, "remote"))).toBe(false);
+    } finally {
+      rmSync(join(testHome, ".pi"), { force: true });
+      rmSync(symlinkTarget, { recursive: true, force: true });
+    }
   });
 
   test("register adds an entry and returns the derived id", async () => {

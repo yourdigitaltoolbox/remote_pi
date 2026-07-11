@@ -1,6 +1,6 @@
 ---
 name: agent-network
-description: Use when the remote-pi mesh tools (`list_peers`, `agent_send`, and — on Claude — `get_messages`) are available. You are an agent (a Claude session or a Pi coding agent) connected to the remote-pi agent mesh over a local broker. This skill teaches how to discover who's online (`list_peers`), how to send messages with a delivery ACK (`agent_send`), how incoming messages reach you (via `get_messages` on Claude, or delivered into your turn on Pi), how to reply (echo `re`), and how peer addresses work — `<cwd>@<name>` locally (echo verbatim, never compose), with a `<pc>:` prefix cross-PC.
+description: Use when the remote-pi mesh tools (`list_peers`, `agent_send`, and — on Claude — `get_messages`) are available. Teaches discovery, delivery ACKs, inbox handling, correlated replies, and opaque ID-first routes. Current peers use `~identity/<workspaceId>/<agentId>` (with `<pc>:` cross-PC); legacy cwd/name aliases may still appear. Always echo listed routes verbatim.
 ---
 
 # Agent Network (remote-pi mesh)
@@ -55,10 +55,8 @@ Before sending anything, find out who's actually online:
 
 ```
 list_peers()
-→ /Users/jo/acme/backend@backend
-  /Users/jo/acme/backend@reviewer
-  /Users/jo/acme/web@web
-  casa:/Users/jo/acme/api@api
+→ {"route":"~identity/<workspace-id>/<agent-id>","name":"backend","cwd":"/Users/jo/acme/backend","alias":"/Users/jo/acme/backend@backend"}
+  {"route":"casa:~identity/<workspace-id>/<agent-id>","name":"api","cwd":"/Users/jo/acme/api","pc":"casa","alias":"casa:/Users/jo/acme/api@api"}
 ```
 
 Synchronous (resolves in milliseconds — not another agent's turn). Use it:
@@ -71,42 +69,19 @@ Synchronous (resolves in milliseconds — not another agent's turn). Use it:
 wake your turn. When your view feels stale, just call `list_peers` again — it's
 the authoritative snapshot. Don't expect `peer_joined`/`peer_left` events.
 
-**Each entry is an ADDRESS, not a bare name.** The form is `<cwd>@<name>`
-(with an optional `<pc>:` prefix for cross-PC peers). Read it by splitting on
-the `@`:
+**Each `route` is opaque, not a bare name.** Current peers use immutable
+`~identity/<workspaceId>/<agentId>` routes. Cross-PC routes add `<pc>:`.
+Legacy peers may still expose `<cwd>@<name>` aliases, but those are compatibility
+routes rather than current ownership keys.
 
-- **after the `@` → the name** (`Orquestrador`, `App`, `backend`). It's a safe
-  token: it never contains a space, `/`, `:`, `#` or `@` — those are normalized
-  to `-` when the agent registers, so `"my agent"` becomes `my-agent`. (That's
-  why the `@` is unambiguous.)
-- **before the `@` → the folder path** (the agent's working directory, cwd).
+Use the separately returned/rendered `name`, `cwd`, and optional `pc` metadata
+to choose a peer. Do **not** parse identity UUIDs or derive a route from that
+metadata. Two peers may share a display name or cwd and still be distinct.
 
-Two agents named `backend` in different folders are therefore distinct
-addresses, and several agents can live in the **same** folder
-(`…/backend@backend`, `…/backend@reviewer`).
-
-**Who's in my project? Read the folder path.** Agents whose cwd is the same
-folder — or share a parent/child path — are very likely the same project. Use
-the path prefix to decide who to coordinate with; the bare name alone doesn't
-tell you the project. Example:
-
-```
-list_peers()
-→ /home/jo/backlog@Orquestrador
-  /home/jo/backlog/app@App
-  /home/jo/backlog/backend@Backend
-  /home/jo/other-thing@solo
-```
-
-`backlog@Orquestrador` sits at the repo root `…/backlog`; `…/backlog/app@App`
-and `…/backlog/backend@Backend` are **subfolders** of it → almost certainly the
-**same project** (an orchestrator plus its app/backend agents). `…/other-thing@solo`
-shares no prefix → a different project, probably leave it alone.
-
-**An address is an opaque routing key. Echo it VERBATIM into `agent_send` /
-`agent_request` (and as your `to` when replying). NEVER build one by hand** —
-don't concatenate cwd and name yourself; copy the exact string `list_peers`
-gave you. The broker composes addresses; everyone else only echoes them.
+**Echo `route` VERBATIM into `agent_send` / `agent_request` and as `to` when
+replying. NEVER build one by hand.** The broker owns route composition. The
+optional `alias` is diagnostic/mixed-version compatibility metadata; prefer
+`route`.
 
 You are excluded from the result — no need to filter yourself out.
 
@@ -118,8 +93,8 @@ Each message carries: `from`, `to`, `id`, `re`, and `body`.
 
 | Field | Meaning |
 |---|---|
-| `from` | Sender's ADDRESS (`<cwd>@<name>`). Use it verbatim as your `to` when replying — never reconstruct it. |
-| `to` | Your address (or `broadcast`, or a list of addresses including yours). |
+| `from` | Sender's broker-owned route. Use it verbatim as `to` when replying. |
+| `to` | Your broker-owned route (or `broadcast`, or a list including yours). |
 | `id` | Unique id of this message. Echo it as `re` when you reply. |
 | `re` | If set, this message is itself a REPLY to an earlier `id` of yours. Otherwise `null`. |
 | `body` | Free-form content — string or JSON, sender's choice. |
@@ -162,14 +137,14 @@ You **do not block** waiting for a reply. The model is event-driven:
 ### Walk-through
 
 ```
-agent_send({ to: "backend", body: { q: "what's the JWT shape?" } })
-→ Delivered to backend        # status received; remember the message id
+agent_send({ to: "<route copied from list_peers>", body: { q: "what's the JWT shape?" } })
+→ Delivered                   # status received; remember the message id
 ```
 
 Your turn continues. A turn or two later you receive:
 
 ```
-from=backend re=<your-id>  id=<new-id>
+from=~identity/<workspace-id>/<agent-id> re=<your-id>  id=<new-id>
 { "shape": { "sub": "string", "exp": "number", "roles": ["string"] } }
 ```
 
@@ -182,7 +157,7 @@ You correlate by `re` — it matches the send you made. Now you have your answer
 When you receive:
 
 ```
-from=orchestrator  id=abc-uuid  re=(none)
+from=~identity/<workspace-id>/<agent-id>  id=abc-uuid  re=(none)
 { "task": "Implement POST /auth/login" }
 ```
 
@@ -190,7 +165,7 @@ Reply with `re` set to that `id`, and `to` set to the sender's `from`:
 
 ```
 agent_send({
-  to: "orchestrator",
+  to: "~identity/<workspace-id>/<agent-id>",
   body: { status: "done", files_changed: [...] },
   re: "abc-uuid"
 })
@@ -207,9 +182,9 @@ Fire multiple `agent_send` in one turn — each returns its own ACK. Replies
 arrive on future turns as peers finish.
 
 ```
-agent_send({ to: "backend",  body: { q: "JWT shape?" } })   // received
-agent_send({ to: "frontend", body: { q: "theme tokens?" } }) // received
-agent_send({ to: "infra",    body: { q: "ETA for Y?" } })    // received (queued if mid-turn)
+agent_send({ to: "<backend route>",  body: { q: "JWT shape?" } })   // received
+agent_send({ to: "<frontend route>", body: { q: "theme tokens?" } }) // received
+agent_send({ to: "<infra route>",    body: { q: "ETA for Y?" } })    // received
 ```
 
 Track which `id` maps to which question. Don't assume replies arrive in send
@@ -217,19 +192,19 @@ order — use `re` to identify what each reply answers.
 
 ---
 
-## Cross-PC addressing (`<pc>:<cwd>@<name>`)
+## Cross-PC routing (`<pc>:<route>`)
 
-When the Owner has paired multiple PCs, remote peers appear with a `<pc>:` prefix
-on the address:
-
-```
-list_peers() → /Users/jo/acme/backend@backend  casa:/Users/jo/acme/api@api
-```
-
-Send to a remote peer with its address verbatim:
+When the Owner has paired multiple PCs, remote primary routes add a `<pc>:`
+prefix:
 
 ```
-agent_send({ to: "casa:/Users/jo/acme/api@api", body: { ... } })
+list_peers() → casa:~identity/<workspace-id>/<agent-id>
+```
+
+Send to the returned route verbatim:
+
+```
+agent_send({ to: "casa:~identity/<workspace-id>/<agent-id>", body: { ... } })
 ```
 
 The relay routes it across the mesh; `received | denied | timeout` semantics
@@ -257,6 +232,16 @@ Cross-PC failure notes:
   received it. For delivery confirmation, use individual unicast sends.
 
 ---
+
+## Child relay exposure is not mesh or YDTB authority
+
+A child may be visible on this local mesh while remaining absent from the phone
+relay. Do not infer relay permission from a descriptor, route, parent link,
+workspace/agent/process ID, runner token, or supervisor request. Child relay
+requires operator policy plus a separate bounded live-parent delegation and
+process lease; withdrawal, expiry, disconnect, and broker restart fail closed.
+These transport records never grant Git, credentials, writer, merge, publish,
+deploy, cleanup, or other YDTB/APEX authority.
 
 ## When in doubt
 
@@ -287,15 +272,15 @@ inbox on a later turn. (Claude has no `agent_request` — use `agent_send`.)
 
 1. **Every turn**: read your inbox first — `get_messages()` on Claude; on Pi
    messages arrive as turn input automatically.
-2. **Discover**: `list_peers()` → addresses `<cwd>@<name>` (local) + `<pc>:…`
-   (cross-PC). Echo verbatim, never compose. Synchronous, self-excluded.
-   Presence is pull-based — join/leave don't wake you.
+2. **Discover**: `list_peers()` → opaque ID-first routes plus presentation
+   metadata; legacy aliases may appear. Echo `route` verbatim, never compose.
+   Synchronous, self-excluded; presence is pull-based.
 3. **Send**: `agent_send({to, body, re?})` → inspect the status.
 4. **Unicast status**: `received | denied | timeout`. Delivery is reliable —
    `received` even if the peer is mid-turn (its harness queues it); abandon on
    `denied`; investigate on `timeout`. No retry-on-busy.
 5. **Broadcast/multicast**: status `sent`. Fire-and-forget.
-6. **Reply**: set `re` to their `id`, `to` to their `from` (the full address,
+6. **Reply**: set `re` to their `id`, `to` to their `from` (the full route,
    prefix and all). `re` is correlation only.
 7. You never receive your own messages.
 
@@ -307,8 +292,8 @@ Re-read when in doubt.
 
 **Q: Can I send a message to myself?**
 A: No. `agent_send` refuses early (`status: "refused"`) when `to` matches your
-own address (or name), and the broker drops unicast self-loops as a second line
-of defense.
+own primary route, and the broker drops unicast self-loops as a second line of
+defense.
 
 **Q: What if the peer never replies?**
 A: Then you never see a reply. Your send returned `received` (the broker handed

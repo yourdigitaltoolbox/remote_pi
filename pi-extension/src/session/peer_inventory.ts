@@ -6,16 +6,15 @@
  * extension imports the function and wraps it with the `_sessionPeer`
  * `list_peers` request.
  *
- * Input shape: the broker's `list_peers_reply` body returns peer names as
- * plain strings — local peers without a prefix (`sess-1`, `agent-2`),
- * cross-PC peers with a `<pc_label>:<peer>` prefix (`casa:sess-3`).
+ * Input: broker-owned primary routes. Current local peers use `~identity/...`,
+ * cross-PC adds `<pc_label>:`, and legacy aliases may still appear.
  */
 
-export function formatPeerInventory(peers: string[], selfName?: string): string {
+export function formatPeerInventory(peers: string[], selfRoute?: string): string {
   const locals: string[] = [];
   const remotes = new Map<string, string[]>();
   for (const p of peers) {
-    if (selfName && p === selfName) continue;
+    if (selfRoute && p === selfRoute) continue;
     const idx = p.indexOf(":");
     if (idx > 0 && idx < p.length - 1) {
       const label = p.slice(0, idx);

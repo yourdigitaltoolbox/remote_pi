@@ -2,14 +2,17 @@ import { createHash } from "node:crypto";
 import { realpathSync } from "node:fs";
 import { defaultAgentName } from "./session/local_config.js";
 
-/**
- * Deterministic room id derived from a cwd. Two Pi processes in the same
- * directory produce the same id; different cwds produce different ids
- * (with cryptographic-strength collision resistance). Symlinks are resolved
- * via `realpath` so `/a` and `/symlink-to-a` map to the same room.
- *
- * Format: first 12 chars of base64url(sha256(realpath)).
- */
+/** Immutable current-protocol room route, independent of cwd/display aliases. */
+export function roomIdForIdentity(identity: { workspaceId: string; agentId: string }): string {
+  return createHash("sha256")
+    .update("remote-pi-room-v2\0")
+    .update(identity.workspaceId.toLowerCase())
+    .update("\0")
+    .update(identity.agentId.toLowerCase())
+    .digest("base64url")
+    .slice(0, 12);
+}
+
 export function roomIdForCwd(cwd: string): string {
   let target: string;
   try {
@@ -22,9 +25,8 @@ export function roomIdForCwd(cwd: string): string {
 }
 
 /**
- * THE single derivation of the App↔Pi `room_id` (plan/41) — keyed by
- * `(cwd, name)` so several agents in the SAME folder get distinct rooms (the
- * app then renders one tile per agent instead of merging them into one).
+ * Legacy App↔Pi room derivation retained for peers without runtime identity.
+ * It is keyed by `(cwd, name)` so same-folder legacy agents remain distinct.
  *
  * Default-preserving: when `name` is absent OR equals `defaultAgentName(cwd)`
  * (an agent with no custom `agent_name`), it returns the LEGACY `roomIdForCwd`

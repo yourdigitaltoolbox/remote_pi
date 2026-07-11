@@ -1,6 +1,11 @@
 import { describe, expect, test, vi } from "vitest";
+import { mkdtempSync } from "node:fs";
+import { tmpdir } from "node:os";
+import { basename, join } from "node:path";
 import { registerAgentTools } from "./tools.js";
-import type { SessionPeer, AckResult } from "./peer.js";
+import { SessionPeer, type AckResult } from "./peer.js";
+import { ipcAddress } from "./ipc.js";
+import type { Envelope } from "./envelope.js";
 import type { ToolDefinition } from "@earendil-works/pi-coding-agent";
 
 // Captures tools registered via pi.registerTool so we can invoke them directly.
@@ -40,6 +45,23 @@ function makeMockPeer(
 }
 
 const TOOL_CALL_ID = "tc_test";
+
+function tmpSock(): string {
+  const dir = mkdtempSync(join(tmpdir(), "pi-tools-e2e-"));
+  return ipcAddress(`tools-${basename(dir)}`, join(dir, "broker.sock"));
+}
+
+function waitForMessage(peer: SessionPeer): Promise<Envelope> {
+  return new Promise((resolve, reject) => {
+    const timer = setTimeout(() => reject(new Error("message timeout")), 2_000);
+    const unsubscribe = peer.onMessage((env) => {
+      if (env.from === "broker") return;
+      clearTimeout(timer);
+      unsubscribe();
+      resolve(env);
+    });
+  });
+}
 
 describe("agent_send tool (ACK protocol)", () => {
   test("unicast idle peer → calls sendWithAck, returns status=received", async () => {
@@ -222,6 +244,75 @@ describe("agent_send tool (ACK protocol)", () => {
       ok: false,
       error: expect.stringContaining("cannot agent_send to yourself"),
     });
+  });
+});
+
+describe("public tools with current runtime identities", () => {
+  const workspaceId = "11111111-1111-4111-8111-111111111111";
+  const firstIdentity = {
+    workspaceId,
+    agentId: "22222222-2222-4222-8222-222222222222",
+    processEpoch: "33333333-3333-4333-8333-333333333333",
+  };
+  const secondIdentity = {
+    workspaceId,
+    agentId: "44444444-4444-4444-8444-444444444444",
+    processEpoch: "55555555-5555-4555-8555-555555555555",
+  };
+
+  test("list_peers → agent_send → correlated reply uses immutable ID routes end-to-end", async () => {
+    const sockPath = tmpSock();
+    const first = new SessionPeer({ sockPath, name: "worker", cwd: "/workspace", identity: firstIdentity });
+    const second = new SessionPeer({ sockPath, name: "worker", cwd: "/workspace", identity: secondIdentity });
+    await first.start();
+    await second.start();
+    try {
+      const firstTools = makeMockPi();
+      const secondTools = makeMockPi();
+      registerAgentTools(firstTools.pi, () => first);
+      registerAgentTools(secondTools.pi, () => second);
+
+      const expectedFirst = `~identity/${workspaceId}/${firstIdentity.agentId}`;
+      const expectedSecond = `~identity/${workspaceId}/${secondIdentity.agentId}`;
+      const listed = await firstTools.tools.get("list_peers")!.execute(
+        TOOL_CALL_ID, {}, undefined, undefined, {} as never,
+      );
+      expect(listed.details).toMatchObject({
+        peers: [expectedSecond],
+        peers_detailed: [expect.objectContaining({
+          identityAddress: expectedSecond,
+          address: "/workspace@worker#2",
+          name: "worker",
+          cwd: "/workspace",
+        })],
+      });
+      expect((listed.details as { peers: string[] }).peers).not.toContain("/workspace@worker#2");
+      expect((listed.content[0] as { text: string }).text).toContain(`"route":"${expectedSecond}"`);
+
+      const inboundAtSecond = waitForMessage(second);
+      const sent = await firstTools.tools.get("agent_send")!.execute(
+        TOOL_CALL_ID, { to: expectedSecond, body: { question: "ping" } }, undefined, undefined, {} as never,
+      );
+      expect(sent.details).toMatchObject({ status: "received", ok: true, target: expectedSecond });
+      const request = await inboundAtSecond;
+      expect(request.from).toBe(expectedFirst);
+      expect(request.to).toBe(expectedSecond);
+
+      const inboundAtFirst = waitForMessage(first);
+      const replied = await secondTools.tools.get("agent_send")!.execute(
+        TOOL_CALL_ID,
+        { to: request.from, body: { answer: "pong" }, re: request.id },
+        undefined, undefined, {} as never,
+      );
+      expect(replied.details).toMatchObject({ status: "received", ok: true, target: expectedFirst });
+      const reply = await inboundAtFirst;
+      expect(reply.from).toBe(expectedSecond);
+      expect(reply.to).toBe(expectedFirst);
+      expect(reply.re).toBe(request.id);
+    } finally {
+      await second.leave();
+      await first.leave();
+    }
   });
 });
 

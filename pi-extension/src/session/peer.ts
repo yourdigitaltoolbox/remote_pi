@@ -3,6 +3,7 @@ import { setTimeout as delay } from "node:timers/promises";
 import { type Envelope, envelope, parse, serialize, EnvelopeError } from "./envelope.js";
 import { joinOrLead, type ElectionResult } from "./leader_election.js";
 import { Broker } from "./broker.js";
+import type { RuntimeIdentity } from "./runtime_identity.js";
 
 /**
  * Symmetric peer-in-session API. Hides whether you are leader or follower;
@@ -19,18 +20,15 @@ export type ReconnectHandler = () => void;
 export interface SessionPeerOptions {
   sockPath: string;
   name: string;
-  /**
-   * Working directory of this agent. Sent in the `register` so the broker can
-   * key peers by the (cwd, name) pair: two agents in the SAME folder with the
-   * same name are the SAME logical agent reincarnating (switch_session /
-   * restart), so the broker take-over the name instead of suffixing `#N`.
-   * Optional for backward-compat with peers that predate this field.
-   */
+  /** Working directory used for presentation and the legacy compatibility
+   * alias. Current ownership/routing uses `identity`; old peers use cwd/name. */
   cwd?: string;
-  /** Replace an existing same-(cwd,name) registration instead of accepting a
-   *  broker-assigned `#N`. Use only for stable logical identities; ordinary
-   *  multi-agent sessions should leave this false. */
+  /** Legacy-only same-(cwd,name) takeover. Current identity registrations
+   *  reject duplicate live owners instead of taking them over. */
   takeoverExisting?: boolean;
+  /** Immutable canonical runtime identity. When present, broker registration,
+   * duplicate detection, and presentation updates are ID-keyed. */
+  identity?: RuntimeIdentity;
   auditPath?: string;
   /** Per-request default timeout (ms). Override per call if needed. */
   defaultTimeoutMs?: number;
@@ -61,9 +59,8 @@ export class SessionPeer {
   /** Clean leaf name actually assigned by the broker (may carry a `#N`
    *  collision suffix). Used for display + self-filtering. */
   private assignedName: string;
-  /** Canonical address assigned by the broker (`[<pc>:]<cwd>@<nome>`, or just
-   *  the name for a legacy broker). This is the routing/identity key the mesh
-   *  uses; callers ECHO it, never compose it. */
+  /** Primary route assigned by the broker. Current peers receive immutable
+   *  `~identity/<workspaceId>/<agentId>`; legacy peers receive cwd/name. */
   private assignedAddress: string;
   private role: "leader" | "follower" = "follower";
   private broker: Broker | null = null;
@@ -102,11 +99,14 @@ export class SessionPeer {
     return this.assignedName;
   }
 
-  /** Returns the canonical address (`[<pc>:]<cwd>@<nome>`) assigned by the
-   *  broker — the key the mesh routes on. Equals `name()` against a legacy
-   *  broker that returns no address. */
+  /** Returns the broker-assigned primary route. Echo it; never compose it. */
   address(): string {
     return this.assignedAddress;
+  }
+
+  /** Immutable runtime identity for current-protocol peers; null for legacy. */
+  identity(): RuntimeIdentity | null {
+    return this.opts.identity ? { ...this.opts.identity } : null;
   }
 
   /** Returns "leader" or "follower" — current role. */
@@ -135,7 +135,7 @@ export class SessionPeer {
     body: unknown,
     re: string | null = null,
   ): Promise<void> {
-    const env = envelope(this.assignedName, to, body, re);
+    const env = envelope(this.assignedAddress, to, body, re);
     await this._writeEnvelope(env);
   }
 
@@ -156,7 +156,7 @@ export class SessionPeer {
     re: string | null = null,
     timeoutMs: number = ACK_TIMEOUT_MS,
   ): Promise<AckResult> {
-    const env = envelope(this.assignedName, to, body, re);
+    const env = envelope(this.assignedAddress, to, body, re);
     return new Promise<AckResult>((resolve) => {
       const timer = setTimeout(() => {
         this.ackPending.delete(env.id);
@@ -182,7 +182,7 @@ export class SessionPeer {
     body: unknown,
     timeoutMs: number = this.opts.defaultTimeoutMs ?? DEFAULT_TIMEOUT_MS,
   ): Promise<Envelope> {
-    const env = envelope(this.assignedName, to, body, null);
+    const env = envelope(this.assignedAddress, to, body, null);
     return new Promise<Envelope>((resolve, reject) => {
       const timer = setTimeout(() => {
         this.pending.delete(env.id);
@@ -216,11 +216,20 @@ export class SessionPeer {
   }
 
   /**
-   * Requests a different display name from the broker. Returns the name
-   * actually assigned (may carry a #N suffix on collision). Implemented as
-   * a soft rejoin: leaves & rejoins with the new name.
+   * Requests a different display name. Current peers update presentation in
+   * place and retain their ID route; legacy peers use the historical rejoin.
    */
   async rename(newName: string): Promise<string> {
+    if (this.opts.identity) {
+      const reply = await this.request("broker", { type: "update_presentation", name: newName });
+      const body = reply.body as { type?: string; name?: string } | null;
+      if (!body || body.type !== "presentation_updated" || typeof body.name !== "string") {
+        throw new Error("broker rejected presentation update");
+      }
+      this.opts.name = body.name;
+      this.assignedName = body.name;
+      return body.name;
+    }
     await this._teardownConn();
     this.opts.name = newName;
     this.assignedName = newName;
@@ -280,11 +289,20 @@ export class SessionPeer {
       const wait = setTimeout(() => reject(new Error("register_ack timeout")), 5_000);
       const onceListener = (raw: unknown) => {
         clearTimeout(wait);
-        // plan/38: a new broker returns `address_assigned` (canonical key) +
-        // `name_assigned` (clean leaf). Read both with cross-fallback so we work
-        // against either a new broker OR a legacy one (only `name_assigned`,
-        // where address == name).
-        const ack = raw as { type?: string; name_assigned?: string; address_assigned?: string };
+        // Current brokers return an ID-first `address_assigned` plus a clean
+        // presentation `name_assigned`. Cross-fallback preserves old brokers
+        // where address and name were the same alias.
+        const ack = raw as { type?: string; code?: string; name_assigned?: string; address_assigned?: string };
+        if (ack?.type === "register_rejected") {
+          this._preAckListener = null;
+          const message = ack.code === "duplicate_identity"
+            ? "duplicate runtime identity is already active"
+            : ack.code === "workspace_cwd_conflict"
+              ? "workspace identity is already active from a different cwd"
+              : `broker rejected registration: ${ack.code ?? "unknown"}`;
+          reject(new Error(message));
+          return;
+        }
         const name = typeof ack?.name_assigned === "string" ? ack.name_assigned : ack?.address_assigned;
         const address = typeof ack?.address_assigned === "string" ? ack.address_assigned : ack?.name_assigned;
         if (ack && ack.type === "register_ack" && typeof name === "string" && typeof address === "string") {
@@ -305,6 +323,7 @@ export class SessionPeer {
         // as "no take-over", i.e. the old #N behavior).
         ...(this.opts.cwd !== undefined ? { cwd: this.opts.cwd } : {}),
         ...(this.opts.takeoverExisting === true ? { takeover: true } : {}),
+        ...(this.opts.identity ? { identity: this.opts.identity } : {}),
       }) + "\n";
       try {
         sock.write(req);

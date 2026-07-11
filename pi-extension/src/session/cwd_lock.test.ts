@@ -2,7 +2,13 @@ import { afterEach, beforeEach, describe, expect, test } from "vitest";
 import { mkdtempSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import { acquireCwdLock, lockPathForCwd, lockPathFor } from "./cwd_lock.js";
+import {
+  acquireCwdLock,
+  acquireIdentityLock,
+  lockPathFor,
+  lockPathForCwd,
+  lockPathForIdentity,
+} from "./cwd_lock.js";
 
 /** A fresh tmp cwd per test — each gets a unique room hash, so tests in
  *  parallel don't fight over the same lock socket. */
@@ -134,5 +140,31 @@ describe("acquireCwdLock", () => {
     }
 
     if (held.ok) held.release();
+  });
+
+  test("runtime identity, not display name or cwd, owns the canonical lock", async () => {
+    const firstIdentity = {
+      workspaceId: "11111111-1111-4111-8111-111111111111",
+      agentId: "22222222-2222-4222-8222-222222222222",
+    };
+    const secondIdentity = {
+      ...firstIdentity,
+      agentId: "33333333-3333-4333-8333-333333333333",
+    };
+
+    const first = await acquireIdentityLock(firstIdentity);
+    const duplicateAfterRename = await acquireIdentityLock({ ...firstIdentity });
+    const concurrentChild = await acquireIdentityLock(secondIdentity);
+
+    expect(first.ok).toBe(true);
+    expect(duplicateAfterRename.ok).toBe(false);
+    if (!duplicateAfterRename.ok) {
+      expect(duplicateAfterRename.lockPath).toBe(lockPathForIdentity(firstIdentity));
+    }
+    expect(concurrentChild.ok).toBe(true);
+    expect(lockPathForIdentity(firstIdentity)).not.toBe(lockPathForIdentity(secondIdentity));
+
+    if (first.ok) first.release();
+    if (concurrentChild.ok) concurrentChild.release();
   });
 });

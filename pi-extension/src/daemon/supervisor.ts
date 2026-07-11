@@ -133,12 +133,14 @@ export class Supervisor {
 
   constructor(private readonly opts: SupervisorOptions) {}
 
-  /** Bind the control UDS + spawn all registered daemons. */
+  /** Validate protected registry state, then bind control UDS and spawn daemons. */
   async start(): Promise<void> {
-    this._mkdirParent();
-    // Backfill folder-derived names into legacy registry entries (pre-name
-    // field) so every daemon has a stable name to inject via env.
+    // Validate or create the protected authoritative registry before any
+    // supervisor socket/log pathname mutation. This prevents a symlinked
+    // registry ancestor from redirecting recursive UDS directory creation.
+    // Migration also backfills legacy names/workspace identities under CAS.
     migrateRegistryNames();
+    this._mkdirParent();
     await this._bindUds();
     this._spawnAllFromRegistry();
     // Cron (plan/39): schedule all enabled jobs, then run any missed catchup.
@@ -286,7 +288,7 @@ export class Supervisor {
         already.push(entry.id);
         continue;
       }
-      this._spawnEntry(entry.id, entry.cwd);
+      this._spawnEntry(entry.id, entry.cwd, entry.workspaceId, entry.name);
       started.push(entry.id);
     }
     return { ok: true, data: { started, already_running: already } };
@@ -303,7 +305,7 @@ export class Supervisor {
     if (slot && slot.child.state === "running") {
       return { ok: true, data: { id, state: slot.child.state, started: false } };
     }
-    this._spawnEntry(entry.id, entry.cwd, entry.name);
+    this._spawnEntry(entry.id, entry.cwd, entry.workspaceId, entry.name);
     const state = this.children.get(id)?.child.state ?? "starting";
     return { ok: true, data: { id, state, started: true } };
   }
@@ -358,7 +360,7 @@ export class Supervisor {
       }
       await slot.child.stop();
     }
-    this._spawnEntry(entry.id, entry.cwd, entry.name);
+    this._spawnEntry(entry.id, entry.cwd, entry.workspaceId, entry.name);
     const state = this.children.get(id)?.child.state ?? "starting";
     return { ok: true, data: { id, state, restarted: true } };
   }
@@ -535,7 +537,7 @@ export class Supervisor {
         if (!entry) {
           result = "skipped_down";
         } else {
-          this._spawnEntry(entry.id, entry.cwd, entry.name);
+          this._spawnEntry(entry.id, entry.cwd, entry.workspaceId, entry.name);
           const woke = this.children.get(job.daemon_id);
           result = woke && woke.child.sendPrompt(job.prompt) ? "woke_and_delivered" : "deliver_failed";
         }
@@ -554,11 +556,11 @@ export class Supervisor {
 
   private _spawnAllFromRegistry(): void {
     for (const entry of listDaemons()) {
-      this._spawnEntry(entry.id, entry.cwd, entry.name);
+      this._spawnEntry(entry.id, entry.cwd, entry.workspaceId, entry.name);
     }
   }
 
-  private _spawnEntry(id: string, cwd: string, name?: string): void {
+  private _spawnEntry(id: string, cwd: string, workspaceId: string, name?: string): void {
     // Clean up any prior slot (e.g. crashed + waiting for backoff).
     const existing = this.children.get(id);
     if (existing) {
@@ -569,11 +571,13 @@ export class Supervisor {
     }
 
     // Build the daemon's config and inject it via REMOTE_PI_DIRECT_CONFIG —
-    // no per-cwd config file needed. The daemon scopes by (cwd, name) like any
-    // agent (plan/38); relay on.
-    const config: LocalConfig = {
+    // no per-cwd config file needed. Immutable workspaceId plus the child Pi
+    // session's agentId own current runtime identity; cwd/name are presentation
+    // and compatibility metadata. Relay is enabled for this normal daemon.
+    const config: LocalConfig & { workspace_id: string } = {
       agent_name: name ?? defaultAgentName(cwd),
       auto_start_relay: true,
+      workspace_id: workspaceId,
     };
     const childOpts: RpcChildOptions = {
       extensionPath: this.opts.extensionPath,

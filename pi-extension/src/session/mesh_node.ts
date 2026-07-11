@@ -7,8 +7,9 @@ import { RelayClient } from "../transport/relay_client.js";
 import { attachCrossPcBridge } from "./bridge.js";
 import { getOrCreateEd25519Keypair } from "../pairing/storage.js";
 import type { Ed25519Keypair } from "./../pairing/crypto.js";
-import { roomIdFor } from "../rooms.js";
+import { roomIdFor, roomIdForIdentity } from "../rooms.js";
 import { toWebSocketUrl } from "../config.js";
+import type { RuntimeIdentity } from "./runtime_identity.js";
 
 /**
  * MeshNode — the single composition point for "join the agent mesh".
@@ -52,13 +53,14 @@ export interface MeshNodeOptions {
   sockPath: string;
   /** Requested mesh name (broker may add a #N collision suffix). */
   name: string;
-  /** Working directory, forwarded to the broker in `register` so peers are
-   *  keyed by (cwd, name) and a same-folder same-name reincarnation takes over
-   *  instead of colliding into `#N`. Optional (legacy peers omit it). */
+  /** Working directory used for presentation/legacy aliasing. Current peers
+   *  are owned and routed by immutable identity instead. */
   cwd?: string;
   /** Replace an existing same-(cwd,name) mesh registration. Intended for
    *  stable process identities such as supervised daemons. */
   takeoverExisting?: boolean;
+  /** Immutable current-protocol runtime identity. */
+  identity?: RuntimeIdentity;
   /** Optional audit log path passed through to SessionPeer. */
   auditPath?: string;
   /** Self-managed relay bridge — brought up if this node leads. */
@@ -107,6 +109,7 @@ export class MeshNode {
     const peerOpts: SessionPeerOptions = { sockPath: opts.sockPath, name: opts.name };
     if (opts.cwd !== undefined) peerOpts.cwd = opts.cwd;
     if (opts.takeoverExisting !== undefined) peerOpts.takeoverExisting = opts.takeoverExisting;
+    if (opts.identity !== undefined) peerOpts.identity = opts.identity;
     if (opts.auditPath !== undefined) peerOpts.auditPath = opts.auditPath;
     this.peer_ = new SessionPeer(peerOpts);
     if (opts.bridge) {
@@ -185,12 +188,20 @@ export class MeshNode {
       this.relayOwned = false;
     } else {
       if (!this.keypair) this.keypair = params.keypair ?? (await getOrCreateEd25519Keypair());
-      // plan/41: room is keyed by (cwd, name) so two agents in the same folder
-      // get distinct App↔Pi rooms. Use the SAME name as room_meta.name so the
-      // derivation and the announced label agree.
       const roomName = params.sessionName ?? this.peer_.name();
-      const roomId = roomIdFor(params.cwd!, roomName);
-      const roomMeta = { name: roomName, cwd: params.cwd! };
+      const identity = this.peer_.identity();
+      const roomId = identity
+        ? roomIdForIdentity(identity)
+        : roomIdFor(params.cwd!, roomName);
+      const roomMeta = {
+        name: roomName,
+        cwd: params.cwd!,
+        ...(identity ? {
+          workspaceId: identity.workspaceId,
+          agentId: identity.agentId,
+          processEpoch: identity.processEpoch,
+        } : {}),
+      };
       const r = new RelayClient(toWebSocketUrl(params.relayUrl), this.keypair);
       try {
         await r.connect({ roomId, roomMeta });
@@ -315,7 +326,7 @@ export class MeshNode {
     return this.peer_;
   }
 
-  /** Fire-and-forget send. `to` may be a name, `<pc>:<name>`, or "broadcast". */
+  /** Fire-and-forget send to an opaque listed route or `broadcast`. */
   async send(to: string | string[], body: unknown, re: string | null = null): Promise<void> {
     return this.peer_.send(to, body, re);
   }
@@ -349,17 +360,20 @@ export class MeshNode {
     return this.peer_.name();
   }
 
-  /** Canonical mesh address (`[<pc>:]<cwd>@<nome>`) — echo, never compose. */
+  /** Broker-assigned primary route — immutable ID route for current peers. */
   address(): string {
     return this.peer_.address();
   }
 
+  /** Immutable runtime identity for current peers; null for legacy. */
+  identity(): RuntimeIdentity | null {
+    return this.peer_.identity();
+  }
+
   /**
-   * Rename this peer on the broker via a soft leave+rejoin (re-registers under
-   * `newName`; the broker may append a `#N` on collision — returns the assigned
-   * name). Keeps the process + onMessage handlers alive. Does NOT touch the
-   * cross-PC bridge or the relay room — the caller must cycle the relay so the
-   * App↔Pi room (keyed by `(cwd, name)`, plan/41) follows the new name.
+   * Update presentation metadata. Current ID-keyed peers keep their canonical
+   * identity and route alias; legacy peers retain the historical soft rejoin.
+   * Keeps the process + onMessage handlers alive and never cycles relay state.
    */
   async rename(newName: string): Promise<string> {
     return this.peer_.rename(newName);

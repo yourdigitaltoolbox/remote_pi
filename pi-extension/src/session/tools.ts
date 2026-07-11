@@ -1,6 +1,7 @@
 import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";
 import { Type } from "typebox";
 import type { SessionPeer } from "./peer.js";
+import type { PeerInfo } from "./broker.js";
 
 const NOT_IN_SESSION = "Not in a session. Run /remote-pi join first";
 const ACK_TIMEOUT_MS = 5_000;
@@ -26,6 +27,13 @@ interface SendDetails {
   ok: boolean;
   error?: string;
   target?: string;
+}
+
+interface ListPeersDetails {
+  /** Opaque primary routes, retained for backward compatibility. */
+  peers: string[];
+  /** Additive presentation/alias metadata; route by identityAddress/address. */
+  peers_detailed?: PeerInfo[];
 }
 
 /**
@@ -56,8 +64,8 @@ export function registerAgentTools(
   const SendParams = Type.Object({
     to: Type.String({
       description:
-        "Recipient agent name (e.g. 'backend'), 'broadcast', or array of names. " +
-        "Broadcast/multicast are fire-and-forget; unicast returns an ACK status.",
+        "Opaque route returned by list_peers (or 'broadcast'). Current peers use " +
+        "immutable identity routes; legacy peers may use cwd/name aliases. Unicast returns an ACK.",
     }),
     body: Type.Unknown({ description: "Free-form JSON payload. String or object — your choice." }),
     re: Type.Optional(Type.String({
@@ -68,7 +76,7 @@ export function registerAgentTools(
   });
 
   const RequestParams = Type.Object({
-    to: Type.String({ description: "Recipient agent name. Must be a single peer (not broadcast)." }),
+    to: Type.String({ description: "Opaque route returned by list_peers. Must be one peer, not broadcast." }),
     body: Type.Unknown({ description: "Free-form JSON payload to send." }),
     timeout_ms: Type.Optional(Type.Number({
       description: "Optional override of the default 30s reply timeout. Per-request.",
@@ -100,7 +108,7 @@ export function registerAgentTools(
         };
       }
       const { to, body, re } = params as SendInput;
-      if (to === peer.address() || to === peer.name()) {
+      if (to === peer.address()) {
         const msg = `Refused: cannot agent_send to yourself ("${to}"). Just do the work directly.`;
         const details: SendDetails = { status: "refused", ok: false, error: msg };
         return {
@@ -154,19 +162,18 @@ export function registerAgentTools(
 
   const ListPeersParams = Type.Object({});
 
-  pi.registerTool<typeof ListPeersParams, { peers: string[] }>({
+  pi.registerTool<typeof ListPeersParams, ListPeersDetails>({
     name: "list_peers",
     label: "List Peers",
     description:
-      "Returns the current peer inventory in this session as ADDRESSES of the " +
-      "form `<cwd>@<name>` (cross-PC peers prefixed `<pc>:`). An address is an " +
-      "opaque routing key — pass it to `agent_send`/`agent_request` VERBATIM, " +
-      "never build one by hand. Use BEFORE sending whenever you're unsure who's " +
-      "available, or after a `peer_joined` / `peer_left` notification to refresh " +
-      "your mental model. Resolves in milliseconds — a metadata query to the " +
-      "broker, not a turn of another agent.",
+      "Returns the current peer inventory as opaque broker routes. Current peers " +
+      "use immutable `~identity/<workspaceId>/<agentId>` routes; cross-PC routes " +
+      "add a `<pc>:` prefix. Legacy peers may still appear as cwd/name aliases. " +
+      "Pass a listed route to `agent_send`/`agent_request` VERBATIM; never build " +
+      "one by hand. Refresh after peer lifecycle notifications. This is a local " +
+      "metadata query, not a turn of another agent.",
     promptSnippet:
-      "list_peers(): returns {peers: string[]} of addresses `<cwd>@<name>` (`<pc>:` prefix cross-PC). Echo an address verbatim to agent_send; never compose one. Cheap; call freely.",
+      "list_peers(): returns {peers: string[]} of opaque ID-first routes (cross-PC prefixed `<pc>:`; legacy aliases possible). Echo a route verbatim; never compose one.",
     parameters: ListPeersParams,
     execute: async (_toolCallId) => {
       const peer = getSessionPeer();
@@ -185,19 +192,38 @@ export function registerAgentTools(
           { type: "list_peers" },
           LIST_PEERS_TIMEOUT_MS,
         );
-        const body = reply.body as { peers?: unknown } | null;
+        const body = reply.body as { peers?: unknown; peers_detailed?: unknown } | null;
         const peers = Array.isArray(body?.peers)
           ? (body!.peers as unknown[]).filter((p): p is string => typeof p === "string")
           : [];
-        // Drop self from the list — the caller is the only one who can't
-        // address itself anyway, so listing it is noise. Peers are ADDRESSES
-        // (plan/38), so filter by address.
+        const detailed = Array.isArray(body?.peers_detailed)
+          ? (body!.peers_detailed as unknown[]).filter((value): value is PeerInfo => {
+              if (!value || typeof value !== "object") return false;
+              const info = value as Partial<PeerInfo>;
+              return typeof info.cwd === "string"
+                && typeof info.name === "string"
+                && typeof info.address === "string";
+            })
+          : [];
         const selfAddress = peer.address();
-        const filtered = peers.filter((p) => p !== selfAddress);
-        const text = filtered.length === 0 ? "(no peers)" : filtered.join("\n");
+        const filtered = peers.filter((route) => route !== selfAddress);
+        const filteredDetailed = detailed.filter((info) =>
+          (info.identityAddress ?? info.address) !== selfAddress
+          && filtered.includes(info.identityAddress ?? info.address));
+        const text = filtered.length === 0
+          ? "(no peers)"
+          : filtered.map((route) => {
+              const info = filteredDetailed.find((candidate) => (candidate.identityAddress ?? candidate.address) === route);
+              return info
+                ? JSON.stringify({ route, name: info.name, cwd: info.cwd, ...(info.pc ? { pc: info.pc } : {}), ...(info.identityAddress ? { alias: info.address } : {}) })
+                : route;
+            }).join("\n");
         return {
           content: [{ type: "text", text }],
-          details: { peers: filtered },
+          details: {
+            peers: filtered,
+            ...(filteredDetailed.length > 0 ? { peers_detailed: filteredDetailed } : {}),
+          },
         };
       } catch (err) {
         const msg = err instanceof Error ? err.message : String(err);
@@ -230,7 +256,7 @@ export function registerAgentTools(
         };
       }
       const { to, body, timeout_ms } = params as RequestInput;
-      if (to === peer.address() || to === peer.name()) {
+      if (to === peer.address()) {
         const msg = `Refused: cannot agent_request to yourself ("${to}"). Just do the work directly.`;
         return {
           content: [{ type: "text", text: msg }],

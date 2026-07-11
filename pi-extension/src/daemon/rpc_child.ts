@@ -42,7 +42,7 @@ export interface RpcChildOptions {
    * source of the `--name` for the session. Falls back to the on-disk config
    * when omitted.
    */
-  config?: LocalConfig;
+  config?: LocalConfig & { workspace_id?: string };
 }
 
 export interface RpcChildExitEvent {

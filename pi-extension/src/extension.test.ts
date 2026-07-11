@@ -4,13 +4,21 @@
  * Post plano 06: no Noise XX. Pairing is `pair_request → pair_ok|pair_error`
  * over an opaque outer envelope whose `ct` is base64(JSON.stringify(inner)).
  */
-import { describe, expect, test, vi, beforeEach, afterEach } from "vitest";
+import { describe, expect, test, vi, beforeEach, afterEach, afterAll } from "vitest";
 import { EventEmitter } from "node:events";
-import { mkdirSync, mkdtempSync, readdirSync, readFileSync, rmSync, writeFileSync } from "node:fs";
+import { chmodSync, existsSync, mkdirSync, mkdtempSync, readdirSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { fileURLToPath } from "node:url";
 import type { ExtensionAPI, ExtensionFactory } from "@earendil-works/pi-coding-agent";
+
+// Keep integration brokers/locks away from the operator's live remote-pi mesh.
+const extensionTestHome = mkdtempSync("/tmp/remote-pi-extension-test-");
+process.env["REMOTE_PI_HOME"] = extensionTestHome;
+afterAll(() => {
+  delete process.env["REMOTE_PI_HOME"];
+  try { rmSync(extensionTestHome, { recursive: true, force: true }); } catch { /* best effort */ }
+});
 
 // ── Mock RelayClient ──────────────────────────────────────────────────────────
 
@@ -159,21 +167,49 @@ const {
   _getActivePeerCountForTest,
   _restartSupervisorCommand,
   _setDisposedForTest,
+  _setAutoInitedForTest,
+  _startRelayForTest,
   _hasMeshNodeForTest,
   _getLockedNameForTest,
+  _getRuntimeIdentityForTest,
+  _getRuntimePresentationForTest,
+  _getRoomMetaForTest,
+  _getRelayExposureLeaseForTest,
+  _handleRelayExposureBrokerNoticeForTest,
+  _applyRelayExposurePromotedNoticeForTest,
+  _handleMeshBrokerReconnectForTest,
   _resetCwdLockForTest,
+  _seedRuntimeIdentityForTest,
   _handleControl,
+  _setBeforePersistentRenameWriteForTest,
   _syncNameFromPiForTest,
   CTRL_PREFIX,
 } = await import("./index.js");
-const { acquireCwdLock } = await import("./session/cwd_lock.js");
+const { acquireIdentityLock } = await import("./session/cwd_lock.js");
+const { agentIdFromSessionId } = await import("./session/runtime_identity.js");
 
 // ── Helpers ───────────────────────────────────────────────────────────────────
+
+class TestEvents {
+  private readonly listeners = new Map<string, Set<(payload: unknown) => void>>();
+
+  on(channel: string, handler: (payload: unknown) => void): () => void {
+    const handlers = this.listeners.get(channel) ?? new Set<(payload: unknown) => void>();
+    handlers.add(handler);
+    this.listeners.set(channel, handlers);
+    return () => handlers.delete(handler);
+  }
+
+  emit(channel: string, payload: unknown): void {
+    for (const handler of this.listeners.get(channel) ?? []) handler(payload);
+  }
+}
 
 function makeMockPi(): { pi: ExtensionAPI; registeredCommands: string[] } {
   const registeredCommands: string[] = [];
   const pi = {
     on: () => undefined,
+    events: new TestEvents(),
     registerCommand(name: string, _opts: unknown) { registeredCommands.push(name); },
     registerTool: () => undefined, registerShortcut: () => undefined,
     registerFlag: () => undefined, getFlag: () => undefined,
@@ -183,8 +219,36 @@ function makeMockPi(): { pi: ExtensionAPI; registeredCommands: string[] } {
   return { pi, registeredCommands };
 }
 
+function testSessionId(cwd: string): string {
+  return `test-session:${cwd}`;
+}
+
 function makeMockCtx(cwd = "/home/user/projects/remote_pi") {
-  return { ui: { notify: vi.fn() }, cwd, abort: vi.fn() };
+  return {
+    ui: { notify: vi.fn() },
+    cwd,
+    abort: vi.fn(),
+    sessionManager: { getSessionId: () => testSessionId(cwd) },
+  };
+}
+
+function writeProtectedLocalConfig(cwd: string, agentName: string, autoStartRelay = false): string {
+  const dir = join(cwd, ".pi", "remote-pi");
+  mkdirSync(dir, { recursive: true });
+  const workspaceId = "11111111-1111-4111-8111-111111111111";
+  const configPath = join(dir, "config.json");
+  writeFileSync(configPath, JSON.stringify({
+    schema_version: 1,
+    revision: 1,
+    workspace_id: workspaceId,
+    agent_name: agentName,
+    auto_start_relay: autoStartRelay,
+  }, null, 2));
+  if (process.platform !== "win32") {
+    chmodSync(dir, 0o700);
+    chmodSync(configPath, 0o600);
+  }
+  return workspaceId;
 }
 
 type CmdHandler = (args: string, ctx: ReturnType<typeof makeMockCtx>) => Promise<void>;
@@ -255,6 +319,9 @@ describe("extension default export", () => {
     expect(registeredCommands).toContain("remote-pi uninstall");
     // Cross-PC peer inventory (plan/25 W D)
     expect(registeredCommands).toContain("remote-pi peers");
+    expect(registeredCommands).toContain("remote-pi child-policy");
+    expect(registeredCommands).toContain("remote-pi relay-parent authorize");
+    expect(registeredCommands).toContain("remote-pi relay-parent revoke");
   });
 
   test("restart-supervisor maps to the right OS command sequence per platform", () => {
@@ -277,8 +344,9 @@ describe("extension default export", () => {
     const { pi, registeredCommands } = makeMockPi();
     (extension as ExtensionFactory)(pi);
     // 8 plan-25 + 2 daemon registry (W1) + 6 fleet ops (W2) + 2 install (W3)
-    // + 1 cross-PC inventory (plan-25 W D) + 1 cron (plan-39) + 1 rename (plan/41).
-    expect(registeredCommands).toHaveLength(21);
+    // + 1 cross-PC inventory (plan-25 W D) + 1 cron (plan-39) + 1 rename (plan/41)
+    // + child-policy and relay-parent authorize/revoke commands (issue #65).
+    expect(registeredCommands).toHaveLength(24);
     for (const removed of [
       "remote-pi join", "remote-pi leave", "remote-pi sessions",
       "remote-pi relay", "remote-pi relay start", "remote-pi relay stop",
@@ -1924,6 +1992,7 @@ describe("/remote-pi set-relay + config", () => {
 
     const text = (ctx.ui.notify.mock.calls[0]![0]) as string;
     expect(text).toContain("https://relay-rp1.jacobmoura.work");
+    expect(text).toContain("Exposure: effective local; requested relay");
   });
 
   test("/remote-pi status reflects env override (canonicalized to https://)", async () => {
@@ -2212,6 +2281,7 @@ describe("rooms wiring", () => {
     relayInstances.length = 0;
     _defaultConnectImpl = async () => undefined;
     delete process.env["REMOTE_PI_RELAY"];
+    _resetCwdLockForTest();
     const qr = await import("./pairing/qr.js");
     (qr.qrSession.consumeToken as unknown as ReturnType<typeof vi.fn>).mockImplementation(
       (token: string) => {
@@ -2240,7 +2310,7 @@ describe("rooms wiring", () => {
     expect(opts.roomMeta?.name).toContain("remote-pi-test-room");
   });
 
-  test("_cmdStart with different cwds uses different roomIds", async () => {
+  test("cwd relocation keeps the same ID-keyed room", async () => {
     const capturedOpts: Array<{ roomId?: string }> = [];
     _defaultConnectImpl = async (opts?: unknown) => {
       capturedOpts.push(opts as { roomId?: string });
@@ -2248,6 +2318,7 @@ describe("rooms wiring", () => {
 
     captureHandler("remote-pi");
     await _connectForTest(makeMockCtx("/tmp/remote-pi-A"));
+    const identityBefore = _getRuntimeIdentityForTest();
 
     const stop = captureHandler("remote-pi stop");
     await stop("", makeMockCtx());
@@ -2255,7 +2326,8 @@ describe("rooms wiring", () => {
     await _connectForTest(makeMockCtx("/tmp/remote-pi-B"));
 
     expect(capturedOpts).toHaveLength(2);
-    expect(capturedOpts[0]!.roomId).not.toBe(capturedOpts[1]!.roomId);
+    expect(capturedOpts[0]!.roomId).toBe(capturedOpts[1]!.roomId);
+    expect(_getRuntimeIdentityForTest()).toEqual(identityBefore);
   });
 
   test("RoomAlreadyOpenError from relay → ui.notify error, state stays idle", async () => {
@@ -2918,27 +2990,27 @@ describe("pi session name → remote-pi mesh name sync", () => {
     try { rmSync(syncCwd, { recursive: true, force: true }); } catch { /* best-effort */ }
   });
 
-  test("join requestedName prefers pi.getSessionName() over config", async () => {
-    // Config says "crow" but pi session name says "remotepi" → join as "remotepi".
+  test("join presentation prefers pi.getSessionName() without changing durable identity", async () => {
+    // Config says "crow" but pi session name says "remotepi" → present as
+    // "remotepi" while workspace/agent IDs remain independent of the name.
+    writeProtectedLocalConfig(syncCwd, "crow");
     process.env["REMOTE_PI_DIRECT_CONFIG"] = JSON.stringify({
       agent_name: "crow", auto_start_relay: false,
     });
     const root = captureHandler("remote-pi");
     _setPiForTest(makeSyncSpyPi(vi.fn(), "remotepi")); // after capture so it isn't clobbered
     await root("", makeMockCtx(syncCwd));
-    // The cwd-lock reserves (cwd, requestedName); the suffix-stripped base must
-    // be the pi session name, not the config name.
+    // Immutable IDs own the process lock; this compatibility presentation
+    // accessor must still use the Pi session name rather than the config name.
     expect(_getLockedNameForTest()?.replace(/#\d+$/, "")).toBe("remotepi");
     const stop = captureHandler("remote-pi stop");
     await stop("", makeMockCtx(syncCwd));
     _resetCwdLockForTest();
   });
 
-  test("session_start persists the pi session name to agent_name (before join)", async () => {
-    // No config on disk yet; no mesh node up. The session_start hook runs
-    // _syncNameFromPi, which persists the pi name so the next join uses it.
-    // _syncNameFromPi + _renameAgent key persistence off process.cwd() (the same
-    // cwd axis the live agent uses), so chdir into the isolated temp cwd.
+  test("pi session name remains presentation-only and does not create durable config", async () => {
+    // No config on disk and no mesh node. Pi `/name` may update live
+    // presentation, but it has no durable-config write authority.
     delete process.env["REMOTE_PI_DIRECT_CONFIG"];
     const prevCwd = process.cwd();
     mkdirSync(syncCwd, { recursive: true });
@@ -2947,8 +3019,7 @@ describe("pi session name → remote-pi mesh name sync", () => {
       captureEventHandler("session_start"); // ensure the handler is registered
       _setPiForTest(makeSyncSpyPi(vi.fn(), "frompiname"));
       await _syncNameFromPiForTest();
-      const cfg = JSON.parse(readFileSync(`${syncCwd}/.pi/remote-pi/config.json`, "utf8"));
-      expect(cfg.agent_name).toBe("frompiname");
+      expect(existsSync(`${syncCwd}/.pi/remote-pi/config.json`)).toBe(false);
     } finally {
       process.chdir(prevCwd);
       _resetCwdLockForTest();
@@ -2956,6 +3027,7 @@ describe("pi session name → remote-pi mesh name sync", () => {
   });
 
   test("unset pi session name does NOT clobber an existing agent_name", async () => {
+    writeProtectedLocalConfig(syncCwd, "crow");
     process.env["REMOTE_PI_DIRECT_CONFIG"] = JSON.stringify({
       agent_name: "crow", auto_start_relay: false,
     });
@@ -2969,9 +3041,539 @@ describe("pi session name → remote-pi mesh name sync", () => {
   });
 });
 
+// ── child-safe legacy exposure ────────────────────────────────────────────────
+
+describe("child-safe legacy exposure", () => {
+  let childCwd: string;
+
+  async function currentRelayDescriptor(requestedExposure: "local" | "relay" = "relay") {
+    const remotePi = (await import("./session/package_identity.js")).loadRemotePiPackageIdentity();
+    return {
+      version: 1,
+      kind: "pi-subagent-child",
+      sessionClass: "child",
+      runId: "run-current-relay",
+      workspaceId: "11111111-1111-4111-8111-111111111111",
+      agentId: "22222222-2222-4222-8222-222222222222",
+      processEpoch: "33333333-3333-4333-8333-333333333333",
+      parentAgentId: "44444444-4444-4444-8444-444444444444",
+      index: 0,
+      requestedExposure,
+      producer: { name: "pi-subagents", version: "0.34.0", protocolVersion: 1, manifestSha256: "a".repeat(64) },
+      compatibility: {
+        remotePi: {
+          state: "compatible",
+          version: remotePi.version,
+          protocolVersion: 1,
+          manifestSha256: remotePi.manifestSha256,
+        },
+      },
+    };
+  }
+
+  beforeEach(async () => {
+    delete process.env["PI_SUBAGENT_DESCRIPTOR"];
+    delete process.env["PI_SUBAGENT_CHILD"];
+    delete process.env["PI_SUBAGENT_RELAY_EXPOSURE_CAPABILITY"];
+    delete process.env["REMOTE_PI_DIRECT_CONFIG"];
+    childCwd = mkdtempSync(join(tmpdir(), "remote-pi-child-"));
+    relayRef.current = null;
+    relayInstances.length = 0;
+    _defaultConnectImpl = async () => undefined;
+    _setDisposedForTest(false);
+    _setAutoInitedForTest(false);
+    _resetCwdLockForTest();
+    const stop = captureHandler("remote-pi stop");
+    await stop("", makeMockCtx(childCwd));
+  });
+
+  afterEach(async () => {
+    const stop = captureHandler("remote-pi stop");
+    await stop("", makeMockCtx(childCwd));
+    _resetCwdLockForTest();
+    _setAutoInitedForTest(false);
+    delete process.env["PI_SUBAGENT_DESCRIPTOR"];
+    delete process.env["PI_SUBAGENT_CHILD"];
+    delete process.env["PI_SUBAGENT_RELAY_EXPOSURE_CAPABILITY"];
+    delete process.env["REMOTE_PI_DIRECT_CONFIG"];
+    rmSync(childCwd, { recursive: true, force: true });
+  });
+
+  test("session_start auto-joins a legacy child locally without config or relay", async () => {
+    process.env["PI_SUBAGENT_CHILD"] = "1";
+    const sessionStart = captureEventHandler("session_start") as unknown as (
+      event: AnyEvent,
+      ctx: ReturnType<typeof makeMockCtx>,
+    ) => void;
+    _setPiForTest({
+      getSessionName: () => "ephemeral-reviewer",
+      sendMessage: () => undefined,
+      sendUserMessage: () => undefined,
+    } as unknown as ExtensionAPI);
+
+    sessionStart({ type: "session_start" }, makeMockCtx(childCwd));
+
+    await vi.waitFor(() => expect(_hasMeshNodeForTest()).toBe(true));
+    expect(_getLockedNameForTest()?.replace(/#\d+$/, "")).toBe("ephemeral-reviewer");
+    expect(_getState()).toBe("idle");
+    expect(relayInstances).toHaveLength(0);
+    expect(existsSync(join(childCwd, ".pi", "remote-pi", "config.json"))).toBe(false);
+  });
+
+  test("cwd auto_start_relay cannot promote a legacy child", async () => {
+    process.env["PI_SUBAGENT_CHILD"] = "1";
+    process.env["REMOTE_PI_DIRECT_CONFIG"] = JSON.stringify({
+      agent_name: "durable-parent",
+      auto_start_relay: true,
+    });
+    const root = captureHandler("remote-pi");
+    const ctx = makeMockCtx(childCwd);
+
+    await root("", ctx);
+
+    expect(_hasMeshNodeForTest()).toBe(true);
+    expect(_getState()).toBe("idle");
+    expect(relayInstances).toHaveLength(0);
+    expect(ctx.ui.notify).toHaveBeenCalledWith(expect.stringContaining("source: legacy-marker"), "info");
+  });
+
+  test("an explicit relay start is denied for a legacy child", async () => {
+    process.env["PI_SUBAGENT_CHILD"] = "1";
+    process.env["REMOTE_PI_DIRECT_CONFIG"] = JSON.stringify({ auto_start_relay: true });
+    captureHandler("remote-pi"); // captures immutable launch classification
+    const ctx = makeMockCtx(childCwd);
+
+    await _startRelayForTest(ctx);
+
+    expect(_getState()).toBe("idle");
+    expect(relayInstances).toHaveLength(0);
+    expect(ctx.ui.notify).toHaveBeenCalledWith(expect.stringContaining("Relay denied"), "warning");
+  });
+
+  test("removing the marker after extension initialization cannot self-promote", async () => {
+    process.env["PI_SUBAGENT_CHILD"] = "1";
+    captureHandler("remote-pi");
+    delete process.env["PI_SUBAGENT_CHILD"];
+    const ctx = makeMockCtx(childCwd);
+
+    await _startRelayForTest(ctx);
+
+    expect(_getState()).toBe("idle");
+    expect(relayInstances).toHaveLength(0);
+    expect(ctx.ui.notify).toHaveBeenCalledWith(expect.stringContaining("Relay denied"), "warning");
+  });
+
+  test("current relay request without a broker-issued capability stays local with zero relay construction", async () => {
+    process.env["PI_SUBAGENT_CHILD"] = "1";
+    process.env["PI_SUBAGENT_DESCRIPTOR"] = JSON.stringify(await currentRelayDescriptor());
+    const root = captureHandler("remote-pi");
+    const ctx = makeMockCtx(childCwd);
+
+    await root("", ctx);
+
+    expect(_hasMeshNodeForTest()).toBe(true);
+    expect(_getState()).toBe("idle");
+    expect(relayInstances).toHaveLength(0);
+    expect(ctx.ui.notify).toHaveBeenCalledWith(expect.stringMatching(/capability|required|denied/i), expect.any(String));
+  });
+
+  test("a forged process-bound capability is consumed from env but cannot construct a relay", async () => {
+    const descriptor = await currentRelayDescriptor();
+    process.env["PI_SUBAGENT_CHILD"] = "1";
+    process.env["PI_SUBAGENT_DESCRIPTOR"] = JSON.stringify(descriptor);
+    process.env["PI_SUBAGENT_RELAY_EXPOSURE_CAPABILITY"] = `rpel1.77777777-7777-4777-8777-777777777777.${"z".repeat(43)}`;
+    const root = captureHandler("remote-pi");
+    expect(process.env["PI_SUBAGENT_RELAY_EXPOSURE_CAPABILITY"]).toBeUndefined();
+    const ctx = makeMockCtx(childCwd);
+
+    await root("", ctx);
+
+    expect(_hasMeshNodeForTest()).toBe(true);
+    expect(_getState()).toBe("idle");
+    expect(relayInstances).toHaveLength(0);
+    expect(ctx.ui.notify).toHaveBeenCalledWith(expect.stringMatching(/forged_capability/), "warning");
+  });
+
+  test.each([false, true])("a broker-issued process-bound capability promotes one current child relay (protected config: %s)", async (withProtectedConfig) => {
+    const descriptor = await currentRelayDescriptor();
+    if (withProtectedConfig) writeProtectedLocalConfig(childCwd, "configured-child", true);
+    const capability = `rpel1.77777777-7777-4777-8777-777777777777.${"a".repeat(43)}`;
+    process.env["PI_SUBAGENT_CHILD"] = "1";
+    process.env["PI_SUBAGENT_DESCRIPTOR"] = JSON.stringify(descriptor);
+    process.env["PI_SUBAGENT_RELAY_EXPOSURE_CAPABILITY"] = capability;
+
+    const { MeshNode } = await import("./session/mesh_node.js");
+    const originalRequest = MeshNode.prototype.request;
+    const request = vi.spyOn(MeshNode.prototype, "request").mockImplementation(function (
+      this: InstanceType<typeof MeshNode>,
+      to: string,
+      body: unknown,
+      timeoutMs?: number,
+    ) {
+      if (to === "broker" && (body as { type?: string } | null)?.type === "relay_lease_activate") {
+        const issuedAt = Date.now();
+        return Promise.resolve({
+          from: "broker",
+          to: this.address(),
+          id: "88888888-8888-4888-8888-888888888888",
+          re: "99999999-9999-4999-8999-999999999999",
+          body: {
+            type: "relay_lease_activate_result",
+            ok: true,
+            state: "activated",
+            lease: {
+              relayExposureLeaseId: "77777777-7777-4777-8777-777777777777",
+              parent: {
+                workspaceId: descriptor.workspaceId,
+                agentId: descriptor.parentAgentId,
+                processEpoch: "55555555-5555-4555-8555-555555555555",
+              },
+              binding: {
+                runId: descriptor.runId,
+                workspaceId: descriptor.workspaceId,
+                agentId: descriptor.agentId,
+                processEpoch: descriptor.processEpoch,
+                mode: "relay",
+              },
+              issuedAt,
+              expiresAt: issuedAt + 30_000,
+            },
+          },
+        });
+      }
+      return originalRequest.call(this, to, body, timeoutMs);
+    });
+
+    const root = captureHandler("remote-pi");
+    expect(process.env["PI_SUBAGENT_RELAY_EXPOSURE_CAPABILITY"]).toBeUndefined();
+    try {
+      await root("", makeMockCtx(childCwd));
+      expect(_hasMeshNodeForTest()).toBe(true);
+      expect(_getState()).toBe("started");
+      expect(relayInstances).toHaveLength(1);
+      expect(request).toHaveBeenCalledWith("broker", expect.objectContaining({
+        type: "relay_lease_activate",
+        capability,
+        runId: descriptor.runId,
+        mode: "relay",
+      }), 2000);
+
+      const activeLease = _getRelayExposureLeaseForTest();
+      expect(activeLease).not.toBeNull();
+      const renewedExpiry = activeLease!.expiresAt + 30_000;
+      expect(_handleRelayExposureBrokerNoticeForTest({
+        type: "relay_lease_renewed",
+        version: 1,
+        relayExposureLeaseId: activeLease!.relayExposureLeaseId,
+        binding: activeLease!.binding,
+        expiresAt: renewedExpiry,
+      })).toBe(true);
+      expect(_getRelayExposureLeaseForTest()?.expiresAt).toBe(renewedExpiry);
+
+      expect(_handleRelayExposureBrokerNoticeForTest({
+        type: "relay_lease_closed",
+        version: 1,
+        relayExposureLeaseId: "99999999-9999-4999-8999-999999999999",
+        binding: activeLease!.binding,
+        reason: "expired",
+      })).toBe(true);
+      expect(_getState()).toBe("started");
+
+      if (withProtectedConfig) {
+        _handleMeshBrokerReconnectForTest();
+      } else {
+        expect(_handleRelayExposureBrokerNoticeForTest({
+          type: "relay_lease_closed",
+          version: 1,
+          relayExposureLeaseId: activeLease!.relayExposureLeaseId,
+          binding: activeLease!.binding,
+          reason: "parent_revoked",
+        })).toBe(true);
+      }
+      expect(_getRelayExposureLeaseForTest()).toBeNull();
+      expect(_getState()).toBe("idle");
+      expect(_hasMeshNodeForTest()).toBe(true);
+    } finally {
+      request.mockRestore();
+    }
+  });
+
+  test("a fresh exact live-promotion notice opens one relay and exact closure demotes without leaving local mesh", async () => {
+    const descriptor = await currentRelayDescriptor("local");
+    process.env["PI_SUBAGENT_CHILD"] = "1";
+    process.env["PI_SUBAGENT_DESCRIPTOR"] = JSON.stringify(descriptor);
+    const { MeshNode } = await import("./session/mesh_node.js");
+    const originalOnMessage = MeshNode.prototype.onMessage;
+    let deliverMeshMessage: Parameters<InstanceType<typeof MeshNode>["onMessage"]>[0] | undefined;
+    const onMessage = vi.spyOn(MeshNode.prototype, "onMessage").mockImplementation(function (
+      this: InstanceType<typeof MeshNode>,
+      handler: Parameters<InstanceType<typeof MeshNode>["onMessage"]>[0],
+    ) {
+      deliverMeshMessage = handler;
+      return originalOnMessage.call(this, handler);
+    });
+    const root = captureHandler("remote-pi");
+    const ctx = makeMockCtx(childCwd);
+
+    await root("", ctx);
+    onMessage.mockRestore();
+    expect(deliverMeshMessage).toBeTypeOf("function");
+    expect(_hasMeshNodeForTest()).toBe(true);
+    expect(_getState()).toBe("idle");
+    expect(relayInstances).toHaveLength(0);
+
+    const issuedAt = Date.now();
+    const lease = {
+      relayExposureLeaseId: "77777777-7777-4777-8777-777777777777",
+      parent: {
+        workspaceId: descriptor.workspaceId,
+        agentId: descriptor.parentAgentId,
+        processEpoch: "55555555-5555-4555-8555-555555555555",
+      },
+      binding: {
+        runId: descriptor.runId,
+        workspaceId: descriptor.workspaceId,
+        agentId: descriptor.agentId,
+        processEpoch: descriptor.processEpoch,
+        mode: "relay" as const,
+      },
+      issuedAt,
+      expiresAt: issuedAt + 30_000,
+    };
+    const notice = { type: "relay_lease_promoted" as const, version: 1 as const, lease };
+
+    deliverMeshMessage!({
+      from: "broker",
+      to: descriptor.agentId,
+      id: "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa",
+      re: null,
+      body: notice,
+    });
+    await vi.waitFor(() => expect(_getState()).toBe("started"));
+    expect(_hasMeshNodeForTest()).toBe(true);
+    expect(_getRelayExposureLeaseForTest()).toEqual(lease);
+    expect(relayInstances).toHaveLength(1);
+
+    // Duplicate delivery is idempotent and never constructs a second relay.
+    expect(await _applyRelayExposurePromotedNoticeForTest(notice, ctx)).toBe(true);
+    expect(relayInstances).toHaveLength(1);
+
+    // Fresh-looking replacement IDs and stale binding epochs/runs are consumed
+    // as broker notices but cannot replace the current exact lease.
+    for (const staleLease of [
+      { ...lease, relayExposureLeaseId: "88888888-8888-4888-8888-888888888888" },
+      { ...lease, relayExposureLeaseId: "88888888-8888-4888-8888-888888888888", binding: { ...lease.binding, runId: "run-stale" } },
+      { ...lease, relayExposureLeaseId: "88888888-8888-4888-8888-888888888888", binding: { ...lease.binding, processEpoch: "66666666-6666-4666-8666-666666666666" } },
+    ]) {
+      expect(await _applyRelayExposurePromotedNoticeForTest({
+        type: "relay_lease_promoted",
+        version: 1,
+        lease: staleLease,
+      }, ctx)).toBe(true);
+    }
+    expect(_getRelayExposureLeaseForTest()).toEqual(lease);
+    expect(relayInstances).toHaveLength(1);
+
+    expect(_handleRelayExposureBrokerNoticeForTest({
+      type: "relay_lease_closed",
+      version: 1,
+      relayExposureLeaseId: lease.relayExposureLeaseId,
+      binding: lease.binding,
+      reason: "parent_revoked",
+    })).toBe(true);
+    expect(_getState()).toBe("idle");
+    expect(_getRelayExposureLeaseForTest()).toBeNull();
+    expect(_hasMeshNodeForTest()).toBe(true);
+  });
+
+  test("keeps the same live lease active when renewal lands during relay connect", async () => {
+    const descriptor = await currentRelayDescriptor("local");
+    process.env["PI_SUBAGENT_CHILD"] = "1";
+    process.env["PI_SUBAGENT_DESCRIPTOR"] = JSON.stringify(descriptor);
+    const root = captureHandler("remote-pi");
+    const ctx = makeMockCtx(childCwd);
+    await root("", ctx);
+
+    const issuedAt = Date.now();
+    const lease = {
+      relayExposureLeaseId: "77777777-7777-4777-8777-777777777777",
+      parent: {
+        workspaceId: descriptor.workspaceId,
+        agentId: descriptor.parentAgentId,
+        processEpoch: "55555555-5555-4555-8555-555555555555",
+      },
+      binding: {
+        runId: descriptor.runId,
+        workspaceId: descriptor.workspaceId,
+        agentId: descriptor.agentId,
+        processEpoch: descriptor.processEpoch,
+        mode: "relay" as const,
+      },
+      issuedAt,
+      expiresAt: issuedAt + 30_000,
+    };
+    let releaseConnect!: () => void;
+    _defaultConnectImpl = () => new Promise<void>((resolve) => { releaseConnect = resolve; });
+
+    const applying = _applyRelayExposurePromotedNoticeForTest({
+      type: "relay_lease_promoted",
+      version: 1,
+      lease,
+    }, ctx);
+    await vi.waitFor(() => expect(relayInstances[0]?.connect).toHaveBeenCalledTimes(1));
+    const renewedExpiry = lease.expiresAt + 30_000;
+    expect(_handleRelayExposureBrokerNoticeForTest({
+      type: "relay_lease_renewed",
+      version: 1,
+      relayExposureLeaseId: lease.relayExposureLeaseId,
+      binding: lease.binding,
+      expiresAt: renewedExpiry,
+    })).toBe(true);
+    releaseConnect();
+    expect(await applying).toBe(true);
+
+    expect(_getState()).toBe("started");
+    expect(_getRelayExposureLeaseForTest()).toMatchObject({
+      relayExposureLeaseId: lease.relayExposureLeaseId,
+      expiresAt: renewedExpiry,
+    });
+    expect(relayInstances).toHaveLength(1);
+    expect(relayInstances[0]!.close).not.toHaveBeenCalled();
+    expect(_hasMeshNodeForTest()).toBe(true);
+  });
+
+  test("live-promotion apply failure closes the exact active lease and stays local", async () => {
+    const descriptor = await currentRelayDescriptor("local");
+    process.env["PI_SUBAGENT_CHILD"] = "1";
+    process.env["PI_SUBAGENT_DESCRIPTOR"] = JSON.stringify(descriptor);
+    const root = captureHandler("remote-pi");
+    const ctx = makeMockCtx(childCwd);
+    await root("", ctx);
+
+    const issuedAt = Date.now();
+    const lease = {
+      relayExposureLeaseId: "77777777-7777-4777-8777-777777777777",
+      parent: {
+        workspaceId: descriptor.workspaceId,
+        agentId: descriptor.parentAgentId,
+        processEpoch: "55555555-5555-4555-8555-555555555555",
+      },
+      binding: {
+        runId: descriptor.runId,
+        workspaceId: descriptor.workspaceId,
+        agentId: descriptor.agentId,
+        processEpoch: descriptor.processEpoch,
+        mode: "relay" as const,
+      },
+      issuedAt,
+      expiresAt: issuedAt + 30_000,
+    };
+    _defaultConnectImpl = async () => { throw new Error("live promotion connect failed"); };
+
+    const { MeshNode } = await import("./session/mesh_node.js");
+    const originalRequest = MeshNode.prototype.request;
+    const request = vi.spyOn(MeshNode.prototype, "request").mockImplementation(function (
+      this: InstanceType<typeof MeshNode>,
+      to: string,
+      body: unknown,
+      timeoutMs?: number,
+    ) {
+      if (to === "broker" && (body as { type?: string } | null)?.type === "relay_lease_close") {
+        return Promise.resolve({
+          from: "broker",
+          to: this.address(),
+          id: "88888888-8888-4888-8888-888888888888",
+          re: "99999999-9999-4999-8999-999999999999",
+          body: { type: "relay_lease_close_result", ok: true, state: "closed", lease },
+        });
+      }
+      return originalRequest.call(this, to, body, timeoutMs);
+    });
+
+    try {
+      expect(await _applyRelayExposurePromotedNoticeForTest({
+        type: "relay_lease_promoted",
+        version: 1,
+        lease,
+      }, ctx)).toBe(true);
+      expect(request).toHaveBeenCalledWith("broker", {
+        type: "relay_lease_close",
+        relayExposureLeaseId: lease.relayExposureLeaseId,
+        binding: lease.binding,
+        reason: "controlled_shutdown",
+      }, 2_000);
+      expect(_getState()).toBe("idle");
+      expect(_getRelayExposureLeaseForTest()).toBeNull();
+      expect(_hasMeshNodeForTest()).toBe(true);
+      expect(relayInstances).toHaveLength(1);
+    } finally {
+      request.mockRestore();
+    }
+  });
+
+  test("child Pi names remain runtime-only and never create shared config", async () => {
+    process.env["PI_SUBAGENT_CHILD"] = "1";
+    captureHandler("remote-pi"); // captures immutable launch classification
+    const previousCwd = process.cwd();
+    process.chdir(childCwd);
+    try {
+      _setPiForTest({
+        getSessionName: () => "ephemeral-writer",
+        sendMessage: () => undefined,
+        sendUserMessage: () => undefined,
+      } as unknown as ExtensionAPI);
+      await _syncNameFromPiForTest();
+      expect(existsSync(join(childCwd, ".pi", "remote-pi", "config.json"))).toBe(false);
+    } finally {
+      process.chdir(previousCwd);
+    }
+  });
+
+  test("child setup cannot rewrite durable cwd configuration", async () => {
+    process.env["PI_SUBAGENT_CHILD"] = "1";
+    const configDir = join(childCwd, ".pi", "remote-pi");
+    const configPath = join(configDir, "config.json");
+    mkdirSync(configDir, { recursive: true });
+    const before = '{\n  "agent_name": "durable-parent",\n  "auto_start_relay": true\n}\n';
+    writeFileSync(configPath, before);
+    const setup = captureHandler("remote-pi setup");
+    const ctx = makeMockCtx(childCwd);
+
+    await setup("", ctx);
+
+    expect(readFileSync(configPath, "utf8")).toBe(before);
+    expect(ctx.ui.notify).toHaveBeenCalledWith(expect.stringContaining("disabled for child sessions"), "warning");
+  });
+
+  test("child name sync leaves an existing durable config byte-for-byte unchanged", async () => {
+    process.env["PI_SUBAGENT_CHILD"] = "1";
+    captureHandler("remote-pi"); // captures immutable launch classification
+    const configDir = join(childCwd, ".pi", "remote-pi");
+    const configPath = join(configDir, "config.json");
+    mkdirSync(configDir, { recursive: true });
+    const before = '{\n  "agent_name": "durable-parent",\n  "auto_start_relay": true\n}\n';
+    writeFileSync(configPath, before);
+    const previousCwd = process.cwd();
+    process.chdir(childCwd);
+    try {
+      _setPiForTest({
+        getSessionName: () => "ephemeral-reviewer",
+        sendMessage: () => undefined,
+        sendUserMessage: () => undefined,
+      } as unknown as ExtensionAPI);
+      await _syncNameFromPiForTest();
+      await _handleControl("rename:child-chosen-name");
+      expect(readFileSync(configPath, "utf8")).toBe(before);
+    } finally {
+      process.chdir(previousCwd);
+    }
+  });
+});
+
 // ── relay control channel + relay-state event (Cockpit on/off button) ──────────
 
 describe("relay control channel + relay-state event", () => {
+  let controlCwd: string;
   function makeSpyPi(sendMessage: ReturnType<typeof vi.fn>) {
     return {
       on: () => undefined, registerCommand: () => undefined,
@@ -2998,8 +3600,15 @@ describe("relay control channel + relay-state event", () => {
     relayInstances.length = 0;
     _defaultConnectImpl = async () => undefined;
     _setDisposedForTest(false);
+    _resetCwdLockForTest();
+    controlCwd = mkdtempSync(join(tmpdir(), "remote-pi-control-"));
+    _seedRuntimeIdentityForTest(makeMockCtx(controlCwd));
     const stop = captureHandler("remote-pi stop");
-    await stop("", makeMockCtx());
+    await stop("", makeMockCtx(controlCwd));
+  });
+
+  afterEach(() => {
+    try { rmSync(controlCwd, { recursive: true, force: true }); } catch { /* best effort */ }
   });
 
   // Transparency: a CTRL_PREFIX-tagged input is swallowed by the `input` hook
@@ -3056,20 +3665,28 @@ describe("relay control channel + relay-state event", () => {
     expect(_getState()).toBe("idle");
   });
 
-  test("rename:<name> renames live (broker re-register + relay swap), process/session survive", async () => {
+  test("rename:<name> updates presentation without broker/relay room churn", async () => {
     const sendMessage = vi.fn();
     captureHandler("remote-pi");
     _setPiForTest(makeSpyPi(sendMessage));
-    await _connectForTest(makeMockCtx());
+    await _connectForTest(makeMockCtx(controlCwd));
     expect(_getState()).toBe("started");
     expect(_hasMeshNodeForTest()).toBe(true);
 
+    const roomBefore = (relayInstances[0]!.connect.mock.calls[0]![0] as { roomId: string }).roomId;
     sendMessage.mockClear();
     await _handleControl("rename:Renamed");
 
-    // The mesh node + relay survive (no process restart); relay back up.
+    // Mesh + relay stay live and the canonical room is unchanged.
     expect(_hasMeshNodeForTest()).toBe(true);
     expect(_getState()).toBe("started");
+    expect(relayInstances).toHaveLength(1);
+    expect((relayInstances[0]!.connect.mock.calls[0]![0] as { roomId: string }).roomId).toBe(roomBefore);
+    expect(relayInstances[0]!.sendControl).toHaveBeenCalledWith(expect.objectContaining({
+      type: "room_meta_update",
+      room_id: roomBefore,
+      meta: { name: "Renamed" },
+    }));
     // Cockpit is told the new effective name via remote-pi:name-assigned.
     const ev = sendMessage.mock.calls
       .map((c) => c[0] as { customType?: string; display?: boolean; details?: Record<string, unknown> })
@@ -3079,12 +3696,320 @@ describe("relay control channel + relay-state event", () => {
     expect(ev!.display).toBe(false);
     expect(ev!.details).toMatchObject({ requested: "Renamed", assigned: "Renamed", changed: false });
 
-    // Clean up: rename churns the real UDS broker (leave+rejoin) and leaves the
-    // mesh/relay live — tear down so it can't leak into later tests (an orphaned
-    // broker socket makes a subsequent bind flaky).
+    // Clean up live mesh/relay state.
     const stop = captureHandler("remote-pi stop");
     await stop("", makeMockCtx());
     _resetCwdLockForTest();
+  });
+
+  test("failed broker presentation update preserves live presentation and relay metadata", async () => {
+    const sendMessage = vi.fn();
+    captureHandler("remote-pi");
+    _setPiForTest(makeSpyPi(sendMessage));
+    await _connectForTest(makeMockCtx(controlCwd));
+    const beforePresentation = _getRuntimePresentationForTest();
+    const beforeRoomMeta = _getRoomMetaForTest();
+    const { inspectLocalConfig } = await import("./session/local_config.js");
+    const beforeConfig = inspectLocalConfig(controlCwd);
+    expect(beforePresentation).toBeTruthy();
+    expect(beforeRoomMeta?.name).toBe(beforePresentation);
+
+    const { MeshNode } = await import("./session/mesh_node.js");
+    const rename = vi.spyOn(MeshNode.prototype, "rename")
+      .mockRejectedValueOnce(new Error("broker does not support presentation updates"));
+    relayInstances[0]!.sendControl.mockClear();
+    sendMessage.mockClear();
+    try {
+      await _handleControl("rename:MustNotLeak");
+    } finally {
+      rename.mockRestore();
+    }
+
+    expect(_getRuntimePresentationForTest()).toBe(beforePresentation);
+    expect(_getRoomMetaForTest()).toEqual(beforeRoomMeta);
+    expect(inspectLocalConfig(controlCwd)).toEqual(beforeConfig);
+    expect(relayInstances[0]!.sendControl).not.toHaveBeenCalledWith(expect.objectContaining({
+      type: "room_meta_update",
+      meta: { name: "MustNotLeak" },
+    }));
+    expect(sendMessage).not.toHaveBeenCalledWith(expect.objectContaining({
+      customType: "remote-pi:name-assigned",
+    }));
+  });
+
+  test("persistent rename CAS failure rolls live broker presentation back without relay divergence", async () => {
+    _resetCwdLockForTest();
+    writeProtectedLocalConfig(controlCwd, "Before");
+    _seedRuntimeIdentityForTest(makeMockCtx(controlCwd));
+    const { inspectLocalConfig, saveLocalConfig } = await import("./session/local_config.js");
+    const sendMessage = vi.fn();
+    _setPiForTest(makeSpyPi(sendMessage));
+    await _connectForTest(makeMockCtx(controlCwd));
+    const roomBefore = _getRoomMetaForTest();
+    expect(_getRuntimePresentationForTest()).toBe("Before");
+    expect(roomBefore?.name).toBe("Before");
+
+    _setBeforePersistentRenameWriteForTest(() => {
+      const concurrent = inspectLocalConfig(controlCwd);
+      saveLocalConfig(controlCwd, { agent_name: "Concurrent" }, {
+        expectedRevision: concurrent.revision,
+        expectedState: concurrent.state,
+        expectedHash: "hash" in concurrent ? concurrent.hash ?? null : null,
+      });
+    });
+    relayInstances[0]!.sendControl.mockClear();
+    sendMessage.mockClear();
+
+    await _handleControl("rename:Requested");
+
+    const after = inspectLocalConfig(controlCwd);
+    expect(after).toMatchObject({
+      state: "loaded",
+      revision: 2,
+      config: { agent_name: "Concurrent" },
+    });
+    expect(_getRuntimePresentationForTest()).toBe("Before");
+    expect(_getRoomMetaForTest()).toEqual(roomBefore);
+    expect(relayInstances[0]!.sendControl).not.toHaveBeenCalledWith(expect.objectContaining({
+      type: "room_meta_update",
+      meta: { name: "Requested" },
+    }));
+    expect(sendMessage).not.toHaveBeenCalledWith(expect.objectContaining({
+      customType: "remote-pi:name-assigned",
+    }));
+  });
+
+  test("failed broker rollback tears down live exposure and reconciles to durable config", async () => {
+    _resetCwdLockForTest();
+    writeProtectedLocalConfig(controlCwd, "Before");
+    _seedRuntimeIdentityForTest(makeMockCtx(controlCwd));
+    const { inspectLocalConfig, saveLocalConfig } = await import("./session/local_config.js");
+    _setPiForTest(makeSpyPi(vi.fn()));
+    await _connectForTest(makeMockCtx(controlCwd));
+    _setBeforePersistentRenameWriteForTest(() => {
+      const concurrent = inspectLocalConfig(controlCwd);
+      saveLocalConfig(controlCwd, { agent_name: "Concurrent" }, {
+        expectedRevision: concurrent.revision,
+        expectedState: concurrent.state,
+        expectedHash: "hash" in concurrent ? concurrent.hash ?? null : null,
+      });
+    });
+
+    const { MeshNode } = await import("./session/mesh_node.js");
+    const originalRename = MeshNode.prototype.rename;
+    let renameCalls = 0;
+    const rename = vi.spyOn(MeshNode.prototype, "rename").mockImplementation(function (this: InstanceType<typeof MeshNode>, name: string) {
+      renameCalls++;
+      if (renameCalls === 2) return Promise.reject(new Error("rollback transport failed"));
+      return originalRename.call(this, name);
+    });
+    try {
+      await _handleControl("rename:Requested");
+    } finally {
+      rename.mockRestore();
+    }
+
+    expect(renameCalls).toBe(2);
+    expect(inspectLocalConfig(controlCwd)).toMatchObject({ config: { agent_name: "Concurrent" } });
+    expect(_hasMeshNodeForTest()).toBe(false);
+    expect(_getState()).toBe("idle");
+    expect(_getRuntimePresentationForTest()).toBe("Concurrent");
+  });
+
+  test("operator commands delegate and withdraw only the selected live parent connection", async () => {
+    captureHandler("remote-pi");
+    _setPiForTest(makeSpyPi(vi.fn()));
+    await _connectForTest(makeMockCtx(controlCwd));
+    const authorize = captureHandler("remote-pi relay-parent authorize");
+    const revoke = captureHandler("remote-pi relay-parent revoke");
+    const ctx = makeMockCtx(controlCwd);
+
+    await authorize("", ctx);
+    expect(ctx.ui.notify).toHaveBeenCalledWith(expect.stringMatching(/relay parent authorized.*live connection/i), "info");
+    await revoke("", ctx);
+    expect(ctx.ui.notify).toHaveBeenCalledWith(expect.stringMatching(/delegation revoked.*leases are closing/i), "info");
+  });
+
+  test("operator child-policy persists the project fallback and withdrawal revokes live parent delegation", async () => {
+    captureHandler("remote-pi");
+    _setPiForTest(makeSpyPi(vi.fn()));
+    await _connectForTest(makeMockCtx(controlCwd));
+    const childPolicy = captureHandler("remote-pi child-policy");
+    const authorize = captureHandler("remote-pi relay-parent authorize");
+    const ctx = makeMockCtx(controlCwd);
+
+    await childPolicy("relay", ctx);
+    const localConfig = await import("./session/local_config.js");
+    expect(localConfig.loadLocalConfig(controlCwd)).toMatchObject({ child_exposure: "relay" });
+    await authorize("", ctx);
+    await childPolicy("local", ctx);
+    expect(localConfig.loadLocalConfig(controlCwd)).toMatchObject({ child_exposure: "local" });
+    expect(ctx.ui.notify).toHaveBeenCalledWith(expect.stringMatching(/live parent delegation.*withdrawn/i), "info");
+  });
+
+  test("lowering a persisted relay child policy without a mesh fails closed", async () => {
+    const childPolicy = captureHandler("remote-pi child-policy");
+    const ctx = makeMockCtx(controlCwd);
+    const localConfig = await import("./session/local_config.js");
+
+    await childPolicy("relay", ctx);
+    expect(localConfig.loadLocalConfig(controlCwd)).toMatchObject({ child_exposure: "relay" });
+    await childPolicy("local", ctx);
+
+    expect(localConfig.loadLocalConfig(controlCwd)).toMatchObject({ child_exposure: "relay" });
+    expect(ctx.ui.notify).toHaveBeenCalledWith(
+      expect.stringMatching(/join the local mesh.*withdrawal can be confirmed.*not changed/i),
+      "warning",
+    );
+  });
+
+  test("same-process relay exposure RPC issues through the authorized parent connection", async () => {
+    const events = new TestEvents();
+    let authorize: CmdHandler | undefined;
+    const pi = {
+      on: () => undefined,
+      events,
+      registerCommand(name: string, opts: { handler: CmdHandler }) {
+        if (name === "remote-pi relay-parent authorize") authorize = opts.handler;
+      },
+      registerTool: () => undefined, registerShortcut: () => undefined,
+      registerFlag: () => undefined, getFlag: () => undefined,
+      registerMessageRenderer: () => undefined,
+      sendMessage: () => undefined, sendUserMessage: () => undefined,
+    } as unknown as ExtensionAPI;
+    (extension as ExtensionFactory)(pi);
+    _setPiForTest(pi);
+    await _connectForTest(makeMockCtx(controlCwd));
+    if (!authorize) throw new Error("relay parent authorization command was not registered");
+    await authorize("", makeMockCtx(controlCwd));
+
+    const rpc = await import("./session/relay_exposure_rpc.js");
+    const deniedRequestId = "80808080-8080-4080-8080-808080808080";
+    const deniedReply = new Promise<unknown>((resolve) => {
+      events.on(rpc.relayExposureReplyEvent(deniedRequestId), resolve);
+    });
+    events.emit(rpc.RELAY_EXPOSURE_REQUEST_EVENT, {
+      version: 1,
+      requestId: deniedRequestId,
+      method: "delegate_runner",
+      rootRunId: "run-fallback-denied",
+      workspaceId: _getRuntimeIdentityForTest()!.workspaceId,
+      delegationTtlMs: 60_000,
+      maxLeaseTtlMs: 30_000,
+      maxChildIssues: 4,
+      intentSources: ["fallback"],
+    });
+    await expect(deniedReply).resolves.toEqual({
+      version: 1,
+      requestId: deniedRequestId,
+      success: false,
+      reason: "policy_denied",
+    });
+
+    const localConfig = await import("./session/local_config.js");
+    const inspection = localConfig.inspectLocalConfig(controlCwd);
+    localConfig.saveLocalConfig(controlCwd, { child_exposure: "relay" }, {
+      expectedRevision: inspection.revision,
+      expectedState: inspection.state,
+      expectedHash: "hash" in inspection ? inspection.hash ?? null : null,
+    });
+    const delegateRequestId = "81818181-8181-4181-8181-818181818181";
+    const delegateReply = new Promise<unknown>((resolve) => {
+      events.on(rpc.relayExposureReplyEvent(delegateRequestId), resolve);
+    });
+    events.emit(rpc.RELAY_EXPOSURE_REQUEST_EVENT, {
+      version: 1,
+      requestId: delegateRequestId,
+      method: "delegate_runner",
+      rootRunId: "run-async",
+      workspaceId: _getRuntimeIdentityForTest()!.workspaceId,
+      delegationTtlMs: 60_000,
+      maxLeaseTtlMs: 30_000,
+      maxChildIssues: 4,
+      intentSources: ["fallback"],
+    });
+    await expect(delegateReply).resolves.toMatchObject({
+      version: 1,
+      requestId: delegateRequestId,
+      success: true,
+      ok: true,
+      token: expect.stringMatching(/^rprd1\./),
+      socketPath: expect.any(String),
+      maxLeaseTtlMs: 30_000,
+      maxChildIssues: 4,
+    });
+
+    const requestId = "88888888-8888-4888-8888-888888888888";
+    const reply = new Promise<unknown>((resolve) => {
+      events.on(rpc.relayExposureReplyEvent(requestId), resolve);
+    });
+    events.emit(rpc.RELAY_EXPOSURE_REQUEST_EVENT, {
+      version: 1,
+      requestId,
+      method: "issue",
+      binding: {
+        runId: "run-rpc-1",
+        workspaceId: _getRuntimeIdentityForTest()!.workspaceId,
+        agentId: "99999999-9999-4999-8999-999999999999",
+        processEpoch: "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa",
+        mode: "relay",
+      },
+      ttlMs: 30_000,
+    });
+
+    const issued = await reply as {
+      lease: {
+        relayExposureLeaseId: string;
+        binding: {
+          runId: string;
+          workspaceId: string;
+          agentId: string;
+          processEpoch: string;
+          mode: "relay";
+        };
+      };
+    };
+    expect(issued).toMatchObject({
+      version: 1,
+      requestId,
+      success: true,
+      capability: expect.stringMatching(/^rpel1\./),
+      lease: { binding: { runId: "run-rpc-1" } },
+    });
+
+    const renewRequestId = "bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbbb";
+    const renewReply = new Promise<unknown>((resolve) => events.on(rpc.relayExposureReplyEvent(renewRequestId), resolve));
+    events.emit(rpc.RELAY_EXPOSURE_REQUEST_EVENT, {
+      version: 1,
+      requestId: renewRequestId,
+      method: "renew",
+      relayExposureLeaseId: issued.lease.relayExposureLeaseId,
+      renewalId: "cccccccc-cccc-4ccc-8ccc-cccccccccccc",
+      binding: issued.lease.binding,
+      ttlMs: 30_000,
+    });
+    await expect(renewReply).resolves.toMatchObject({
+      version: 1,
+      requestId: renewRequestId,
+      success: false,
+      reason: "lease_not_active",
+    });
+
+    const revokeRequestId = "dddddddd-dddd-4ddd-8ddd-dddddddddddd";
+    const revokeReply = new Promise<unknown>((resolve) => events.on(rpc.relayExposureReplyEvent(revokeRequestId), resolve));
+    events.emit(rpc.RELAY_EXPOSURE_REQUEST_EVENT, {
+      version: 1,
+      requestId: revokeRequestId,
+      method: "revoke",
+      relayExposureLeaseId: issued.lease.relayExposureLeaseId,
+      binding: issued.lease.binding,
+    });
+    await expect(revokeReply).resolves.toMatchObject({
+      version: 1,
+      requestId: revokeRequestId,
+      success: true,
+      state: "revoked",
+    });
   });
 
   test("empty rename is a no-op", async () => {
@@ -3094,9 +4019,9 @@ describe("relay control channel + relay-state event", () => {
   });
 });
 
-// ── multi-agent in the same folder: lock suffixes instead of refusing ──────────
+// ── immutable runtime identity locks ─────────────────────────────────────────
 
-describe("same-folder same-name → #N suffix (no refusal)", () => {
+describe("runtime identity lock ownership", () => {
   beforeEach(async () => {
     vi.clearAllMocks();
     _knownPeers.length = 0;
@@ -3113,41 +4038,95 @@ describe("same-folder same-name → #N suffix (no refusal)", () => {
     await stop("", makeMockCtx());
   });
 
-  // The reported case: a folder already has an agent "Backoffice"; creating a
-  // second "Backoffice" must NOT be refused — it comes up as "Backoffice#2"
-  // (and the name-assigned event reports the change), matching the broker.
-  test("a second same-name agent joins as <name>#2 instead of being refused", async () => {
-    process.env["REMOTE_PI_DIRECT_CONFIG"] = JSON.stringify({
-      agent_name: "Backoffice",
-      auto_start_relay: false, // keep the test off the relay
-    });
-    const cwd = "/home/user/projects/remote_pi";
-    // Simulate the first agent already holding (cwd, "Backoffice").
-    const first = await acquireCwdLock(cwd, "Backoffice");
-    expect(first.ok).toBe(true);
-    try {
-      const root = captureHandler("remote-pi");
-      await root("", makeMockCtx(cwd));
-      // Lock seeker skipped the taken base name and reserved the #2 variant…
-      expect(_getLockedNameForTest()).toBe("Backoffice#2");
-      // …and the agent actually joined the mesh (not refused).
-      expect(_hasMeshNodeForTest()).toBe(true);
-    } finally {
-      if (first.ok) first.release();
-      delete process.env["REMOTE_PI_DIRECT_CONFIG"];
-      _resetCwdLockForTest();
-    }
-  });
-
-  test("a supervised daemon refuses a busy base lock instead of joining as <name>#2", async () => {
-    process.env["REMOTE_PI_DAEMON"] = "1";
+  test("normal direct-config daemon joins without creating cwd config", async () => {
+    const cwd = mkdtempSync(join(tmpdir(), "remote-pi-direct-daemon-"));
+    const workspaceId = "77777777-7777-4777-8777-777777777777";
     process.env["REMOTE_PI_DIRECT_CONFIG"] = JSON.stringify({
       agent_name: "Backoffice",
       auto_start_relay: false,
+      workspace_id: workspaceId,
     });
-    const cwd = "/home/user/projects/remote_pi";
-    const first = await acquireCwdLock(cwd, "Backoffice");
-    expect(first.ok).toBe(true);
+    try {
+      const root = captureHandler("remote-pi");
+      await root("", makeMockCtx(cwd));
+      expect(_hasMeshNodeForTest()).toBe(true);
+      expect(_getRuntimeIdentityForTest()).toMatchObject({ workspaceId });
+      expect(existsSync(join(cwd, ".pi", "remote-pi", "config.json"))).toBe(false);
+    } finally {
+      const stop = captureHandler("remote-pi stop");
+      await stop("", makeMockCtx(cwd));
+      delete process.env["REMOTE_PI_DIRECT_CONFIG"];
+      _resetCwdLockForTest();
+      rmSync(cwd, { recursive: true, force: true });
+    }
+  });
+
+  test("persistent daemon rename materializes cwd config with the injected registry workspaceId", async () => {
+    const cwd = mkdtempSync(join(tmpdir(), "remote-pi-direct-daemon-rename-"));
+    const workspaceId = "77777777-7777-4777-8777-777777777777";
+    process.env["REMOTE_PI_DIRECT_CONFIG"] = JSON.stringify({
+      agent_name: "Backoffice",
+      auto_start_relay: false,
+      workspace_id: workspaceId,
+    });
+    try {
+      const root = captureHandler("remote-pi");
+      await root("", makeMockCtx(cwd));
+      await _handleControl("rename:RenamedDaemon");
+      const { inspectLocalConfig } = await import("./session/local_config.js");
+      expect(inspectLocalConfig(cwd)).toMatchObject({
+        state: "loaded",
+        workspaceId,
+        config: { agent_name: "RenamedDaemon" },
+      });
+
+      const stop = captureHandler("remote-pi stop");
+      await stop("", makeMockCtx(cwd));
+      _resetCwdLockForTest();
+      await root("", makeMockCtx(cwd));
+      expect(_getRuntimeIdentityForTest()).toMatchObject({ workspaceId });
+    } finally {
+      const stop = captureHandler("remote-pi stop");
+      await stop("", makeMockCtx(cwd));
+      delete process.env["REMOTE_PI_DIRECT_CONFIG"];
+      _resetCwdLockForTest();
+      rmSync(cwd, { recursive: true, force: true });
+    }
+  });
+
+  test("same cwd/display name with a different agentId remains independent", async () => {
+    const cwd = mkdtempSync(join(tmpdir(), "remote-pi-identity-lock-"));
+    const workspaceId = writeProtectedLocalConfig(cwd, "Backoffice");
+    process.env["REMOTE_PI_DIRECT_CONFIG"] = JSON.stringify({ agent_name: "Backoffice", auto_start_relay: false });
+    const other = await acquireIdentityLock({
+      workspaceId,
+      agentId: "99999999-9999-4999-8999-999999999999",
+    });
+    expect(other.ok).toBe(true);
+    try {
+      const root = captureHandler("remote-pi");
+      await root("", makeMockCtx(cwd));
+      expect(_getLockedNameForTest()).toBe("Backoffice");
+      expect(_hasMeshNodeForTest()).toBe(true);
+    } finally {
+      const stop = captureHandler("remote-pi stop");
+      await stop("", makeMockCtx(cwd));
+      if (other.ok) other.release();
+      delete process.env["REMOTE_PI_DIRECT_CONFIG"];
+      _resetCwdLockForTest();
+      rmSync(cwd, { recursive: true, force: true });
+    }
+  });
+
+  test("a duplicate workspaceId+agentId is refused regardless of display name or epoch", async () => {
+    const cwd = mkdtempSync(join(tmpdir(), "remote-pi-identity-lock-"));
+    const workspaceId = writeProtectedLocalConfig(cwd, "Backoffice");
+    process.env["REMOTE_PI_DIRECT_CONFIG"] = JSON.stringify({ agent_name: "Backoffice", auto_start_relay: false });
+    const held = await acquireIdentityLock({
+      workspaceId,
+      agentId: agentIdFromSessionId(testSessionId(cwd)),
+    });
+    expect(held.ok).toBe(true);
     try {
       const root = captureHandler("remote-pi");
       const ctx = makeMockCtx(cwd);
@@ -3156,14 +4135,14 @@ describe("same-folder same-name → #N suffix (no refusal)", () => {
       expect(_getLockedNameForTest()).toBeNull();
       expect(_hasMeshNodeForTest()).toBe(false);
       expect(ctx.ui.notify).toHaveBeenCalledWith(
-        expect.stringContaining("Daemon not started"),
+        expect.stringContaining("runtime identity"),
         "warning",
       );
     } finally {
-      if (first.ok) first.release();
-      delete process.env["REMOTE_PI_DAEMON"];
+      if (held.ok) held.release();
       delete process.env["REMOTE_PI_DIRECT_CONFIG"];
       _resetCwdLockForTest();
+      rmSync(cwd, { recursive: true, force: true });
     }
   });
 });
@@ -3217,6 +4196,24 @@ describe("relay reconnect", () => {
     } finally {
       vi.useRealTimers();
     }
+  });
+
+  test("a stale relay close cannot tear down its replacement", async () => {
+    captureHandler("remote-pi");
+    const ctx = makeMockCtx();
+    await _connectForTest(ctx);
+    const stale = relayInstances[0]!;
+
+    const stop = captureHandler("remote-pi stop");
+    await stop("", ctx);
+    await _startRelayForTest(ctx);
+    expect(relayInstances).toHaveLength(2);
+    expect(_getState()).toBe("started");
+
+    stale.emit("close");
+    expect(_getState()).toBe("started");
+    expect(_hasPendingReconnect()).toBe(false);
+    expect(relayInstances).toHaveLength(2);
   });
 
   test("backoff progression 1s, 2s, 5s, 10s, 30s, 30s (capped) when connects keep failing", async () => {

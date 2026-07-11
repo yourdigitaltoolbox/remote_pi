@@ -2,7 +2,7 @@ import { mkdtempSync, mkdirSync, symlinkSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { describe, expect, test } from "vitest";
-import { roomIdForCwd, roomIdFor } from "./rooms.js";
+import { roomIdForCwd, roomIdFor, roomIdForIdentity } from "./rooms.js";
 import { defaultAgentName } from "./session/local_config.js";
 
 describe("roomIdForCwd", () => {
@@ -38,6 +38,18 @@ describe("roomIdForCwd", () => {
   test("non-existent cwd falls back to raw-path hash (no throw)", () => {
     const id = roomIdForCwd("/no/such/path/anywhere/xyz");
     expect(id).toMatch(/^[A-Za-z0-9_-]{12}$/);
+  });
+});
+
+describe("roomIdForIdentity", () => {
+  test("is stable across presentation rename/restart and distinct per logical agent", () => {
+    const workspaceId = "11111111-1111-4111-8111-111111111111";
+    const agentId = "22222222-2222-4222-8222-222222222222";
+    const beforeRename = roomIdForIdentity({ workspaceId, agentId });
+    const afterRename = roomIdForIdentity({ workspaceId, agentId });
+    expect(afterRename).toBe(beforeRename);
+    expect(roomIdForIdentity({ workspaceId, agentId: "33333333-3333-4333-8333-333333333333" })).not.toBe(beforeRename);
+    expect(beforeRename).toMatch(/^[A-Za-z0-9_-]{12}$/);
   });
 });
 

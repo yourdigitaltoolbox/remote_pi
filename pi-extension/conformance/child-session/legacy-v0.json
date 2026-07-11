@@ -1,0 +1,11 @@
+{
+  "case": "legacy-v0",
+  "environment": {
+    "PI_SUBAGENT_CHILD": "1"
+  },
+  "expected": {
+    "classification": "child_legacy",
+    "mode": "local",
+    "source": "legacy-marker"
+  }
+}
