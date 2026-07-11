@@ -1,0 +1,31 @@
+{
+  "case": "malformed-v1",
+  "environment": {
+    "PI_SUBAGENT_CHILD": "1"
+  },
+  "descriptor": {
+    "version": 1,
+    "kind": "pi-subagent-child",
+    "sessionClass": "child",
+    "runId": "fixture-run-malformed",
+    "agentId": "not-a-uuid",
+    "processEpoch": "",
+    "requestedExposure": "phone",
+    "producer": {
+      "name": "pi-subagents",
+      "version": "0.34.0",
+      "protocolVersion": 1,
+      "manifestSha256": "not-a-hash"
+    },
+    "compatibility": {
+      "remotePi": {
+        "state": "absent"
+      }
+    }
+  },
+  "expected": {
+    "classification": "child_invalid",
+    "mode": "local",
+    "source": "invalid-descriptor"
+  }
+}

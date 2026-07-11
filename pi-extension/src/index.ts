@@ -101,6 +101,7 @@ import {
   resolveSessionExposure,
   type SessionExposurePolicy,
 } from "./session/child_policy.js";
+import { loadRemotePiPackageIdentity } from "./session/package_identity.js";
 import { updateFooter, type FooterState } from "./ui/footer.js";
 import { join, dirname, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
@@ -211,10 +212,11 @@ function _snapshotSessionClaim(): Record<string, string | undefined> {
   };
 }
 let _sessionClaim = _snapshotSessionClaim();
+const _loadedRemotePiIdentity = loadRemotePiPackageIdentity();
 
 /** Resolve captured launch classification + this cwd's durable normal config. */
 function _sessionExposure(cwd: string): SessionExposurePolicy {
-  return resolveSessionExposure(_sessionClaim, loadLocalConfig(cwd));
+  return resolveSessionExposure(_sessionClaim, loadLocalConfig(cwd), _loadedRemotePiIdentity);
 }
 
 // Cached state of global pairings (`peers.json`). Pairing is per-machine, so a
@@ -1779,8 +1781,14 @@ function _cmdStatus(ctx: Pick<ExtensionContext, "ui"> & Partial<Pick<ExtensionCo
   }
 
   const exposureLine = `Exposure: ${exposure.mode} (${exposure.classification}, source: ${exposure.source})`;
+  const descriptorLine = exposure.descriptor
+    ? `\n  Launcher: ${exposure.descriptor.producer.name}@${exposure.descriptor.producer.version} protocol v${exposure.descriptor.producer.protocolVersion} (${exposure.descriptor.producer.manifestSha256.slice(0, 12)})`
+      + (exposure.descriptor.compatibility.remotePi.state === "compatible"
+        ? `; preflight remote-pi@${exposure.descriptor.compatibility.remotePi.version} (${exposure.descriptor.compatibility.remotePi.manifestSha256.slice(0, 12)})`
+        : "; preflight remote-pi absent")
+    : "";
   const diagnosticLine = exposure.diagnostic ? `\n  Policy diagnostic: ${exposure.diagnostic}` : "";
-  ctx.ui.notify(`[remote-pi]\n  ${meshLine}\n  ${relayLine}\n  ${exposureLine}${diagnosticLine}`, "info");
+  ctx.ui.notify(`[remote-pi]\n  ${meshLine}\n  ${relayLine}\n  ${exposureLine}${descriptorLine}${diagnosticLine}`, "info");
 }
 
 /**

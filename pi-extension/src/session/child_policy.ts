@@ -1,3 +1,5 @@
+import type { RemotePiPackageIdentity } from "./package_identity.js";
+
 export const CHILD_DESCRIPTOR_ENV = "PI_SUBAGENT_DESCRIPTOR";
 export const LEGACY_CHILD_ENV = "PI_SUBAGENT_CHILD";
 
@@ -25,8 +27,24 @@ export interface ChildSessionDescriptorV1 {
   processEpoch: string;
   parentSessionId?: string;
   parentAgentId?: string;
-  index?: number;
-  requestedExposure?: ExposureMode;
+  index: number;
+  requestedExposure: ExposureMode;
+  producer: {
+    name: "pi-subagents";
+    version: string;
+    protocolVersion: 1;
+    manifestSha256: string;
+  };
+  compatibility: {
+    remotePi:
+      | { state: "absent" }
+      | {
+        state: "compatible";
+        version: string;
+        protocolVersion: 1;
+        manifestSha256: string;
+      };
+  };
 }
 
 export interface SessionExposurePolicy {
@@ -48,7 +66,18 @@ function optionalNonEmpty(value: unknown): boolean {
   return value === undefined || nonEmpty(value);
 }
 
-function parseDescriptor(raw: string):
+const UUID_PATTERN = /^[0-9a-f]{8}-[0-9a-f]{4}-[1-5][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i;
+const SHA256_PATTERN = /^[0-9a-f]{64}$/i;
+
+function isUuid(value: unknown): value is string {
+  return typeof value === "string" && UUID_PATTERN.test(value);
+}
+
+function isManifestHash(value: unknown): value is string {
+  return typeof value === "string" && SHA256_PATTERN.test(value);
+}
+
+function parseDescriptor(raw: string, loadedRemotePi?: RemotePiPackageIdentity):
   | { ok: true; descriptor: ChildSessionDescriptorV1 }
   | { ok: false; diagnostic: string } {
   let parsed: unknown;
@@ -67,18 +96,49 @@ function parseDescriptor(raw: string):
   if (value["kind"] !== "pi-subagent-child" || value["sessionClass"] !== "child") {
     return { ok: false, diagnostic: "invalid child descriptor kind or session class" };
   }
-  if (!nonEmpty(value["runId"]) || !nonEmpty(value["agentId"]) || !nonEmpty(value["processEpoch"])) {
-    return { ok: false, diagnostic: "child descriptor requires runId, agentId, and processEpoch" };
+  if (!nonEmpty(value["runId"]) || !isUuid(value["agentId"]) || !isUuid(value["processEpoch"])) {
+    return { ok: false, diagnostic: "child descriptor requires runId plus UUID agentId and processEpoch" };
   }
-  if (!optionalNonEmpty(value["parentSessionId"]) || !optionalNonEmpty(value["parentAgentId"])) {
-    return { ok: false, diagnostic: "child descriptor parent identifiers must be non-empty strings" };
+  if (!optionalNonEmpty(value["parentSessionId"]) || (value["parentAgentId"] !== undefined && !isUuid(value["parentAgentId"]))) {
+    return { ok: false, diagnostic: "child descriptor parent identifiers are invalid" };
   }
-  if (value["index"] !== undefined && (!Number.isInteger(value["index"]) || (value["index"] as number) < 0)) {
+  if (!Number.isInteger(value["index"]) || (value["index"] as number) < 0) {
     return { ok: false, diagnostic: "child descriptor index must be a non-negative integer" };
   }
   const requested = value["requestedExposure"];
-  if (requested !== undefined && requested !== "off" && requested !== "local" && requested !== "relay") {
+  if (requested !== "off" && requested !== "local" && requested !== "relay") {
     return { ok: false, diagnostic: "child descriptor requestedExposure is invalid" };
+  }
+  const producer = value["producer"];
+  if (!producer || typeof producer !== "object" || Array.isArray(producer)) {
+    return { ok: false, diagnostic: "child descriptor producer metadata is required" };
+  }
+  const producerValue = producer as Record<string, unknown>;
+  if (producerValue["name"] !== "pi-subagents" || !nonEmpty(producerValue["version"])
+    || producerValue["protocolVersion"] !== 1 || !isManifestHash(producerValue["manifestSha256"])) {
+    return { ok: false, diagnostic: "child descriptor producer metadata is invalid" };
+  }
+  const compatibility = value["compatibility"];
+  const remotePi = compatibility && typeof compatibility === "object" && !Array.isArray(compatibility)
+    ? (compatibility as Record<string, unknown>)["remotePi"]
+    : undefined;
+  if (!remotePi || typeof remotePi !== "object" || Array.isArray(remotePi)) {
+    return { ok: false, diagnostic: "child descriptor remote-pi compatibility metadata is required" };
+  }
+  const remotePiValue = remotePi as Record<string, unknown>;
+  if (remotePiValue["state"] !== "compatible") {
+    return { ok: false, diagnostic: "loaded remote-pi was not compatibility-preflighted by the launcher" };
+  }
+  if (!nonEmpty(remotePiValue["version"]) || remotePiValue["protocolVersion"] !== 1 || !isManifestHash(remotePiValue["manifestSha256"])) {
+    return { ok: false, diagnostic: "child descriptor compatible remote-pi metadata is invalid" };
+  }
+  if (loadedRemotePi
+    && (remotePiValue["version"] !== loadedRemotePi.version
+      || (remotePiValue["manifestSha256"] as string).toLowerCase() !== loadedRemotePi.manifestSha256.toLowerCase())) {
+    return {
+      ok: false,
+      diagnostic: `preflight remote-pi identity does not match loaded remote-pi@${loadedRemotePi.version} (${loadedRemotePi.manifestSha256.slice(0, 12)})`,
+    };
   }
 
   const descriptor: ChildSessionDescriptorV1 = {
@@ -88,11 +148,25 @@ function parseDescriptor(raw: string):
     runId: value["runId"],
     agentId: value["agentId"],
     processEpoch: value["processEpoch"],
+    index: value["index"] as number,
+    requestedExposure: requested,
+    producer: {
+      name: "pi-subagents",
+      version: producerValue["version"] as string,
+      protocolVersion: 1,
+      manifestSha256: (producerValue["manifestSha256"] as string).toLowerCase(),
+    },
+    compatibility: {
+      remotePi: {
+        state: "compatible",
+        version: remotePiValue["version"] as string,
+        protocolVersion: 1,
+        manifestSha256: (remotePiValue["manifestSha256"] as string).toLowerCase(),
+      },
+    },
   };
   if (value["parentSessionId"] !== undefined) descriptor.parentSessionId = value["parentSessionId"] as string;
   if (value["parentAgentId"] !== undefined) descriptor.parentAgentId = value["parentAgentId"] as string;
-  if (value["index"] !== undefined) descriptor.index = value["index"] as number;
-  if (requested !== undefined) descriptor.requestedExposure = requested;
   return { ok: true, descriptor };
 }
 
@@ -107,12 +181,13 @@ function parseDescriptor(raw: string):
 export function resolveSessionExposure(
   env: Environment = process.env,
   config: RelayConfig = {},
+  loadedRemotePi?: RemotePiPackageIdentity,
 ): SessionExposurePolicy {
   const rawDescriptor = env[CHILD_DESCRIPTOR_ENV];
   const legacyMarker = env[LEGACY_CHILD_ENV];
 
   if (rawDescriptor !== undefined) {
-    const parsed = parseDescriptor(rawDescriptor);
+    const parsed = parseDescriptor(rawDescriptor, loadedRemotePi);
     if (!parsed.ok) {
       return {
         classification: "child_invalid",

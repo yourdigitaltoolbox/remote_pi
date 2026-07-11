@@ -12,8 +12,24 @@ function descriptor(overrides: Partial<ChildSessionDescriptorV1> = {}): ChildSes
     kind: "pi-subagent-child",
     sessionClass: "child",
     runId: "run-1",
-    agentId: "reviewer",
-    processEpoch: "epoch-1",
+    agentId: "11111111-1111-5111-8111-111111111111",
+    processEpoch: "22222222-2222-4222-8222-222222222222",
+    index: 0,
+    requestedExposure: "local",
+    producer: {
+      name: "pi-subagents",
+      version: "0.34.0",
+      protocolVersion: 1,
+      manifestSha256: "a".repeat(64),
+    },
+    compatibility: {
+      remotePi: {
+        state: "compatible",
+        version: "0.5.4",
+        protocolVersion: 1,
+        manifestSha256: "b".repeat(64),
+      },
+    },
     ...overrides,
   };
 }
@@ -49,8 +65,39 @@ describe("child session exposure policy", () => {
     expect(policy.classification).toBe("child_current");
     expect(policy.mode).toBe("local");
     expect(policy.source).toBe("descriptor");
-    expect(policy.descriptor).toMatchObject({ runId: "run-1", processEpoch: "epoch-1" });
+    expect(policy.descriptor).toMatchObject({
+      runId: "run-1",
+      processEpoch: "22222222-2222-4222-8222-222222222222",
+      producer: { name: "pi-subagents", protocolVersion: 1 },
+      compatibility: { remotePi: { state: "compatible", protocolVersion: 1 } },
+    });
     expect(policy.diagnostic).toContain("relay authorization");
+  });
+
+  test("rejects a valid-looking preflight identity that does not match the loaded package", () => {
+    const policy = resolveSessionExposure(
+      { [CHILD_DESCRIPTOR_ENV]: JSON.stringify(descriptor()) },
+      {},
+      { name: "remote-pi", version: "0.5.4", manifestSha256: "c".repeat(64) },
+    );
+    expect(policy).toMatchObject({
+      classification: "child_invalid",
+      mode: "local",
+      source: "invalid-descriptor",
+    });
+    expect(policy.diagnostic).toContain("does not match loaded remote-pi");
+  });
+
+  test("a descriptor that claimed remote-pi was absent is invalid if remote-pi actually loaded", () => {
+    const policy = resolveSessionExposure({
+      [CHILD_DESCRIPTOR_ENV]: JSON.stringify(descriptor({ compatibility: { remotePi: { state: "absent" } } })),
+    });
+    expect(policy).toMatchObject({
+      classification: "child_invalid",
+      mode: "local",
+      source: "invalid-descriptor",
+    });
+    expect(policy.diagnostic).toContain("not compatibility-preflighted");
   });
 
   test.each([

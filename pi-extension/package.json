@@ -35,7 +35,17 @@
     "extensions": [
       "./dist"
     ],
-    "image": "https://raw.githubusercontent.com/jacobaraujo7/remote_pi/main/branding/banner.png"
+    "image": "https://raw.githubusercontent.com/jacobaraujo7/remote_pi/main/branding/banner.png",
+    "remotePi": {
+      "childSessionProtocol": {
+        "current": 1,
+        "supported": [
+          1
+        ],
+        "previous": "legacy-env-v0",
+        "descriptorEnv": "PI_SUBAGENT_DESCRIPTOR"
+      }
+    }
   },
   "author": "Jacob Moura <jacobmoura7@gmail.com>",
   "license": "MIT",

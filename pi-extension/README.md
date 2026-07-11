@@ -98,12 +98,20 @@ the local mesh, but remote-pi caps them at **local-only** exposure unless a
 separate relay authorization is present. A cwd's `auto_start_relay: true` is
 normal-session consent and never promotes a child by itself.
 
+Descriptor v1 carries non-authoritative run, logical-agent, process-epoch,
+parent/index, requested-exposure, launcher version/manifest hash, and remote-pi
+preflight version/manifest hash fields. The package advertises accepted versions
+under `pi.remotePi.childSessionProtocol`; compatible launchers verify that
+metadata before child Pi wake. The initial previous-version contract is the
+legacy marker, which is always local-only. Missing required v1 fields,
+malformed metadata, and unknown/future versions fail closed to local.
+
 Child/Pi session names are runtime presentation only. They may label the live
 mesh peer, but they never overwrite the shared cwd
 `.pi/remote-pi/config.json`. `/remote-pi status` reports the effective exposure
-mode, classification, and policy source. Malformed or unsupported claimed-child
-metadata fails closed to local-only with diagnostics; it does not disable other
-extensions.
+mode, classification, policy source, and safe protocol/source diagnostics.
+Claimed-child metadata never authorizes relay or privileged work and does not
+disable other extensions.
 
 The first agent to enter a session becomes the *leader* (hosts the broker);
 the rest are *followers*. If the leader exits, a follower automatically takes

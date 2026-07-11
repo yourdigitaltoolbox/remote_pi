@@ -1,0 +1,20 @@
+{
+  "case": "future-v2",
+  "environment": {
+    "PI_SUBAGENT_CHILD": "1"
+  },
+  "descriptor": {
+    "version": 2,
+    "kind": "pi-subagent-child",
+    "sessionClass": "child",
+    "runId": "fixture-run-future",
+    "agentId": "44444444-4444-5444-8444-444444444444",
+    "processEpoch": "55555555-5555-4555-8555-555555555555",
+    "requestedExposure": "relay"
+  },
+  "expected": {
+    "classification": "child_invalid",
+    "mode": "local",
+    "source": "invalid-descriptor"
+  }
+}
