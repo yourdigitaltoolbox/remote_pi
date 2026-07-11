@@ -18,16 +18,16 @@
     "intentSource": "run",
     "producer": {
       "name": "pi-subagents",
-      "version": "0.34.0",
+      "version": "0.34.1",
       "protocolVersion": 1,
-      "manifestSha256": "914872688d1e2c8e67d669952be420dbafe6337bf1f4e951a9a03257defa024b"
+      "manifestSha256": "addc080c5677eb301a0b03e28ca36ee70edfb05ab439e4a68a22111a5d6b6870"
     },
     "compatibility": {
       "remotePi": {
         "state": "compatible",
-        "version": "0.5.4",
+        "version": "0.5.5",
         "protocolVersion": 1,
-        "manifestSha256": "1abda90ebdc3a707636a8bef175de1136a5c32acaf9d153f9277f9f76f3de5f8"
+        "manifestSha256": "ead52f60e9338e71a39288165f20d3437e5fa1d93f542ed831983ab99d12cd5d"
       }
     }
   },

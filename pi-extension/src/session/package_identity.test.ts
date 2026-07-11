@@ -9,7 +9,7 @@ describe("loaded remote-pi package identity", () => {
     const raw = fs.readFileSync(packageUrl, "utf8");
     expect(loadRemotePiPackageIdentity()).toEqual({
       name: "remote-pi",
-      version: "0.5.4",
+      version: "0.5.5",
       manifestSha256: createHash("sha256").update(raw).digest("hex"),
     });
   });

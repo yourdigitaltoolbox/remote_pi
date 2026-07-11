@@ -279,6 +279,28 @@ Documented for context:
 
 ---
 
+## [0.5.5] — 2026-07-11
+
+### Added
+
+- Added a versioned child-session contract with stable workspace and logical-agent identity, fresh process epochs, explicit exposure intent/source, and legacy-safe classification.
+- Added protected per-workspace configuration with strict schema validation, private storage, atomic revision/hash CAS, corruption diagnostics, and deliberate migration/repair paths.
+- Added bounded, short-lived relay exposure leases for explicitly authorized child sessions, including replay, source, process-epoch, expiry, reconnect, and withdrawal fencing.
+
+### Changed
+
+- Child sessions now remain local-only by default without suppressing ordinary Pi extension inheritance; relay exposure is effective only while exact live authority and transport state remain valid.
+- Current-protocol peer routing prefers immutable identity addresses while preserving cwd/name aliases for compatibility and presentation.
+- Resume, detached-runner, nested, and shutdown paths now retain non-secret intent only, rotate process authority, and reconcile relay cleanup idempotently.
+
+### Fixed
+
+- Prevented child display names and ephemeral runtime state from rewriting durable workspace identity/configuration.
+- Guarded configuration persistence on read-only filesystems and stale extension contexts.
+- Kept generic relay capabilities and identity metadata transport-only; they confer no external control-plane authority.
+
+---
+
 ## [0.1.3] — 2026-05-22
 
 ### Added
