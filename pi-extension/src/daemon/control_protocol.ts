@@ -21,7 +21,7 @@ export type DaemonState = "running" | "stopped" | "starting" | "crashed";
 export interface DaemonInfo {
   id: string;            // sha256(cwd)[0..8] — see daemon/id.ts
   cwd: string;           // absolute realpath
-  name: string;          // from <cwd>/.pi/remote-pi/config.json agent_name
+  name: string;          // supervisor registry presentation name
   state: DaemonState;
   pid?: number;          // current process pid, when running
   uptime_s?: number;     // since last successful spawn, when running

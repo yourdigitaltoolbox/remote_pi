@@ -51,22 +51,19 @@ In terminal A (say it ended up named `agent-A`):
 Who else is connected in our agent session? List them.
 ```
 
-The LLM calls `agent_send` to `broker` with `{ type: "list_peers" }` and
-replies with the names it sees.
+The LLM calls `list_peers` and sees opaque routes. Current peers use immutable
+`~identity/<workspaceId>/<agentId>` routes; legacy peers may still appear as
+cwd/name aliases.
 
 Then, still in terminal A:
 
 ```text
-Send a ping to agent-B and wait for a reply.
+Send a ping to the listed route for agent-B and wait for a reply.
 ```
 
-Pi calls `agent_request({ to: "agent-B", body: { type: "ping" } })`. The
-message arrives in terminal B as a user-facing turn — terminal B's LLM
-answers, and the reply lands back in terminal A. Two agents, one prompt
-each, full round trip.
-
-(Replace `agent-B` with whatever name terminal B reports for itself — the
-wizard's default is the directory name plus a `#N` suffix on collision.)
+Pi passes that listed route verbatim to `agent_request`/`agent_send`. The
+message arrives in terminal B as a user-facing turn; replies use the immutable
+sender route carried in the envelope. Names remain display metadata only.
 
 ---
 
@@ -219,8 +216,8 @@ Behavior depends on whether there's a local config for this directory:
 
 The wizard asks three questions:
 
-1. **Agent name** — how other agents will address you in `agent_send` /
-   `agent_request`. Defaults to the directory name.
+1. **Agent name** — the human-facing label shown for this runtime. Current
+   routing uses immutable IDs; the label defaults to the directory name.
 2. **Default session** — the name of the agent-network room for this
    directory. Multiple terminals in the same directory join the same session.
 3. **Auto-start relay (for mobile app access)?** — `Yes` if you want
@@ -341,28 +338,26 @@ both pointing at the same relay.
 
 ## Agent network: deeper look
 
-Each session is one Unix-domain-socket broker plus N peers. The broker
-multiplexes messages by `to` name and broadcasts system events
-(`peer_joined`, `peer_left`).
+Each session is one Unix-domain-socket broker plus N peers. Current peer
+ownership and public routing use immutable workspaceId+agentId. The broker
+retains `<cwd>@<name>` only as a mixed-version compatibility alias and
+broadcasts system lifecycle events.
 
-Inside the LLM, the agent skill registers two tools:
+Inside the LLM, call `list_peers` first and echo one returned route verbatim:
 
 ```jsonc
-// Fire-and-forget
+const { peers } = list_peers()
 agent_send({
-  to: "backend",      // peer name (or array for multicast)
+  to: peers[0],
   body: { task: "add /healthz endpoint" },
-  re: "<id>"          // optional — set when replying to a previous request
-})
-
-// Send + await reply (default 30s timeout)
-agent_request({
-  to: "backend",
-  body: { question: "is the migration applied?" }
+  re: "<id>" // set only when replying to a previous message
 })
 ```
 
-The wire format is a 5-field envelope `{ from, to, id, re, body }` serialized
+Current local routes have the form `~identity/<workspaceId>/<agentId>`;
+cross-PC routes prefix that with `<pc>:`. Legacy aliases remain routable but
+are not authoritative ownership keys. The wire format is a 5-field envelope
+`{ from, to, id, re, body }` serialized
 as one JSON line per message. The leader's broker writes an `audit.jsonl`
 log at `~/.pi/remote/sessions/<name>/audit.jsonl` for postmortem inspection.
 
@@ -373,11 +368,10 @@ Useful commands:
 | `/remote-pi join [name]` | Join (or create) a session — only needed manually if `auto_start_relay=false` |
 | `/remote-pi leave` | Leave the current session |
 | `/remote-pi sessions` | List local sessions and which are live |
-| `/remote-pi rename <new>` | Rename this agent in the current session |
+| `/remote-pi rename <new>` | Persist display metadata with revision/hash CAS; immutable route/room unchanged |
 
-Name collisions inside a session get a numeric suffix automatically
-(`backend`, `backend#2`, `backend#3`). The broker assigns it and returns the
-real name to the peer.
+Legacy alias collisions may receive numeric suffixes (`backend#2`, …).
+Current peers can share a display name because immutable IDs own their routes.
 
 ---
 
@@ -557,8 +551,9 @@ with a `[<cwd>]` prefix, so a single log stream shows every agent.
 - **Single supervisor.** If `pi-supervisord` crashes all daemons go
   down with it. systemd/launchd restarts it within seconds; daemons
   come back automatically.
-- **One daemon per cwd.** The `roomIdForCwd` derivation makes daemons
-  by-path; two daemons in the same folder is rejected at `create` time.
+- **One daemon registration per cwd.** Duplicate registrations for the same
+  normalized cwd are rejected. The registry retains a stable `workspaceId`,
+  while relay rooms use immutable workspace/logical-agent identity.
 
 ---
 
@@ -566,11 +561,27 @@ with a `[<cwd>]` prefix, so a single log stream shows every agent.
 
 | Path | Scope | What's in it |
 |---|---|---|
-| `<cwd>/.pi/remote-pi/config.json` | Per-directory | `agent_name`, `session_name`, `auto_start_relay` |
+| `<cwd>/.pi/remote-pi/config.json` | Per-directory | schema/revision, `workspace_id`, `agent_name`, `auto_start_relay` (private `0700/0600`) |
+| `~/.pi/remote/daemons.json` | Per-machine | protected schema/revision, daemon cwd/name, stable generic `workspaceId` (`0700/0600`) |
 | `~/.pi/remote/config.json` | Per-user | `relay` URL |
 | `~/.pi/remote/peers.json` | Per-machine | Paired mobile devices |
 | `~/.pi/remote/sessions/<name>/` | Per-session | Broker socket + `audit.jsonl` |
 | `~/.pi/remote/skills/agent-network/SKILL.md` | Per-user | Agent skill the LLM reads |
+
+The per-directory config and daemon-registry boundaries reject pre-existing
+symlink components, read trusted bytes and protection metadata from the same
+no-follow file descriptor, use private modes, and serialize cooperative
+writers with exclusive revision/hash CAS locks. Portable Node does not expose contained `openat2` /
+`unlinkat` or a cross-platform `flock`, so this boundary does not claim to
+resist a malicious process already executing as the same OS user and racing
+path replacement between syscalls. Such a process can already rewrite the
+user's `0600` config and inspect the Pi process; treat that as local-user
+compromise. Detected replacements fail closed, and these generic IDs never
+convey relay authorization or privileged YDTB authority. Stale writer locks
+are intentionally not auto-unlinked through a racy pathname; after confirming
+that no writer is live, recovery requires deliberate removal of
+`.pi/remote-pi/config.lock` (or `~/.pi/remote/daemons.lock` for the registry)
+before retrying the revision-checked write.
 
 Override the relay for a single run without persisting:
 

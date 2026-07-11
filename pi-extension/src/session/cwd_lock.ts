@@ -2,13 +2,13 @@ import { mkdirSync } from "node:fs";
 import { homedir } from "node:os";
 import { dirname, join } from "node:path";
 import type { Server } from "node:net";
-import { roomIdFor } from "../rooms.js";
+import { roomIdFor, roomIdForIdentity } from "../rooms.js";
 import { removeStaleSock, tryBind, tryConnect } from "./leader_election.js";
 import { ipcAddress, usesNamedPipe } from "./ipc.js";
 
 /**
- * Per-cwd singleton lock for `/remote-pi`. At most one Pi process per
- * working directory may hold the lock; the second attempt is refused.
+ * Local singleton locks for remote-pi. Current runtimes lock immutable
+ * workspaceId+agentId; legacy callers retain cwd/name-derived lock helpers.
  *
  * Why a UDS bind instead of a PID lock file:
  *   - The OS releases the socket handle the instant the process dies, even
@@ -19,17 +19,14 @@ import { ipcAddress, usesNamedPipe } from "./ipc.js";
  *   - Kernel-enforced — there is no race window between "check if held"
  *     and "claim", which an explicit PID file would have.
  *
- * Lock files live in `<root>/.pi/remote/locks/<roomId>.sock` (where `roomId`
- * is `sha256(realpath(cwd))[:12]` and `<root>` is `$REMOTE_PI_HOME` or the
- * home dir), NOT inside the cwd itself, to dodge:
+ * Lock sockets live in `<root>/.pi/remote/locks/<lockId>.sock`, outside the
+ * cwd, where `<root>` is `$REMOTE_PI_HOME` or the home directory, to dodge:
  *   - The 104/108-char path-length limit on UDS sockets on macOS/Linux.
  *   - Symlinked cwds (realpath canonicalization happens in `roomIdFor`).
  *   - Read-only cwds (the home directory is always writable).
  *
- * Caller workflow:
- *   const lock = await acquireCwdLock(cwd);
- *   if (!lock.ok) { ui.notify("Já tem um agente rodando nessa pasta."); return; }
- *   // …run /remote-pi normally; lock auto-releases on process exit
+ * Current callers use `acquireIdentityLock`; `acquireCwdLock` remains only for
+ * peers that do not yet carry immutable runtime identity.
  */
 
 /** Resolved at call time (not module load) so tests can redirect the lock
@@ -54,29 +51,23 @@ export interface RefusedLock {
 
 export type CwdLockResult = AcquiredLock | RefusedLock;
 
-/**
- * Lock id for an agent. Keyed by **(cwd, name)** so several agents can run in
- * the SAME folder as long as their names differ — the per-folder singleton is
- * now a per-(folder,name) singleton.
- *
- * plan/41: this is the SAME derivation as the App↔Pi `room_id` — `lockIdFor`
- * delegates to the shared `roomIdFor(cwd, name)`. So the per-(folder,name) lock
- * and the announced room stay in lockstep: a default/unnamed agent locks the
- * legacy cwd id (and owns the legacy room); a custom or `#N`-suffixed name gets
- * a name-scoped id for both. Symlinks canonicalize via `realpath` inside
- * `roomIdFor`.
- */
+/** Legacy cwd/name lock derivation for peers without runtime identity. */
 function lockIdFor(cwd: string, name?: string): string {
   return roomIdFor(cwd, name);
 }
 
-/**
- * Local-IPC address of the lock for a given (cwd, name). Pure helper (no IO).
- * POSIX → a `.sock` file under `locksDir()`; Windows → a per-user named pipe.
- */
-export function lockPathFor(cwd: string, name?: string): string {
-  const id = lockIdFor(cwd, name);
+/** Legacy cwd/name lock address. Current callers use lockPathForIdentity. */
+function lockPathForId(id: string): string {
   return ipcAddress(`lock-${id}`, join(locksDir(), `${id}.sock`));
+}
+
+export function lockPathFor(cwd: string, name?: string): string {
+  return lockPathForId(lockIdFor(cwd, name));
+}
+
+/** Canonical lock path for the immutable workspace/logical-agent identity. */
+export function lockPathForIdentity(identity: { workspaceId: string; agentId: string }): string {
+  return lockPathForId(roomIdForIdentity(identity));
 }
 
 /** Back-compat alias: the cwd-only lock path (no name component). */
@@ -85,7 +76,7 @@ export function lockPathForCwd(cwd: string): string {
 }
 
 /**
- * Attempts to acquire the cwd lock. Resolves with either:
+ * Attempts to acquire a legacy cwd/name lock. Resolves with either:
  *   - `{ ok: true, release }` when we own it (server bound + retained).
  *   - `{ ok: false, lockPath }` when a live Pi already holds the lock.
  *
@@ -99,7 +90,15 @@ export function lockPathForCwd(cwd: string): string {
  * signal we care about.
  */
 export async function acquireCwdLock(cwd: string, name?: string): Promise<CwdLockResult> {
-  const lockPath = lockPathFor(cwd, name);
+  return acquireLockPath(lockPathFor(cwd, name));
+}
+
+/** Acquire the singleton lock for one immutable workspace/logical-agent ID. */
+export async function acquireIdentityLock(identity: { workspaceId: string; agentId: string }): Promise<CwdLockResult> {
+  return acquireLockPath(lockPathForIdentity(identity));
+}
+
+async function acquireLockPath(lockPath: string): Promise<CwdLockResult> {
   // POSIX: the lock socket is a file under locksDir → ensure the dir exists.
   // Windows: lockPath is a named pipe (`\\.\pipe\…`) — no parent dir to create.
   if (!usesNamedPipe()) mkdirSync(dirname(lockPath), { recursive: true });

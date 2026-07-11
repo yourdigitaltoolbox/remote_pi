@@ -8,6 +8,7 @@
     "kind": "pi-subagent-child",
     "sessionClass": "child",
     "runId": "fixture-run-current",
+    "workspaceId": "2559677a-1ce7-53e5-95d3-d3ee669b3cfd",
     "agentId": "4d4e8813-7aa7-5d73-ab2c-bec65573b511",
     "processEpoch": "22222222-2222-4222-8222-222222222222",
     "parentSessionId": "fixture-parent-session",

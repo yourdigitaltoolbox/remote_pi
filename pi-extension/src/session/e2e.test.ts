@@ -19,8 +19,14 @@ function tmpSock(): string {
   return ipcAddress(`e2e-${basename(dir)}`, join(dir, "broker.sock"));
 }
 
-async function makePeer(sockPath: string, name: string, auditPath?: string): Promise<SessionPeer> {
-  const peer = new SessionPeer({ sockPath, name, auditPath, defaultTimeoutMs: 3000 });
+async function makePeer(
+  sockPath: string,
+  name: string,
+  auditPath?: string,
+  identity?: { workspaceId: string; agentId: string; processEpoch: string },
+  cwd?: string,
+): Promise<SessionPeer> {
+  const peer = new SessionPeer({ sockPath, name, auditPath, defaultTimeoutMs: 3000, identity, cwd });
   await peer.start();
   return peer;
 }
@@ -744,7 +750,146 @@ describe("plan/38 — (cwd, name) mesh addressing (e2e)", () => {
   });
 });
 
-// ── SessionPeer.rename: no duplicate / no ghost ───────────────────────────────
+// ── Runtime identity + presentation-only rename ──────────────────────────────
+
+describe("SessionPeer runtime identity", () => {
+  const workspaceId = "11111111-1111-4111-8111-111111111111";
+  const identity = (agentId: string, processEpoch: string) => ({ workspaceId, agentId, processEpoch });
+
+  test("distinct logical IDs may share a display name while retaining routable aliases", async () => {
+    const sock = tmpSock();
+    const first = await makePeer(
+      sock,
+      "worker",
+      undefined,
+      identity("22222222-2222-4222-8222-222222222222", "33333333-3333-4333-8333-333333333333"),
+      "/workspace",
+    );
+    const second = await makePeer(
+      sock,
+      "worker",
+      undefined,
+      identity("44444444-4444-4444-8444-444444444444", "55555555-5555-4555-8555-555555555555"),
+      "/workspace",
+    );
+
+    const firstRoute = `~identity/${workspaceId}/${first.identity()!.agentId}`;
+    const secondRoute = `~identity/${workspaceId}/${second.identity()!.agentId}`;
+    expect(first.name()).toBe("worker");
+    expect(second.name()).toBe("worker");
+    expect(first.address()).toBe(firstRoute);
+    expect(second.address()).toBe(secondRoute);
+
+    const roster = await first.request("broker", { type: "list_peers" }, 2000);
+    const rosterBody = roster.body as { peers: string[]; peers_detailed: PeerInfo[] };
+    expect(rosterBody.peers).toEqual([firstRoute, secondRoute]);
+    expect(rosterBody.peers).not.toContain("/workspace@worker");
+    expect(rosterBody.peers).not.toContain("/workspace@worker#2");
+    const detailed = rosterBody.peers_detailed;
+    expect(detailed).toEqual(expect.arrayContaining([
+      expect.objectContaining({ agentId: first.identity()!.agentId, name: "worker", address: "/workspace@worker" }),
+      expect.objectContaining({ agentId: second.identity()!.agentId, name: "worker", address: "/workspace@worker#2" }),
+    ]));
+    const secondInfo = detailed.find((peer) => peer.agentId === second.identity()!.agentId)!;
+    expect(secondInfo.identityAddress).toBe(`~identity/${workspaceId}/${second.identity()!.agentId}`);
+    const received: Envelope[] = [];
+    second.onMessage((envelope) => { if (envelope.from !== "broker") received.push(envelope); });
+    await first.send(secondInfo.identityAddress!, { stable: true });
+    await first.send(secondInfo.address, { compatibilityAlias: true });
+    await wait(50);
+    expect(received).toHaveLength(2);
+    expect(received[0]).toMatchObject({ from: firstRoute, to: secondRoute, body: { stable: true } });
+    expect(received[1]).toMatchObject({ from: firstRoute, to: "/workspace@worker#2", body: { compatibilityAlias: true } });
+
+    await first.leave();
+    await second.leave();
+  });
+
+  test("a live canonical identity rejects duplicate epochs instead of replacing state", async () => {
+    const sock = tmpSock();
+    const first = await makePeer(
+      sock,
+      "worker",
+      undefined,
+      identity("22222222-2222-4222-8222-222222222222", "33333333-3333-4333-8333-333333333333"),
+      "/workspace",
+    );
+    const duplicate = new SessionPeer({
+      sockPath: sock,
+      name: "renamed",
+      cwd: "/elsewhere",
+      identity: identity("22222222-2222-4222-8222-222222222222", "66666666-6666-4666-8666-666666666666"),
+    });
+
+    await expect(duplicate.start()).rejects.toThrow(/duplicate runtime identity/i);
+    expect(first.name()).toBe("worker");
+    expect(first.address()).toBe(`~identity/${workspaceId}/${first.identity()!.agentId}`);
+    await first.leave();
+  });
+
+  test("one live workspaceId cannot claim different cwd paths, but may relocate after the old owner leaves", async () => {
+    const sock = tmpSock();
+    const first = await makePeer(
+      sock,
+      "first",
+      undefined,
+      identity("22222222-2222-4222-8222-222222222222", "33333333-3333-4333-8333-333333333333"),
+      "/workspace-a",
+    );
+    const copiedWorkspace = new SessionPeer({
+      sockPath: sock,
+      name: "copied",
+      cwd: "/workspace-b",
+      identity: identity("44444444-4444-4444-8444-444444444444", "55555555-5555-4555-8555-555555555555"),
+    });
+
+    await expect(copiedWorkspace.start()).rejects.toThrow(/workspace.*different cwd/i);
+    expect(first.address()).toBe(`~identity/${workspaceId}/${first.identity()!.agentId}`);
+
+    await first.leave();
+    await wait(50);
+
+    const relocated = await makePeer(
+      sock,
+      "relocated",
+      undefined,
+      identity("44444444-4444-4444-8444-444444444444", "66666666-6666-4666-8666-666666666666"),
+      "/workspace-b",
+    );
+    expect(relocated.address()).toBe(`~identity/${workspaceId}/${relocated.identity()!.agentId}`);
+    await relocated.leave();
+  });
+
+  test("rename updates presentation metadata without changing canonical identity or route", async () => {
+    const sock = tmpSock();
+    const first = await makePeer(
+      sock,
+      "before",
+      undefined,
+      identity("22222222-2222-4222-8222-222222222222", "33333333-3333-4333-8333-333333333333"),
+      "/workspace",
+    );
+    const address = first.address();
+    const beforeIdentity = first.identity();
+
+    expect(await first.rename("after")).toBe("after");
+    expect(first.name()).toBe("after");
+    expect(first.address()).toBe(address);
+    expect(first.identity()).toEqual(beforeIdentity);
+
+    const roster = await first.request("broker", { type: "list_peers" }, 2000);
+    expect((roster.body as { peers_detailed: PeerInfo[] }).peers_detailed)
+      .toContainEqual(expect.objectContaining({
+        address: "/workspace@before",
+        identityAddress: address,
+        name: "after",
+        agentId: beforeIdentity!.agentId,
+      }));
+    await first.leave();
+  });
+});
+
+// ── Legacy SessionPeer.rename: no duplicate / no ghost ───────────────────────
 
 describe("SessionPeer.rename (live rename)", () => {
   test("renames in place — no `#N` duplicate, no stale old name (single rejoin)", async () => {

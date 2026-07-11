@@ -12,6 +12,7 @@ function descriptor(overrides: Partial<ChildSessionDescriptorV1> = {}): ChildSes
     kind: "pi-subagent-child",
     sessionClass: "child",
     runId: "run-1",
+    workspaceId: "33333333-3333-4333-8333-333333333333",
     agentId: "11111111-1111-5111-8111-111111111111",
     processEpoch: "22222222-2222-4222-8222-222222222222",
     index: 0,
@@ -67,6 +68,7 @@ describe("child session exposure policy", () => {
     expect(policy.source).toBe("descriptor");
     expect(policy.descriptor).toMatchObject({
       runId: "run-1",
+      workspaceId: "33333333-3333-4333-8333-333333333333",
       processEpoch: "22222222-2222-4222-8222-222222222222",
       producer: { name: "pi-subagents", protocolVersion: 1 },
       compatibility: { remotePi: { state: "compatible", protocolVersion: 1 } },
@@ -104,6 +106,7 @@ describe("child session exposure policy", () => {
     "{not-json",
     JSON.stringify({ version: 99, kind: "pi-subagent-child", sessionClass: "child" }),
     JSON.stringify(descriptor({ processEpoch: "" })),
+    JSON.stringify(descriptor({ workspaceId: "" })),
   ])("malformed or unsupported claimed-child descriptors fail closed to local", (raw) => {
     const policy = resolveSessionExposure({ [CHILD_DESCRIPTOR_ENV]: raw }, { auto_start_relay: true });
     expect(policy.classification).toBe("child_invalid");

@@ -23,6 +23,7 @@ export interface ChildSessionDescriptorV1 {
   kind: "pi-subagent-child";
   sessionClass: "child";
   runId: string;
+  workspaceId: string;
   agentId: string;
   processEpoch: string;
   parentSessionId?: string;
@@ -96,8 +97,8 @@ function parseDescriptor(raw: string, loadedRemotePi?: RemotePiPackageIdentity):
   if (value["kind"] !== "pi-subagent-child" || value["sessionClass"] !== "child") {
     return { ok: false, diagnostic: "invalid child descriptor kind or session class" };
   }
-  if (!nonEmpty(value["runId"]) || !isUuid(value["agentId"]) || !isUuid(value["processEpoch"])) {
-    return { ok: false, diagnostic: "child descriptor requires runId plus UUID agentId and processEpoch" };
+  if (!nonEmpty(value["runId"]) || !isUuid(value["workspaceId"]) || !isUuid(value["agentId"]) || !isUuid(value["processEpoch"])) {
+    return { ok: false, diagnostic: "child descriptor requires runId plus UUID workspaceId, agentId, and processEpoch" };
   }
   if (!optionalNonEmpty(value["parentSessionId"]) || (value["parentAgentId"] !== undefined && !isUuid(value["parentAgentId"]))) {
     return { ok: false, diagnostic: "child descriptor parent identifiers are invalid" };
@@ -146,6 +147,7 @@ function parseDescriptor(raw: string, loadedRemotePi?: RemotePiPackageIdentity):
     kind: "pi-subagent-child",
     sessionClass: "child",
     runId: value["runId"],
+    workspaceId: value["workspaceId"],
     agentId: value["agentId"],
     processEpoch: value["processEpoch"],
     index: value["index"] as number,

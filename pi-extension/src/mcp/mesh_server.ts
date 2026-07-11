@@ -87,15 +87,16 @@ process.on("uncaughtException", (err) => {
   logErr(`uncaughtException: ${err.stack ?? err.message}`);
 });
 
-// Canonicalize so the (cwd, name) the broker keys us by matches roomIdForCwd
-// and the Pi extension's own register (symlinked cwds map to one identity).
+// Canonicalize the cwd used by this legacy MCP peer's compatibility alias.
+// Current Pi peers carry explicit runtime identity; this launcher has not yet
+// adopted that descriptor and therefore remains safely alias-routed.
 let _canonCwd = _cwd;
 try { _canonCwd = realpathSync(_cwd); } catch { /* cwd missing — use raw path */ }
 
 const mesh = new MeshNode({
   sockPath: BROKER_SOCK,
   name: AGENT_NAME,
-  cwd: _canonCwd,  // plan/38: register with (cwd, name) → address `<cwd>@<name>`
+  cwd: _canonCwd,
   auditPath: AUDIT_PATH,
   // Own Pi-key cross-PC bridge — active only when this node leads (no Pi /
   // daemon already hosting the broker for this cwd). As a follower the
@@ -121,9 +122,9 @@ const mcp = new McpServer(
       `You are connected to the remote-pi agent mesh as "${AGENT_NAME}".`,
       "At the start of each turn call get_messages to check for incoming messages from other agents.",
       "Use list_peers to discover available agents.",
-      "Use agent_send to send messages — pass the exact address returned by list_peers (form `<cwd>@<name>`, `<pc>:` prefix cross-PC) VERBATIM; never build one by hand.",
+      "Use agent_send with the exact opaque route returned by list_peers. Current peers use ~identity routes, cross-PC adds <pc>:, and legacy aliases may appear. Never build a route by hand.",
       'Use "broadcast" as the target to send to all peers in your folder (cwd) at once.',
-      "Follow the agent-network protocol (in your system prompt) for the full details (ACK statuses, replies via re, `<cwd>@<name>` addresses, cross-PC `<pc>:` prefix).",
+      "Follow the agent-network protocol in your system prompt for ACKs, replies via re, and ID-first opaque routing.",
     ].join("\n"),
   },
 );
@@ -151,13 +152,13 @@ mcp.registerTool("list_peers", {
 mcp.registerTool("agent_send", {
   description: 'Send a message to another agent. Use "broadcast" to send to all peers.',
   inputSchema: {
-    to: z.string().describe('Peer address from list_peers (form "<cwd>@<name>", or "<pc>:<cwd>@<name>" cross-PC) echoed verbatim, or "broadcast"'),
+    to: z.string().describe('Opaque route from list_peers, echoed verbatim, or "broadcast"'),
     body: z.unknown().describe("Message body — any JSON value"),
     re: z.string().optional().describe("Optional: id of the message you are replying to"),
   },
 }, async ({ to, body, re }) => {
   if (!meshReady) return notReady();
-  if (to === mesh.address() || to === mesh.name()) {
+  if (to === mesh.address()) {
     return { content: [{ type: "text" as const, text: "Cannot send to yourself" }], isError: true };
   }
   try {
@@ -207,9 +208,9 @@ function isoNow(): string {
   return new Date().toISOString();
 }
 
-// Background lock+join state. The cwd lock enforces the per-folder singleton
-// (at most one remote-pi agent — Pi OR Claude — per folder; a second peer with
-// the same cwd-derived name would be a ghost).
+// Background lock+join state for this legacy MCP launcher. Current Pi peers
+// use immutable identity locks; this launcher retains its cwd/name lock until
+// it adopts the versioned runtime descriptor.
 //
 // We retry only briefly — just enough to ride out a restart RACE (the previous
 // MCP for this folder is still tearing down when Claude respawns us). After a

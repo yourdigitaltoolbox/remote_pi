@@ -55,7 +55,17 @@ const BROKER_NAME = "broker";
 export interface WirePeerInfo {
   cwd: string;
   name: string;
+  /** Cwd/name compatibility alias; canonical only for legacy peers. */
   address: string;
+  workspaceId?: string;
+  agentId?: string;
+  processEpoch?: string;
+  /** Immutable primary route for current peers. */
+  identityAddress?: string;
+}
+
+function primaryWireRoute(info: WirePeerInfo): string {
+  return info.identityAddress ?? info.address;
 }
 
 export interface RemotePeerEntry {
@@ -194,8 +204,18 @@ export class BrokerRemote implements RemoteRouter {
     const detailed = this.broker.localPeerInfos();
     return {
       type: "peers_update",
-      peers: detailed.map((p) => p.address),
-      peers_detailed: detailed.map((p) => ({ cwd: p.cwd, name: p.name, address: p.address })),
+      peers: detailed.map((p) => p.identityAddress ?? p.address),
+      peers_detailed: detailed.map((p) => ({
+        cwd: p.cwd,
+        name: p.name,
+        address: p.address,
+        ...(p.workspaceId && p.agentId && p.processEpoch && p.identityAddress ? {
+          workspaceId: p.workspaceId,
+          agentId: p.agentId,
+          processEpoch: p.processEpoch,
+          identityAddress: p.identityAddress,
+        } : {}),
+      })),
     };
   }
 
@@ -255,10 +275,9 @@ export class BrokerRemote implements RemoteRouter {
     return entry.infos;
   }
 
-  /** Returns the cached peer ADDRESSES for a remote pc_label (the sibling's
-   *  local, unprefixed addresses), or [] when unknown / expired. */
+  /** Returns cached unprefixed primary routes for a remote sibling. */
   getRemotePeers(pcLabel: string): string[] {
-    return this._remoteInfos(pcLabel).map((i) => i.address);
+    return this._remoteInfos(pcLabel).map(primaryWireRoute);
   }
 
   /** Returns the full cross-PC inventory: pc_label → addresses (TTL-respected). */
@@ -271,26 +290,35 @@ export class BrokerRemote implements RemoteRouter {
     return out;
   }
 
-  /** Aggregated remote peer addresses (`<pc>:<cwd>@<nome>`) for the broker's
-   *  `list_peers` `peers` field. Skips siblings with no cache entry. */
+  /** Aggregated cross-PC primary routes for public `list_peers`. */
   listRemotePeers(): string[] {
     const out: string[] = [];
     for (const [label] of this.remotePeers) {
       for (const info of this._remoteInfos(label)) {
-        out.push(`${label}:${info.address}`);
+        out.push(`${label}:${primaryWireRoute(info)}`);
       }
     }
     return out;
   }
 
-  /** Structured remote roster (plan/38 Fase 2): one `PeerInfo` per cross-PC
-   *  peer with `pc` = sibling label, `cwd`/`name` from the sibling's inventory,
-   *  and `address` prefixed `<pc>:<cwd>@<nome>`. Powers `peers_detailed`. */
+  /** Structured remote roster: `address` retains the prefixed compatibility
+   *  alias while `identityAddress` carries the prefixed primary route. */
   listRemotePeerInfos(): PeerInfo[] {
     const out: PeerInfo[] = [];
     for (const [label] of this.remotePeers) {
       for (const info of this._remoteInfos(label)) {
-        out.push({ pc: label, cwd: info.cwd, name: info.name, address: `${label}:${info.address}` });
+        out.push({
+          pc: label,
+          cwd: info.cwd,
+          name: info.name,
+          address: `${label}:${info.address}`,
+          ...(info.workspaceId && info.agentId && info.processEpoch && info.identityAddress ? {
+            workspaceId: info.workspaceId,
+            agentId: info.agentId,
+            processEpoch: info.processEpoch,
+            identityAddress: `${label}:${info.identityAddress}`,
+          } : {}),
+        });
       }
     }
     return out;
@@ -565,11 +593,20 @@ function _parsePeersUpdate(body: PeersUpdateBody): WirePeerInfo[] {
   const detailed = body.peers_detailed;
   if (Array.isArray(detailed)) {
     return detailed.filter(
-      (e): e is WirePeerInfo =>
-        !!e && typeof e === "object" &&
-        typeof (e as WirePeerInfo).cwd === "string" &&
-        typeof (e as WirePeerInfo).name === "string" &&
-        typeof (e as WirePeerInfo).address === "string",
+      (e): e is WirePeerInfo => {
+        if (!e || typeof e !== "object"
+          || typeof (e as WirePeerInfo).cwd !== "string"
+          || typeof (e as WirePeerInfo).name !== "string"
+          || typeof (e as WirePeerInfo).address !== "string") return false;
+        const identityFields = [
+          (e as WirePeerInfo).workspaceId,
+          (e as WirePeerInfo).agentId,
+          (e as WirePeerInfo).processEpoch,
+          (e as WirePeerInfo).identityAddress,
+        ];
+        return identityFields.every((value) => value === undefined)
+          || identityFields.every((value) => typeof value === "string");
+      },
     );
   }
   const peers = Array.isArray(body.peers) ? body.peers : [];

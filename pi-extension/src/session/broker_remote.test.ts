@@ -335,18 +335,37 @@ describe("BrokerRemote: control envelopes (peers_update / peers_request)", () =>
         type: "peers_update",
         peers: ["/w/app@App", "/w/api@Api"],
         peers_detailed: [
-          { cwd: "/w/app", name: "App", address: "/w/app@App" },
+          {
+            cwd: "/w/app", name: "App", address: "/w/app@App",
+            workspaceId: "11111111-1111-4111-8111-111111111111",
+            agentId: "22222222-2222-4222-8222-222222222222",
+            processEpoch: "33333333-3333-4333-8333-333333333333",
+            identityAddress: "~identity/11111111-1111-4111-8111-111111111111/22222222-2222-4222-8222-222222222222",
+          },
           { cwd: "/w/api", name: "Api", address: "/w/api@Api" },
         ],
       },
     ), "K_B");
 
-    // Addresses (the `peers` half) get the sibling-label prefix.
-    expect(br.listRemotePeers()).toEqual(["trab:/w/app@App", "trab:/w/api@Api"]);
+    // Public routes prefer immutable identity; legacy entries keep aliases.
+    expect(br.getRemotePeers("trab")).toEqual([
+      "~identity/11111111-1111-4111-8111-111111111111/22222222-2222-4222-8222-222222222222",
+      "/w/api@Api",
+    ]);
+    expect(br.listRemotePeers()).toEqual([
+      "trab:~identity/11111111-1111-4111-8111-111111111111/22222222-2222-4222-8222-222222222222",
+      "trab:/w/api@Api",
+    ]);
     // Structured: `pc` filled from the verified sibling label, cwd/name preserved,
     // address prefixed `<pc>:<cwd>@<nome>` — this is what powers `peers_detailed`.
     expect(br.listRemotePeerInfos()).toEqual([
-      { pc: "trab", cwd: "/w/app", name: "App", address: "trab:/w/app@App" },
+      {
+        pc: "trab", cwd: "/w/app", name: "App", address: "trab:/w/app@App",
+        workspaceId: "11111111-1111-4111-8111-111111111111",
+        agentId: "22222222-2222-4222-8222-222222222222",
+        processEpoch: "33333333-3333-4333-8333-333333333333",
+        identityAddress: "trab:~identity/11111111-1111-4111-8111-111111111111/22222222-2222-4222-8222-222222222222",
+      },
       { pc: "trab", cwd: "/w/api", name: "Api", address: "trab:/w/api@Api" },
     ]);
   });
