@@ -4,6 +4,25 @@ import { dirname } from "node:path";
 import { type Envelope, parse, serialize, uuidv7, EnvelopeError } from "./envelope.js";
 import { sanitizeSegment } from "./local_config.js";
 import { isRuntimeIdentity, type RuntimeIdentity } from "./runtime_identity.js";
+import {
+  RelayExposureLeaseAuthority,
+  type ParentDelegationOptions,
+  type RelayExposureBinding,
+  type RelayExposureLease,
+} from "./relay_exposure_lease.js";
+import {
+  parseRelayExposureActivationBrokerRequest,
+  parseRelayExposureCloseBrokerRequest,
+  parseRelayExposureIssueBrokerRequest,
+  parseRelayExposurePromoteBrokerRequest,
+  parseRelayExposureRenewBrokerRequest,
+  parseRelayExposureRevokeBrokerRequest,
+} from "./relay_exposure_rpc.js";
+import {
+  parseRelayRunnerDelegateRequest,
+  parseRelayRunnerRequest,
+  type RelayRunnerRequest,
+} from "./relay_runner_rpc.js";
 
 /**
  * Structured view of one mesh peer (plan/38). Current peers route canonically
@@ -134,9 +153,19 @@ interface PeerConn {
   identity: RuntimeIdentity | null;
   socket: Socket;
   buf: string;
+  /** Unregistered runner IPC is exactly one request and never becomes a peer. */
+  oneShotComplete: boolean;
 }
 
 const BROKER_NAME = "broker";
+const RUNNER_REQUEST_ID_PATTERN = /^[0-9a-f]{8}-[0-9a-f]{4}-[1-5][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i;
+const RUNNER_REQUEST_TYPES = new Set([
+  "relay_runner_issue",
+  "relay_runner_renew",
+  "relay_runner_revoke",
+  "relay_runner_close",
+  "relay_runner_release",
+]);
 
 function runtimeIdentityKey(identity: Pick<RuntimeIdentity, "workspaceId" | "agentId">): string {
   return `${identity.workspaceId.toLowerCase()}\0${identity.agentId.toLowerCase()}`;
@@ -208,6 +237,9 @@ export class Broker {
   private readonly auditPath?: string;
   private readonly onRouted?: BrokerOptions["onRouted"];
   private readonly server: Server;
+  /** Broker-memory authority: restart loses every grant/lease and fails closed. */
+  private readonly relayExposureLeases = new RelayExposureLeaseAuthority();
+  private readonly relayExposureExpiryTimers = new Map<string, ReturnType<typeof setTimeout>>();
   /** Plan/25 Wave C: optional handoff for cross-PC routing. Null = local only. */
   private remoteRouter: RemoteRouter | null = null;
 
@@ -216,11 +248,105 @@ export class Broker {
     this.auditPath = opts.auditPath;
     this.onRouted = opts.onRouted;
     this.server.on("connection", (socket) => this._handleConnection(socket));
+    this.server.on("close", () => {
+      for (const timer of this.relayExposureExpiryTimers.values()) clearTimeout(timer);
+      this.relayExposureExpiryTimers.clear();
+    });
   }
 
   /** Attach (or detach with null) a cross-PC router. Idempotent. */
   setRemoteRouter(router: RemoteRouter | null): void {
     this.remoteRouter = router;
+  }
+
+  /**
+   * Privileged, broker-leader-local operator seam. This deliberately has no
+   * wire message equivalent: it resolves a displayed route to the actual live
+   * connection object, then delegates that exact object in broker memory.
+   */
+  authorizeRelayParent(
+    route: string,
+    options: ParentDelegationOptions = {},
+  ): { ok: true; parent: RuntimeIdentity } | { ok: false; reason: "peer_not_found" | "legacy_peer" } {
+    const peer = this._peerAt(route);
+    if (!peer) return { ok: false, reason: "peer_not_found" };
+    if (!peer.identity) return { ok: false, reason: "legacy_peer" };
+    this.relayExposureLeases.authorizeParent(peer, peer.identity, options);
+    return { ok: true, parent: { ...peer.identity } };
+  }
+
+  private _scheduleRelayExposureExpiry(lease: RelayExposureLease): void {
+    const leaseId = lease.relayExposureLeaseId;
+    const existing = this.relayExposureExpiryTimers.get(leaseId);
+    if (existing) clearTimeout(existing);
+    const timer = setTimeout(() => {
+      // A cleared timer can already be queued. Never let a stale callback
+      // delete/reconcile the replacement timer installed by renewal.
+      if (this.relayExposureExpiryTimers.get(leaseId) !== timer) return;
+      this.relayExposureExpiryTimers.delete(leaseId);
+      this.relayExposureLeases.expireDue();
+      this._reconcileRelayExposureTransitions();
+    }, Math.max(0, lease.expiresAt - Date.now()));
+    timer.unref?.();
+    this.relayExposureExpiryTimers.set(leaseId, timer);
+  }
+
+  private _sendRelayExposurePromoted(child: PeerConn, lease: RelayExposureLease): void {
+    if (!child.address) return;
+    const notice: Envelope = {
+      from: BROKER_NAME,
+      to: primaryRoute(child),
+      id: uuidv7(),
+      re: null,
+      body: { type: "relay_lease_promoted", version: 1, lease },
+    };
+    try { child.socket.write(serialize(notice)); } catch { /* child hung up */ }
+  }
+
+  private _reconcileRelayExposureTransitions(): void {
+    for (const renewal of this.relayExposureLeases.drainRenewals()) {
+      const child = renewal.childConnection as PeerConn;
+      if (!child.address) continue;
+      const route = primaryRoute(child);
+      const notice: Envelope = {
+        from: BROKER_NAME,
+        to: route,
+        id: uuidv7(),
+        re: null,
+        body: {
+          type: "relay_lease_renewed",
+          version: 1,
+          relayExposureLeaseId: renewal.lease.relayExposureLeaseId,
+          binding: renewal.lease.binding,
+          expiresAt: renewal.lease.expiresAt,
+        },
+      };
+      try { child.socket.write(serialize(notice)); } catch { /* child hung up */ }
+    }
+    for (const transition of this.relayExposureLeases.drainTransitions()) {
+      const leaseId = transition.lease.relayExposureLeaseId;
+      const timer = this.relayExposureExpiryTimers.get(leaseId);
+      if (timer) clearTimeout(timer);
+      this.relayExposureExpiryTimers.delete(leaseId);
+      const child = transition.childConnection as PeerConn | undefined;
+      if (!child?.address) continue;
+      const route = primaryRoute(child);
+      const notice: Envelope = {
+        from: BROKER_NAME,
+        to: route,
+        id: uuidv7(),
+        re: null,
+        body: {
+          type: "relay_lease_closed",
+          version: 1,
+          relayExposureLeaseId: leaseId,
+          binding: transition.lease.binding,
+          reason: transition.reason,
+          ...(transition.closeReason ? { closeReason: transition.closeReason } : {}),
+        },
+      };
+      try { child.socket.write(serialize(notice)); } catch { /* child hung up */ }
+    }
   }
 
   private _peerAt(route: string): PeerConn | undefined {
@@ -291,7 +417,7 @@ export class Broker {
   // ── connection lifecycle ──────────────────────────────────────────────────
 
   private _handleConnection(socket: Socket): void {
-    const conn: PeerConn = { name: "", cwd: "", address: "", identity: null, socket, buf: "" };
+    const conn: PeerConn = { name: "", cwd: "", address: "", identity: null, socket, buf: "", oneShotComplete: false };
     socket.setEncoding("utf8");
     socket.on("data", (chunk: string) => this._onData(conn, chunk));
     socket.on("close", () => this._onClose(conn));
@@ -299,6 +425,7 @@ export class Broker {
   }
 
   private _onData(conn: PeerConn, chunk: string): void {
+    if (conn.oneShotComplete) return;
     conn.buf += chunk;
     let nl: number;
     while ((nl = conn.buf.indexOf("\n")) >= 0) {
@@ -306,15 +433,21 @@ export class Broker {
       conn.buf = conn.buf.slice(nl + 1);
       if (!line) continue;
       void this._handleLine(conn, line);
+      if (conn.oneShotComplete) {
+        conn.buf = "";
+        break;
+      }
     }
   }
 
   private async _handleLine(conn: PeerConn, line: string): Promise<void> {
+    if (conn.oneShotComplete) return;
     // Unregistered conn: a read-only `list_peers` probe (the `remote-pi peers`
     // CLI — answered without registering, so it leaves no trace on the mesh) or
     // the mandatory `register` handshake. Anything else `_handleRegister` drops.
     if (!conn.name) {
       if (this._tryObserverProbe(conn, line)) return;
+      if (this._tryRelayRunnerRequest(conn, line)) return;
       this._handleRegister(conn, line);
       return;
     }
@@ -330,7 +463,7 @@ export class Broker {
     // Current peers therefore expose immutable IDs in ordinary send/reply;
     // legacy peers retain their historical cwd/name route.
     env.from = primaryRoute(conn);
-    await this._route(env);
+    await this._route(env, conn);
   }
 
   private _handleRegister(conn: PeerConn, line: string): void {
@@ -453,6 +586,94 @@ export class Broker {
     return true;
   }
 
+  /**
+   * Consume one strict runner lifecycle request without mesh registration.
+   * The opaque token is parsed only in memory and is never used as a route,
+   * identity, audit field, or log field. Recognized malformed requests receive
+   * only a correlation UUID and `invalid_request`; all sockets end after one
+   * reply so they cannot change protocol roles.
+   */
+  private _tryRelayRunnerRequest(conn: PeerConn, line: string): boolean {
+    let raw: Record<string, unknown>;
+    try {
+      const parsed = JSON.parse(line) as unknown;
+      if (!parsed || typeof parsed !== "object" || Array.isArray(parsed)) return false;
+      raw = parsed as Record<string, unknown>;
+    } catch {
+      return false;
+    }
+    if (typeof raw.type !== "string" || !RUNNER_REQUEST_TYPES.has(raw.type)) return false;
+
+    conn.oneShotComplete = true;
+    const requestId = typeof raw.requestId === "string" && RUNNER_REQUEST_ID_PATTERN.test(raw.requestId)
+      ? raw.requestId
+      : undefined;
+    const request = parseRelayRunnerRequest(raw);
+    if (!request || !requestId) {
+      if (requestId) {
+        conn.socket.end(JSON.stringify({
+          type: "relay_runner_result",
+          version: 1,
+          requestId,
+          ok: false,
+          reason: "invalid_request",
+        }) + "\n");
+      } else {
+        conn.socket.end();
+      }
+      return true;
+    }
+
+    const result = this._applyRelayRunnerRequest(request);
+    conn.socket.end(JSON.stringify({
+      type: "relay_runner_result",
+      version: 1,
+      requestId: request.requestId,
+      ...result,
+    }) + "\n");
+    if (request.type === "relay_runner_renew" && result.ok && result.state === "renewed") {
+      this._scheduleRelayExposureExpiry(result.lease);
+    }
+    this._reconcileRelayExposureTransitions();
+    return true;
+  }
+
+  private _applyRelayRunnerRequest(request: RelayRunnerRequest):
+    | (ReturnType<RelayExposureLeaseAuthority["issueForRunner"]> & { state?: "issued" })
+    | ReturnType<RelayExposureLeaseAuthority["renewForRunner"]>
+    | ReturnType<RelayExposureLeaseAuthority["revokeForRunner"]>
+    | ReturnType<RelayExposureLeaseAuthority["closeForRunner"]>
+    | ReturnType<RelayExposureLeaseAuthority["releaseRunner"]> {
+    switch (request.type) {
+      case "relay_runner_issue": {
+        const issued = this.relayExposureLeases.issueForRunner(request.token, request.binding, { ttlMs: request.ttlMs });
+        return issued.ok ? { ...issued, state: "issued" } : issued;
+      }
+      case "relay_runner_renew":
+        return this.relayExposureLeases.renewForRunner(
+          request.token,
+          request.relayExposureLeaseId,
+          request.binding,
+          { ttlMs: request.ttlMs, renewalId: request.renewalId },
+        );
+      case "relay_runner_revoke":
+        return this.relayExposureLeases.revokeForRunner(
+          request.token,
+          request.relayExposureLeaseId,
+          request.binding,
+        );
+      case "relay_runner_close":
+        return this.relayExposureLeases.closeForRunner(
+          request.token,
+          request.relayExposureLeaseId,
+          request.binding,
+          request.reason,
+        );
+      case "relay_runner_release":
+        return this.relayExposureLeases.releaseRunner(request.token);
+    }
+  }
+
   /** Local primary routes plus cross-PC primary routes from the remote router. */
   private _allPeerNames(): string[] {
     const remote = this.remoteRouter ? this.remoteRouter.listRemotePeers() : [];
@@ -526,6 +747,11 @@ export class Broker {
   }
 
   private _onClose(conn: PeerConn): void {
+    // A connection may be a delegated parent, an active child, or both. Revoke
+    // and reconcile by exact object identity before roster ownership moves.
+    this.relayExposureLeases.revokeParent(conn);
+    this.relayExposureLeases.disconnectChild(conn);
+    this._reconcileRelayExposureTransitions();
     if (!conn.address) return;
     if (conn.identity) {
       const key = runtimeIdentityKey(conn.identity);
@@ -549,10 +775,12 @@ export class Broker {
 
   // ── routing ───────────────────────────────────────────────────────────────
 
-  private async _route(env: Envelope): Promise<void> {
-    // Special handling for messages addressed to the broker itself.
+  private async _route(env: Envelope, senderConnection: PeerConn): Promise<void> {
+    // Special handling for messages addressed to the broker itself. Pass the
+    // actual socket-owned connection object so lease authority never depends
+    // on re-resolving self-assertable route metadata.
     if (env.to === BROKER_NAME) {
-      this._handleBrokerMessage(env);
+      this._handleBrokerMessage(env, senderConnection);
       return;
     }
 
@@ -642,11 +870,124 @@ export class Broker {
     } catch { /* sender dropped; close handler will fire */ }
   }
 
-  private _handleBrokerMessage(env: Envelope): void {
-    const body = env.body as { type?: string; peers?: unknown; name?: unknown } | null;
-    if (!body || typeof body !== "object") return;
+  private _handleBrokerMessage(env: Envelope, peer: PeerConn): void {
+    const body = env.body as Record<string, unknown> | null;
+    if (!body || typeof body !== "object" || Array.isArray(body)) return;
+    if (body["type"] === "relay_runner_delegate") {
+      const request = parseRelayRunnerDelegateRequest(body);
+      const result = request
+        ? this.relayExposureLeases.delegateRunner(peer, request)
+        : { ok: false as const, reason: "invalid_request" as const };
+      this._sendBrokerReply(peer, env, { type: "relay_runner_delegate_result", version: 1, ...result });
+      this._reconcileRelayExposureTransitions();
+      return;
+    }
+    if (body["type"] === "relay_lease_promote") {
+      const request = parseRelayExposurePromoteBrokerRequest(body);
+      let target: PeerConn | undefined;
+      let result: ReturnType<RelayExposureLeaseAuthority["promote"]> | { ok: false; reason: "invalid_request" | "target_not_found" | "target_epoch_mismatch" };
+      if (!request) {
+        result = { ok: false, reason: "invalid_request" };
+      } else {
+        target = this.peersByIdentity.get(runtimeIdentityKey(request.binding));
+        if (!target?.identity) {
+          result = { ok: false, reason: "target_not_found" };
+        } else if (target.identity.processEpoch.toLowerCase() !== request.binding.processEpoch.toLowerCase()) {
+          result = { ok: false, reason: "target_epoch_mismatch" };
+        } else {
+          result = this.relayExposureLeases.promote(peer, request.binding, target, { ttlMs: request.ttlMs });
+        }
+      }
+      this._sendBrokerReply(peer, env, { type: "relay_lease_promote_result", ...result });
+      if (result.ok && result.state === "promoted" && target) {
+        this._scheduleRelayExposureExpiry(result.lease);
+        this._sendRelayExposurePromoted(target, result.lease);
+      }
+      this._reconcileRelayExposureTransitions();
+      return;
+    }
+    if (body["type"] === "relay_lease_issue") {
+      const request = parseRelayExposureIssueBrokerRequest(body);
+      const result = request
+        ? this.relayExposureLeases.issue(peer, request.binding, { ttlMs: request.ttlMs })
+        : { ok: false as const, reason: "invalid_binding" as const };
+      this._sendBrokerReply(peer, env, { type: "relay_lease_issue_result", ...result });
+      this._reconcileRelayExposureTransitions();
+      return;
+    }
+    if (body["type"] === "relay_lease_activate") {
+      const request = parseRelayExposureActivationBrokerRequest(body);
+      let binding: RelayExposureBinding | undefined;
+      if (peer.identity && request) {
+        binding = {
+          runId: request.runId,
+          workspaceId: peer.identity.workspaceId,
+          agentId: peer.identity.agentId,
+          processEpoch: peer.identity.processEpoch,
+          mode: "relay",
+        };
+      }
+      const result = binding && request
+        ? this.relayExposureLeases.activate(request.capability, binding, peer)
+        : { ok: false as const, reason: "forged_capability" as const };
+      this._sendBrokerReply(peer, env, { type: "relay_lease_activate_result", ...result });
+      if (result.ok) this._scheduleRelayExposureExpiry(result.lease);
+      this._reconcileRelayExposureTransitions();
+      return;
+    }
+    if (body["type"] === "relay_lease_renew") {
+      const request = parseRelayExposureRenewBrokerRequest(body);
+      const result = request
+        ? this.relayExposureLeases.renew(peer, request.relayExposureLeaseId, request.binding, {
+            ttlMs: request.ttlMs,
+            renewalId: request.renewalId,
+          })
+        : { ok: false as const, reason: "invalid_request" as const };
+      this._sendBrokerReply(peer, env, { type: "relay_lease_renew_result", ...result });
+      // An idempotent reply may be an older A receipt replayed after a newer
+      // B renewal. Only a state-changing renewal owns expiry rescheduling.
+      if (result.ok && result.state === "renewed") this._scheduleRelayExposureExpiry(result.lease);
+      this._reconcileRelayExposureTransitions();
+      return;
+    }
+    if (body["type"] === "relay_lease_revoke") {
+      const request = parseRelayExposureRevokeBrokerRequest(body);
+      const result = request
+        ? this.relayExposureLeases.revoke(peer, request.relayExposureLeaseId, request.binding)
+        : { ok: false as const, reason: "invalid_request" as const };
+      this._sendBrokerReply(peer, env, { type: "relay_lease_revoke_result", ...result });
+      this._reconcileRelayExposureTransitions();
+      return;
+    }
+    if (body["type"] === "relay_lease_close") {
+      const request = parseRelayExposureCloseBrokerRequest(body);
+      let result = request
+        ? this.relayExposureLeases.close(
+            peer,
+            request.relayExposureLeaseId,
+            request.binding,
+            request.reason,
+          )
+        : { ok: false as const, reason: "invalid_request" as const };
+      // The same strict close shape is valid from either exact live endpoint:
+      // children reconcile apply failure/exit, while delegated parents reconcile
+      // ordinary completion and shutdown. Never fall back after a child-bound
+      // result; only a non-child connection may be considered as the parent.
+      if (request && !result.ok && result.reason === "stale_child_connection") {
+        result = this.relayExposureLeases.closeByParent(
+          peer,
+          request.relayExposureLeaseId,
+          request.binding,
+          request.reason,
+        );
+      }
+      this._sendBrokerReply(peer, env, { type: "relay_lease_close_result", ...result });
+      this._reconcileRelayExposureTransitions();
+      return;
+    }
+    // No wire-level parent-authorization operation exists. Unknown messages,
+    // including a forged `relay_parent_authorize`, are intentionally ignored.
     if (body.type === "update_presentation") {
-      const peer = this._peerAt(env.from);
       // Presentation mutation exists only for current ID-keyed peers. Legacy
       // clients keep their historical soft-rejoin rename behavior.
       if (!peer?.identity || typeof body.name !== "string") return;
@@ -695,6 +1036,17 @@ export class Broker {
     // plan/34: `turn_state` is no longer consumed — the broker doesn't gate
     // delivery on busy state. The Pi extension still publishes working state
     // as room_meta over the relay (index.ts), independent of the broker.
+  }
+
+  private _sendBrokerReply(peer: PeerConn, request: Envelope, body: unknown): void {
+    const reply: Envelope = {
+      from: BROKER_NAME,
+      to: request.from,
+      id: uuidv7(),
+      re: request.id,
+      body,
+    };
+    try { peer.socket.write(serialize(reply)); } catch { /* peer hung up */ }
   }
 
   private _broadcastSystem(body: SystemBody, excludeRoute: string): void {

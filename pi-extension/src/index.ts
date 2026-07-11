@@ -110,6 +110,22 @@ import {
   type RuntimeIdentity,
   type RuntimePresentation,
 } from "./session/runtime_identity.js";
+import {
+  parseRelayExposureActivationBrokerReply,
+  parseRelayExposureClosedNotice,
+  parseRelayExposureIssueBrokerReply,
+  parseRelayExposureLifecycleBrokerReply,
+  parseRelayExposurePromoteBrokerReply,
+  parseRelayExposurePromotedNotice,
+  parseRelayExposureRequest,
+  parseRelayExposureRenewedNotice,
+  relayExposureReplyEvent,
+  RELAY_EXPOSURE_CAPABILITY_ENV,
+  RELAY_EXPOSURE_READY_EVENT,
+  RELAY_EXPOSURE_REQUEST_EVENT,
+} from "./session/relay_exposure_rpc.js";
+import { parseRelayRunnerDelegateResult } from "./session/relay_runner_rpc.js";
+import type { RelayExposureLease } from "./session/relay_exposure_lease.js";
 import { updateFooter, type FooterState } from "./ui/footer.js";
 import { join, dirname, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
@@ -214,12 +230,18 @@ let _autoInited = false;
 // not become mutable policy merely because another extension changes
 // process.env after remote-pi has been initialized.
 function _snapshotSessionClaim(): Record<string, string | undefined> {
-  return {
+  const claim = {
     PI_SUBAGENT_CHILD: process.env["PI_SUBAGENT_CHILD"],
     PI_SUBAGENT_DESCRIPTOR: process.env["PI_SUBAGENT_DESCRIPTOR"],
+    [RELAY_EXPOSURE_CAPABILITY_ENV]: process.env[RELAY_EXPOSURE_CAPABILITY_ENV],
   };
+  // The one-process bearer is needed only during extension initialization and
+  // broker activation. Remove it from the mutable process environment before
+  // any model turn or child tool can inspect/inherit it.
+  delete process.env[RELAY_EXPOSURE_CAPABILITY_ENV];
+  return claim;
 }
-let _sessionClaim = _snapshotSessionClaim();
+let _sessionClaim: Record<string, string | undefined> = {};
 const _loadedRemotePiIdentity = loadRemotePiPackageIdentity();
 
 // Immutable runtime identity is resolved once per Pi session/runtime
@@ -232,6 +254,217 @@ let _runtimeSessionId: string | null = null;
 let _runtimeCwd: string | null = null;
 let _runtimeProcessEpoch = randomUUID();
 const _runtimeEpochFence = new EpochFence();
+let _relayExposureLease: RelayExposureLease | null = null;
+
+function _sameRelayExposureBinding(
+  left: import("./session/relay_exposure_lease.js").RelayExposureBinding,
+  right: import("./session/relay_exposure_lease.js").RelayExposureBinding,
+): boolean {
+  return left.runId === right.runId
+    && left.workspaceId.toLowerCase() === right.workspaceId.toLowerCase()
+    && left.agentId.toLowerCase() === right.agentId.toLowerCase()
+    && left.processEpoch.toLowerCase() === right.processEpoch.toLowerCase()
+    && left.mode === right.mode;
+}
+
+function _relayExposureAllowsReconnect(identity: RuntimeIdentity): boolean {
+  const lease = _relayExposureLease;
+  if (!lease) return true;
+  return lease.expiresAt > Date.now()
+    && lease.binding.workspaceId.toLowerCase() === identity.workspaceId.toLowerCase()
+    && lease.binding.agentId.toLowerCase() === identity.agentId.toLowerCase()
+    && lease.binding.processEpoch.toLowerCase() === identity.processEpoch.toLowerCase();
+}
+
+function _cloneRelayExposureLease(lease: RelayExposureLease): RelayExposureLease {
+  return {
+    ...lease,
+    relayExposureLeaseId: lease.relayExposureLeaseId.toLowerCase(),
+    parent: {
+      workspaceId: lease.parent.workspaceId.toLowerCase(),
+      agentId: lease.parent.agentId.toLowerCase(),
+      processEpoch: lease.parent.processEpoch.toLowerCase(),
+    },
+    binding: {
+      ...lease.binding,
+      workspaceId: lease.binding.workspaceId.toLowerCase(),
+      agentId: lease.binding.agentId.toLowerCase(),
+      processEpoch: lease.binding.processEpoch.toLowerCase(),
+    },
+  };
+}
+
+function _sameRelayExposureLeaseIdentity(left: RelayExposureLease, right: RelayExposureLease): boolean {
+  return left.relayExposureLeaseId === right.relayExposureLeaseId.toLowerCase()
+    && _sameRelayExposureBinding(left.binding, right.binding)
+    && left.parent.workspaceId === right.parent.workspaceId.toLowerCase()
+    && left.parent.agentId === right.parent.agentId.toLowerCase()
+    && left.parent.processEpoch === right.parent.processEpoch.toLowerCase()
+    && left.issuedAt === right.issuedAt;
+}
+
+function _sameRelayExposureLease(left: RelayExposureLease, right: RelayExposureLease): boolean {
+  return _sameRelayExposureLeaseIdentity(left, right) && left.expiresAt === right.expiresAt;
+}
+
+function _relayExposureLeaseCoversSnapshot(current: RelayExposureLease, snapshot: RelayExposureLease): boolean {
+  return _sameRelayExposureLeaseIdentity(current, snapshot) && current.expiresAt >= snapshot.expiresAt;
+}
+
+function _relayExposureLeaseMatchesCurrentChild(
+  lease: RelayExposureLease,
+  exposure: SessionExposurePolicy,
+  now = Date.now(),
+): boolean {
+  const descriptor = exposure.descriptor;
+  const identity = _runtimeIdentity;
+  return exposure.classification === "child_current"
+    && descriptor !== undefined
+    && identity !== null
+    && _meshNode !== null
+    && _runtimeEpochFence.isCurrent(identity)
+    && lease.issuedAt <= now
+    && lease.expiresAt > now
+    && lease.binding.runId === descriptor.runId
+    && lease.binding.workspaceId.toLowerCase() === identity.workspaceId.toLowerCase()
+    && lease.binding.agentId.toLowerCase() === identity.agentId.toLowerCase()
+    && lease.binding.processEpoch.toLowerCase() === identity.processEpoch.toLowerCase()
+    && lease.binding.workspaceId.toLowerCase() === descriptor.workspaceId.toLowerCase()
+    && lease.binding.agentId.toLowerCase() === descriptor.agentId.toLowerCase()
+    && lease.binding.processEpoch.toLowerCase() === descriptor.processEpoch.toLowerCase()
+    && lease.parent.workspaceId.toLowerCase() === descriptor.workspaceId.toLowerCase()
+    && typeof descriptor.parentAgentId === "string"
+    && lease.parent.agentId.toLowerCase() === descriptor.parentAgentId.toLowerCase();
+}
+
+function _demoteRelayExposure(): void {
+  _relayExposureLease = null;
+  if (_state !== "idle") _goIdle();
+}
+
+async function _closeCurrentChildRelayAfterApplyFailure(lease: RelayExposureLease): Promise<void> {
+  const meshNode = _meshNode;
+  if (!meshNode) return;
+  const request = {
+    version: 1 as const,
+    requestId: randomUUID(),
+    method: "close" as const,
+    relayExposureLeaseId: lease.relayExposureLeaseId,
+    binding: { ...lease.binding },
+    reason: "controlled_shutdown" as const,
+  };
+  try {
+    const reply = await meshNode.request("broker", {
+      type: "relay_lease_close",
+      relayExposureLeaseId: request.relayExposureLeaseId,
+      binding: request.binding,
+      reason: request.reason,
+    }, 2_000);
+    parseRelayExposureLifecycleBrokerReply(reply.body, request);
+  } catch {
+    // The exact child disconnect or bounded lease expiry remains the broker's
+    // fail-closed backstop when an apply-failure close cannot be acknowledged.
+  }
+}
+
+let _relayPromotionApplication: { leaseId: string; promise: Promise<void> } | null = null;
+
+async function _applyRelayExposurePromotedNotice(
+  raw: unknown,
+  ctx: Pick<ExtensionContext, "ui" | "cwd">,
+): Promise<boolean> {
+  const promoted = parseRelayExposurePromotedNotice(raw);
+  if (!promoted) return false;
+
+  const lease = _cloneRelayExposureLease(promoted.lease);
+  const cwd = "cwd" in ctx ? (ctx as ExtensionCommandContext).cwd : process.cwd();
+  const exposure = _sessionExposure(cwd);
+  if (!_relayExposureLeaseMatchesCurrentChild(lease, exposure)) return true;
+
+  const current = _relayExposureLease;
+  if (current) {
+    if (_sameRelayExposureLease(current, lease)) {
+      if (_relayPromotionApplication?.leaseId === lease.relayExposureLeaseId) {
+        await _relayPromotionApplication.promise;
+      }
+      return true;
+    }
+    if (current.expiresAt > Date.now()) return true;
+    _demoteRelayExposure();
+  }
+
+  _relayExposureLease = lease;
+  const application = (async () => {
+    let opened = false;
+    try {
+      opened = await _cmdStart(ctx, { preactivatedLease: lease });
+    } catch {
+      opened = false;
+    }
+    if (opened && _relayExposureLease && _relayExposureLeaseCoversSnapshot(_relayExposureLease, lease)) return;
+
+    const stillCurrent = _relayExposureLease !== null
+      && _relayExposureLeaseCoversSnapshot(_relayExposureLease, lease);
+    if (!stillCurrent) return;
+    _demoteRelayExposure();
+    await _closeCurrentChildRelayAfterApplyFailure(lease);
+    ctx.ui.notify("[remote-pi] Live relay promotion could not be applied; child remains on the local mesh.", "warning");
+  })();
+  _relayPromotionApplication = { leaseId: lease.relayExposureLeaseId, promise: application };
+  try {
+    await application;
+  } finally {
+    if (_relayPromotionApplication?.promise === application) _relayPromotionApplication = null;
+  }
+  return true;
+}
+
+function _handleRelayExposureBrokerNotice(raw: unknown): boolean {
+  const renewed = parseRelayExposureRenewedNotice(raw);
+  if (renewed) {
+    const lease = _relayExposureLease;
+    if (lease
+      && lease.relayExposureLeaseId === renewed.relayExposureLeaseId.toLowerCase()
+      && _sameRelayExposureBinding(lease.binding, renewed.binding)
+      && renewed.expiresAt > lease.expiresAt) {
+      _relayExposureLease = { ...lease, binding: { ...lease.binding }, parent: { ...lease.parent }, expiresAt: renewed.expiresAt };
+    }
+    return true;
+  }
+  const closed = parseRelayExposureClosedNotice(raw);
+  if (!closed) return false;
+  const lease = _relayExposureLease;
+  if (lease
+    && lease.relayExposureLeaseId === closed.relayExposureLeaseId.toLowerCase()
+    && _sameRelayExposureBinding(lease.binding, closed.binding)) {
+    _demoteRelayExposure();
+  }
+  return true;
+}
+
+function _handleMeshBrokerReconnect(): void {
+  // A local broker restart loses the in-memory authority. Even if this peer
+  // reconnects with the same generic IDs, it must obtain fresh authorization.
+  if (_relayExposureLease) _demoteRelayExposure();
+}
+
+export function _handleRelayExposureBrokerNoticeForTest(raw: unknown): boolean {
+  return _handleRelayExposureBrokerNotice(raw);
+}
+export function _applyRelayExposurePromotedNoticeForTest(
+  raw: unknown,
+  ctx: Pick<ExtensionContext, "ui" | "cwd">,
+): Promise<boolean> {
+  return _applyRelayExposurePromotedNotice(raw, ctx);
+}
+export function _handleMeshBrokerReconnectForTest(): void { _handleMeshBrokerReconnect(); }
+export function _getRelayExposureLeaseForTest(): RelayExposureLease | null {
+  return _relayExposureLease ? {
+    ..._relayExposureLease,
+    parent: { ..._relayExposureLease.parent },
+    binding: { ..._relayExposureLease.binding },
+  } : null;
+}
 
 /** Resolve captured launch classification + this cwd's durable normal config. */
 function _sessionExposure(cwd: string): SessionExposurePolicy {
@@ -505,6 +738,8 @@ export function _resetCwdLockForTest(): void {
   _runtimePresentation = null;
   _runtimeSessionId = null;
   _runtimeCwd = null;
+  _relayExposureLease = null;
+  _relayPromotionApplication = null;
   _beforePersistentRenameWriteForTest = null;
   _runtimeProcessEpoch = randomUUID();
 }
@@ -862,6 +1097,10 @@ function _onRelayClose(identity: RuntimeIdentity, closedRelay: RelayClient): voi
   // the current epoch.
   if (!_runtimeEpochFence.isCurrent(identity) || _relay !== closedRelay) return;
   if (_state === "idle") return;  // already torn down (e.g. /remote-pi stop)
+  if (!_relayExposureAllowsReconnect(identity)) {
+    _demoteRelayExposure();
+    return;
+  }
 
   _stopAutoListener?.();
   _stopAutoListener = null;
@@ -893,6 +1132,11 @@ function _scheduleReconnect(): void {
   if (_reconnectTimer !== null) return;  // already scheduled
   if (!_cachedEd25519 || !_relayUrl) return;  // can't reconnect without these
   if (_getState() === "idle") return;  // stopped while we were here
+  const identity = _runtimeIdentity;
+  if (!identity || !_relayExposureAllowsReconnect(identity)) {
+    if (_relayExposureLease) _demoteRelayExposure();
+    return;
+  }
 
   const idx = Math.min(_reconnectAttempt, RECONNECT_BACKOFFS_MS.length - 1);
   const delay = RECONNECT_BACKOFFS_MS[idx]!;
@@ -911,6 +1155,10 @@ async function _attemptReconnect(): Promise<void> {
   if (!_cachedEd25519 || !_relayUrl) return;
   const identity = _runtimeIdentity;
   if (!identity || !_runtimeEpochFence.isCurrent(identity)) return;
+  if (!_relayExposureAllowsReconnect(identity)) {
+    if (_relayExposureLease) _demoteRelayExposure();
+    return;
+  }
 
   const edKp = _cachedEd25519;
   const url = _relayUrl;
@@ -1448,6 +1696,143 @@ function _appliedRegistry(): WeakSet<object> {
   return (g[_APPLIED_REGISTRY_KEY] ??= new WeakSet<object>());
 }
 
+function _registerRelayExposureRpc(pi: ExtensionAPI): void {
+  const events = (pi as ExtensionAPI & {
+    events?: { on: (channel: string, handler: (payload: unknown) => void) => unknown; emit: (channel: string, payload: unknown) => void };
+  }).events;
+  if (!events || typeof events.on !== "function" || typeof events.emit !== "function") return;
+  events.on(RELAY_EXPOSURE_REQUEST_EVENT, (raw) => {
+    const request = parseRelayExposureRequest(raw);
+    if (!request) return;
+    void (async () => {
+      let reply: Record<string, unknown>;
+      try {
+        if (!_meshNode) {
+          reply = { version: 1, requestId: request.requestId, success: false, reason: "local_mesh_unavailable" };
+        } else if (request.method === "delegate_runner") {
+          const envelope = await _meshNode.request("broker", {
+            type: "relay_runner_delegate",
+            version: 1,
+            rootRunId: request.rootRunId,
+            workspaceId: request.workspaceId,
+            delegationTtlMs: request.delegationTtlMs,
+            maxLeaseTtlMs: request.maxLeaseTtlMs,
+            maxChildIssues: request.maxChildIssues,
+          }, 2_000);
+          const result = parseRelayRunnerDelegateResult(envelope.body);
+          reply = result?.ok === true
+            ? {
+                version: 1,
+                requestId: request.requestId,
+                success: true,
+                ok: true,
+                token: result.token,
+                socketPath: sessionSockPath(LOCAL_SESSION_NAME),
+                expiresAt: result.expiresAt,
+                maxLeaseTtlMs: result.maxLeaseTtlMs,
+                maxChildIssues: result.maxChildIssues,
+              }
+            : {
+                version: 1,
+                requestId: request.requestId,
+                success: false,
+                reason: result?.reason ?? "invalid_broker_reply",
+              };
+        } else if (request.method === "issue") {
+          const envelope = await _meshNode.request("broker", {
+            type: "relay_lease_issue",
+            binding: request.binding,
+            ttlMs: request.ttlMs,
+          }, 2_000);
+          const result = parseRelayExposureIssueBrokerReply(envelope.body);
+          reply = result?.ok === true
+            ? {
+                version: 1,
+                requestId: request.requestId,
+                success: true,
+                ok: true,
+                capability: result.capability,
+                lease: result.lease,
+              }
+            : {
+                version: 1,
+                requestId: request.requestId,
+                success: false,
+                reason: result?.reason ?? "invalid_broker_reply",
+              };
+        } else if (request.method === "promote") {
+          const envelope = await _meshNode.request("broker", {
+            type: "relay_lease_promote",
+            binding: request.binding,
+            ttlMs: request.ttlMs,
+          }, 2_000);
+          const result = parseRelayExposurePromoteBrokerReply(envelope.body, request.binding);
+          reply = result?.ok === true
+            ? {
+                version: 1,
+                requestId: request.requestId,
+                success: true,
+                ok: true,
+                state: result.state,
+                lease: result.lease,
+              }
+            : {
+                version: 1,
+                requestId: request.requestId,
+                success: false,
+                reason: result?.reason ?? "invalid_broker_reply",
+              };
+        } else {
+          const brokerRequest = request.method === "renew"
+            ? {
+                type: "relay_lease_renew",
+                relayExposureLeaseId: request.relayExposureLeaseId,
+                renewalId: request.renewalId,
+                binding: request.binding,
+                ttlMs: request.ttlMs,
+              }
+            : request.method === "revoke"
+              ? {
+                  type: "relay_lease_revoke",
+                  relayExposureLeaseId: request.relayExposureLeaseId,
+                  binding: request.binding,
+                }
+              : {
+                  type: "relay_lease_close",
+                  relayExposureLeaseId: request.relayExposureLeaseId,
+                  binding: request.binding,
+                  reason: request.reason,
+                };
+          const envelope = await _meshNode.request("broker", brokerRequest, 2_000);
+          const result = parseRelayExposureLifecycleBrokerReply(envelope.body, request);
+          reply = result?.ok === true
+            ? {
+                version: 1,
+                requestId: request.requestId,
+                success: true,
+                ok: true,
+                state: result.state,
+                lease: result.lease,
+              }
+            : {
+                version: 1,
+                requestId: request.requestId,
+                success: false,
+                reason: result?.reason ?? "invalid_broker_reply",
+                ...(result && "field" in result && result.field ? { field: result.field } : {}),
+              };
+        }
+      } catch {
+        // Capability material and raw request payloads are deliberately absent
+        // from diagnostics. Broker loss/timeout is a fail-closed denial.
+        reply = { version: 1, requestId: request.requestId, success: false, reason: "broker_unavailable" };
+      }
+      events.emit(relayExposureReplyEvent(request.requestId), reply);
+    })();
+  });
+  events.emit(RELAY_EXPOSURE_READY_EVENT, { version: 1 });
+}
+
 const extension: ExtensionFactory = (pi: ExtensionAPI): void => {
   const applied = _appliedRegistry();
   if (applied.has(pi)) return;  // this session's pi was already wired
@@ -1473,6 +1858,7 @@ const extension: ExtensionFactory = (pi: ExtensionAPI): void => {
   // session network natively. Getter captures `_meshNode` live so the
   // tool always sees the current state.
   registerAgentTools(pi, () => _meshNode?.peer() ?? null);
+  _registerRelayExposureRpc(pi);
 
   // Tool calls execute without prompting the remote user. The Pi SDK has no
   // native `requiresApproval` per tool, and a hardcoded gate (Bash/Edit/Write)
@@ -1780,6 +2166,7 @@ const extension: ExtensionFactory = (pi: ExtensionAPI): void => {
     _runtimePresentation = null;
     _runtimeSessionId = null;
     _runtimeCwd = null;
+    _relayExposureLease = null;
     // No bye reason: the process keeps running and the fresh instance re-joins
     // the SAME relay room, so an explicit offline→online flap would be wrong.
     if (_state !== "idle") _goIdle();
@@ -1810,6 +2197,7 @@ const extension: ExtensionFactory = (pi: ExtensionAPI): void => {
         "pair", "devices", "revoke",
         "rename",
         "set-relay",
+        "relay-parent authorize",
         "peers",  // plan/25 Wave D — local + cross-PC inventory
         "create", "remove", "daemons",  // daemon registry (plan/26 W1)
         // Fleet ops use the `daemon` prefix so `/remote-pi stop` keeps
@@ -1834,6 +2222,7 @@ const extension: ExtensionFactory = (pi: ExtensionAPI): void => {
       else if (sub.startsWith("revoke"))         { await _cmdRevoke(sub.slice("revoke".length).trim(), ctx); }
       else if (sub.startsWith("set-relay"))      { _cmdSetRelay(sub.slice("set-relay".length).trim(), ctx); }
       else if (sub === "rename" || sub.startsWith("rename ")) { await _renameAgent(sub.slice("rename".length).trim(), { persist: true }); }
+      else if (sub === "relay-parent authorize" || sub.startsWith("relay-parent authorize ")) { _cmdAuthorizeRelayParent(sub.slice("relay-parent authorize".length).trim(), ctx); }
       else if (sub === "peers")                  { await _cmdPeers(ctx); }
       else if (sub.startsWith("create"))         { await _cmdCreate(sub.slice("create".length).trim(), ctx); }
       else if (sub.startsWith("remove"))         { await _cmdRemove(sub.slice("remove".length).trim(), ctx); }
@@ -1865,6 +2254,10 @@ const extension: ExtensionFactory = (pi: ExtensionAPI): void => {
     handler: async (args, ctx) => { _lastCtx = ctx; await _cmdRevoke(args.trim(), ctx); },
   });
   pi.registerCommand("remote-pi set-relay", { description: "Persist a new relay URL to user config", handler: async (args, ctx) => { _lastCtx = ctx; _cmdSetRelay(args.trim(), ctx); } });
+  pi.registerCommand("remote-pi relay-parent authorize", {
+    description: "Explicitly delegate relay issuance to one live parent connection (broker leader only)",
+    handler: async (args, ctx) => { _lastCtx = ctx; _cmdAuthorizeRelayParent(args.trim(), ctx); },
+  });
 
   // Plan/25 Wave D
   pi.registerCommand("remote-pi peers", {
@@ -1909,6 +2302,28 @@ const extension: ExtensionFactory = (pi: ExtensionAPI): void => {
 export default extension;
 
 // ── Command implementations ───────────────────────────────────────────────────
+
+function _cmdAuthorizeRelayParent(
+  requestedRoute: string,
+  ctx: Pick<ExtensionContext, "ui">,
+): void {
+  if (!_meshNode) {
+    ctx.ui.notify("[remote-pi] Local mesh is not running; start remote-pi before authorizing a relay parent.", "warning");
+    return;
+  }
+  const broker = _meshNode.localBroker();
+  if (!broker) {
+    ctx.ui.notify("[remote-pi] Relay-parent authorization is broker-leader-local. Run it in the Pi process currently hosting the local broker.", "warning");
+    return;
+  }
+  const route = requestedRoute || _meshNode.address();
+  const result = broker.authorizeRelayParent(route);
+  if (!result.ok) {
+    ctx.ui.notify(`[remote-pi] Could not authorize relay parent '${route}': ${result.reason}.`, "warning");
+    return;
+  }
+  ctx.ui.notify(`[remote-pi] Relay parent authorized for this live connection: ${route}. The delegation is transient and ends on disconnect or broker restart.`, "info");
+}
 
 /**
  * `/remote-pi status` — full state snapshot. Two lines: local mesh + relay.
@@ -2008,6 +2423,11 @@ async function _cmdRoot(ctx: Pick<ExtensionContext, "ui" | "cwd">): Promise<void
   // this cwd has no remote-pi config yet.
   if (!localConfigExists(cwd) && isChildSession(exposure)) {
     if (exposure.mode !== "off" && !_meshNode) await _cmdJoin(ctx);
+    if (exposure.classification === "child_current"
+      && exposure.descriptor?.requestedExposure === "relay"
+      && _state === "idle") {
+      await _cmdStart(ctx);
+    }
     _cmdStatus(ctx);
     return;
   }
@@ -2065,7 +2485,10 @@ async function _cmdRoot(ctx: Pick<ExtensionContext, "ui" | "cwd">): Promise<void
   // a ghost relay connection on an already-disposed instance (the replacement
   // instance owns the live connect).
   if (_disposed) return;
-  if (exposure.mode === "relay" && effectiveAutoStartRelay(config) && _state === "idle") await _cmdStart(ctx);
+  const shouldStartRelay = isChildSession(exposure)
+    ? exposure.classification === "child_current" && exposure.descriptor?.requestedExposure === "relay"
+    : exposure.mode === "relay" && effectiveAutoStartRelay(config);
+  if (shouldStartRelay && _state === "idle") await _cmdStart(ctx);
   _cmdStatus(ctx);
 }
 
@@ -2117,23 +2540,93 @@ async function _cmdSetup(ctx: Pick<ExtensionContext, "ui" | "cwd">): Promise<voi
   }
 }
 
-async function _cmdStart(ctx: Pick<ExtensionContext, "ui" | "cwd">): Promise<void> {
+type ChildRelayActivation =
+  | { ok: true; lease: RelayExposureLease }
+  | { ok: false; reason: string };
+
+async function _activateCurrentChildRelay(exposure: SessionExposurePolicy): Promise<ChildRelayActivation> {
+  const descriptor = exposure.descriptor;
+  if (exposure.classification !== "child_current" || descriptor?.requestedExposure !== "relay") {
+    return { ok: false, reason: "relay_not_requested" };
+  }
+  if (!_meshNode || !_runtimeIdentity) return { ok: false, reason: "local_mesh_unavailable" };
+  if (!_runtimeEpochFence.isCurrent(_runtimeIdentity)) return { ok: false, reason: "stale_process_epoch" };
+  const capability = _sessionClaim[RELAY_EXPOSURE_CAPABILITY_ENV];
+  if (!capability) return { ok: false, reason: "missing_capability" };
+  let activationReply: ReturnType<typeof parseRelayExposureActivationBrokerReply>;
+  try {
+    const reply = await _meshNode.request("broker", {
+      type: "relay_lease_activate",
+      capability,
+      runId: descriptor.runId,
+      mode: "relay",
+    }, 2_000);
+    activationReply = parseRelayExposureActivationBrokerReply(reply.body, capability);
+  } catch {
+    return { ok: false, reason: "broker_unavailable" };
+  }
+  if (!activationReply) return { ok: false, reason: "invalid_activation_reply" };
+  if (!activationReply.ok) return { ok: false, reason: activationReply.reason };
+  const lease = activationReply.lease;
+  const now = Date.now();
+  if (lease.binding.runId !== descriptor.runId
+    || lease.binding.workspaceId.toLowerCase() !== _runtimeIdentity.workspaceId.toLowerCase()
+    || lease.binding.agentId.toLowerCase() !== _runtimeIdentity.agentId.toLowerCase()
+    || lease.binding.processEpoch.toLowerCase() !== _runtimeIdentity.processEpoch.toLowerCase()
+    || lease.expiresAt <= now) {
+    return { ok: false, reason: "invalid_activation_reply" };
+  }
+  _relayExposureLease = {
+    ...lease,
+    parent: { ...lease.parent },
+    binding: { ...lease.binding },
+  };
+  return { ok: true, lease: _relayExposureLease };
+}
+
+interface RelayStartOptions {
+  /** Safe broker-active metadata for a post-start live promotion. */
+  preactivatedLease?: RelayExposureLease;
+}
+
+async function _cmdStart(
+  ctx: Pick<ExtensionContext, "ui" | "cwd">,
+  options: RelayStartOptions = {},
+): Promise<boolean> {
   const cwd = "cwd" in ctx ? (ctx as ExtensionCommandContext).cwd : process.cwd();
   const exposure = _sessionExposure(cwd);
-  if (isChildSession(exposure) && exposure.mode !== "relay") {
-    ctx.ui.notify(
-      `[remote-pi] Relay denied for ${exposure.classification}; effective child exposure is ${exposure.mode} (source: ${exposure.source}).`,
-      "warning",
-    );
-    return;
+  let childLease: RelayExposureLease | null = null;
+  if (isChildSession(exposure)) {
+    if (options.preactivatedLease) {
+      if (!_relayExposureLease
+        || !_sameRelayExposureLease(_relayExposureLease, options.preactivatedLease)
+        || !_relayExposureLeaseMatchesCurrentChild(options.preactivatedLease, exposure)) {
+        ctx.ui.notify(
+          `[remote-pi] Relay denied for ${exposure.classification}; child remains ${exposure.mode} (source: ${exposure.source}, lease: stale_promotion).`,
+          "warning",
+        );
+        return false;
+      }
+      childLease = options.preactivatedLease;
+    } else {
+      const activation = await _activateCurrentChildRelay(exposure);
+      if (!activation.ok) {
+        ctx.ui.notify(
+          `[remote-pi] Relay denied for ${exposure.classification}; child remains ${exposure.mode} (source: ${exposure.source}, lease: ${activation.reason}).`,
+          "warning",
+        );
+        return false;
+      }
+      childLease = activation.lease;
+    }
   }
   if (_state !== "idle") {
     ctx.ui.notify("[remote-pi] Already started.", "warning");
-    return;
+    return childLease === null || (_relayExposureLease !== null && _relayExposureLeaseCoversSnapshot(_relayExposureLease, childLease));
   }
 
   const identity = _runtimeIdentity ?? _ensureRuntimeIdentity(cwd, exposure, _displayName(cwd), ctx);
-  if (!identity) return;
+  if (!identity) return false;
 
   let edKp: Awaited<ReturnType<typeof getOrCreateEd25519Keypair>>;
   try {
@@ -2152,7 +2645,7 @@ async function _cmdStart(ctx: Pick<ExtensionContext, "ui" | "cwd">): Promise<voi
         "(Set REMOTE_PI_ALLOW_FILE_IDENTITY=1 only for headless hosts.)",
         "error",
       );
-      return;
+      return false;
     }
     throw err;
   }
@@ -2236,10 +2729,10 @@ async function _cmdStart(ctx: Pick<ExtensionContext, "ui" | "cwd">): Promise<voi
         "[remote-pi] Already running in this cwd. Stop the other terminal first.",
         "error",
       );
-      return;
+      return false;
     }
     ctx.ui.notify(`[remote-pi] relay connect failed: ${String(err)}`, "error");
-    return;
+    return false;
   }
 
   // Race guard: a `session_shutdown` may have landed while we were awaiting the
@@ -2253,9 +2746,11 @@ async function _cmdStart(ctx: Pick<ExtensionContext, "ui" | "cwd">): Promise<voi
   // instance's own connect is refused with `room_already_open` — the agent never enters
   // the cross-PC mesh. Close the fresh relay and bail; the replacement instance
   // (fresh module) drives the real connect. Mirrors the `_cmdJoin` guard.
-  if (_disposed) {
+  if (_disposed
+    || (childLease !== null
+      && (!_relayExposureLease || !_relayExposureLeaseCoversSnapshot(_relayExposureLease, childLease)))) {
     try { relay.close(); } catch { /* best-effort */ }
-    return;
+    return false;
   }
 
   _relay = relay;
@@ -2338,6 +2833,7 @@ async function _cmdStart(ctx: Pick<ExtensionContext, "ui" | "cwd">): Promise<voi
 
   _emitRelayState();  // → connected
   ctx.ui.notify(`[remote-pi] state: started (peer=${myShort}) — Connected to relay ${relayUrl}`, "info");
+  return true;
 }
 
 /**
@@ -2451,6 +2947,7 @@ async function _cmdStop(ctx: Pick<ExtensionContext, "ui">): Promise<void> {
   }
 
   if (relayUp) _goIdle("peer_stop");
+  _relayExposureLease = null;
 
   ctx.ui.notify("[remote-pi] Stopped (mesh + relay disconnected).", "info");
   _refreshFooter(ctx);
@@ -3332,6 +3829,18 @@ async function _cmdJoin(ctx: Pick<ExtensionContext, "ui" | "cwd">): Promise<void
   peer.onMessage((env) => {
     if (!_runtimeEpochFence.isCurrent(identity)) return;
     const body = env.body as { type?: string } | null;
+    if (env.from === "broker" && body?.type === "relay_lease_promoted") {
+      void _applyRelayExposurePromotedNotice(body, ctx);
+      return;
+    }
+    if (env.from === "broker" && body?.type === "relay_lease_renewed") {
+      _handleRelayExposureBrokerNotice(body);
+      return;
+    }
+    if (env.from === "broker" && body?.type === "relay_lease_closed") {
+      _handleRelayExposureBrokerNotice(body);
+      return;
+    }
     // Broker system events: re-query broker for authoritative count.
     // Incremental ±1 drifts when peer_left is missed (leader leaves cleanly,
     // failover, etc.) — querying list_peers makes the count self-healing.
@@ -3381,6 +3890,7 @@ async function _cmdJoin(ctx: Pick<ExtensionContext, "ui" | "cwd">): Promise<void
   // is handled INSIDE MeshNode — no manual teardown/ensure needed here.
   peer.onReconnect(() => {
     if (!_runtimeEpochFence.isCurrent(identity) || _meshNode !== peer) return;
+    _handleMeshBrokerReconnect();
     _refreshSessionPeerCount(peer, ctx);
   });
 
