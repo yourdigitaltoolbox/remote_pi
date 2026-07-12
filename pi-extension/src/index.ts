@@ -4203,6 +4203,73 @@ export function _routeClientMessageFrom(
     }
     return;
   }
+  // Lifecycle actions do not need a direct Pi call. Handle them before the
+  // generic Pi-binding guard so an owner can diagnose an unavailable registry
+  // rather than having its authenticated request silently dropped.
+  if (msg.type === "session_compact") {
+    handleSessionCompact(_remoteLifecycle, sender, msg);
+    return;
+  }
+  if (msg.type === "lifecycle_status") {
+    const status = _remoteLifecycle.status();
+    sender.send({
+      type: "lifecycle_status",
+      in_reply_to: msg.id,
+      snapshot: {
+        registry_state: status.snapshot.registryState,
+        sequence: status.snapshot.sequence,
+        ...(status.snapshot.sessionId ? { session_id: status.snapshot.sessionId } : {}),
+        ...(status.snapshot.generationId ? { generation_id: status.snapshot.generationId } : {}),
+        ...(status.snapshot.phase ? { phase: status.snapshot.phase } : {}),
+        ...(status.snapshot.operationId ? { operation_id: status.snapshot.operationId } : {}),
+        ...(status.snapshot.reason ? { reason: status.snapshot.reason } : {}),
+        ...(status.snapshot.lastOutcome ? { last_outcome: status.snapshot.lastOutcome } : {}),
+      },
+      diagnostics: status.diagnostics.map((record) => ({
+        sequence: record.sequence,
+        timestamp: record.timestamp,
+        code: record.code,
+        ...(record.operationId ? { operation_id: record.operationId } : {}),
+        ...(record.phase ? { phase: record.phase } : {}),
+        ...(record.outcome ? { outcome: record.outcome } : {}),
+      })),
+    });
+    return;
+  }
+  if (msg.type === "lifecycle_repair") {
+    // This route is only reached from an authenticated paired channel. The
+    // lifecycle owner still validates operation/session/generation/phase/
+    // sequence CAS and evidence; Remote Pi supplies no bypass authority.
+    if (!Number.isSafeInteger(msg.expected_sequence) || msg.expected_sequence < 0) {
+      sender.send({ type: "lifecycle_repair", in_reply_to: msg.id, disposition: "rejected", code: "invalid-expected-sequence" });
+      return;
+    }
+    try {
+      const result = _remoteLifecycle.repair({
+        action: msg.action,
+        operationId: msg.operation_id,
+        sessionId: msg.session_id,
+        generationId: msg.generation_id,
+        expectedPhase: msg.expected_phase,
+        expectedSequence: msg.expected_sequence,
+        evidenceClass: msg.evidence_class,
+        ...(msg.consumer_id ? { consumerId: msg.consumer_id } : {}),
+        ...(msg.lane_id ? { laneId: msg.lane_id } : {}),
+        ...(msg.evidence_entry_id ? { evidenceEntryId: msg.evidence_entry_id } : {}),
+      });
+      sender.send({
+        type: "lifecycle_repair",
+        in_reply_to: msg.id,
+        disposition: result.disposition,
+        ...(result.disposition === "applied"
+          ? { action: result.action, operation_id: result.operationId, generation_id: result.generationId }
+          : { code: result.code, ...(result.generationId ? { generation_id: result.generationId } : {}), ...(result.sequence === undefined ? {} : { sequence: result.sequence }) }),
+      });
+    } catch (error) {
+      sender.send({ type: "lifecycle_repair", in_reply_to: msg.id, disposition: "rejected", code: error instanceof Error ? error.message : String(error) });
+    }
+    return;
+  }
   if (!_pi) return;
   switch (msg.type) {
     case "user_message": {
@@ -4290,72 +4357,6 @@ export function _routeClientMessageFrom(
     // null or a narrower Pick than the handlers want, so we cast to
     // `ActionCtx` — fields that aren't present at runtime are surfaced
     // as `action_error` by the handlers, not as a TypeError.
-    case "session_compact":
-      // Manual remote compaction is lifecycle-owned. This never invokes
-      // ctx.compact() directly: the owner serializes request settlement,
-      // generations, resume admission, and duplicate/multi-owner coalescing.
-      handleSessionCompact(_remoteLifecycle, sender, msg);
-      break;
-    case "lifecycle_status": {
-      const status = _remoteLifecycle.status();
-      sender.send({
-        type: "lifecycle_status",
-        in_reply_to: msg.id,
-        snapshot: {
-          registry_state: status.snapshot.registryState,
-          sequence: status.snapshot.sequence,
-          ...(status.snapshot.sessionId ? { session_id: status.snapshot.sessionId } : {}),
-          ...(status.snapshot.generationId ? { generation_id: status.snapshot.generationId } : {}),
-          ...(status.snapshot.phase ? { phase: status.snapshot.phase } : {}),
-          ...(status.snapshot.operationId ? { operation_id: status.snapshot.operationId } : {}),
-          ...(status.snapshot.reason ? { reason: status.snapshot.reason } : {}),
-          ...(status.snapshot.lastOutcome ? { last_outcome: status.snapshot.lastOutcome } : {}),
-        },
-        diagnostics: status.diagnostics.map((record) => ({
-          sequence: record.sequence,
-          timestamp: record.timestamp,
-          code: record.code,
-          ...(record.operationId ? { operation_id: record.operationId } : {}),
-          ...(record.phase ? { phase: record.phase } : {}),
-          ...(record.outcome ? { outcome: record.outcome } : {}),
-        })),
-      });
-      break;
-    }
-    case "lifecycle_repair": {
-      // This route is only reached from an authenticated paired channel. The
-      // lifecycle owner still validates operation/session/generation/phase/
-      // sequence CAS and evidence; Remote Pi supplies no bypass authority.
-      if (!Number.isSafeInteger(msg.expected_sequence) || msg.expected_sequence < 0) {
-        sender.send({ type: "lifecycle_repair", in_reply_to: msg.id, disposition: "rejected", code: "invalid-expected-sequence" });
-        break;
-      }
-      try {
-        const result = _remoteLifecycle.repair({
-          action: msg.action,
-          operationId: msg.operation_id,
-          sessionId: msg.session_id,
-          generationId: msg.generation_id,
-          expectedPhase: msg.expected_phase,
-          expectedSequence: msg.expected_sequence,
-          evidenceClass: msg.evidence_class,
-          ...(msg.consumer_id ? { consumerId: msg.consumer_id } : {}),
-          ...(msg.lane_id ? { laneId: msg.lane_id } : {}),
-          ...(msg.evidence_entry_id ? { evidenceEntryId: msg.evidence_entry_id } : {}),
-        });
-        sender.send({
-          type: "lifecycle_repair",
-          in_reply_to: msg.id,
-          disposition: result.disposition,
-          ...(result.disposition === "applied"
-            ? { action: result.action, operation_id: result.operationId, generation_id: result.generationId }
-            : { code: result.code, ...(result.generationId ? { generation_id: result.generationId } : {}), ...(result.sequence === undefined ? {} : { sequence: result.sequence }) }),
-        });
-      } catch (error) {
-        sender.send({ type: "lifecycle_repair", in_reply_to: msg.id, disposition: "rejected", code: error instanceof Error ? error.message : String(error) });
-      }
-      break;
-    }
     case "session_new": {
       const actionCtx = _lastCtx as ActionCtx | null;
       if (process.env["REMOTE_PI_DAEMON"] === "1" && !actionCtx?.newSession) {
