@@ -36,5 +36,7 @@ jobs:
       - name: Disposable Pi 0.80.6 full-SHA Git-install smoke
         env:
           REMOTE_PI_GIT_SOURCE: github.com/${{ github.repository }}
-          REMOTE_PI_GIT_SHA: ${{ github.sha }}
+          # PR `github.sha` is an ephemeral merge ref that a fresh Git clone
+          # cannot resolve; install the immutable published head instead.
+          REMOTE_PI_GIT_SHA: ${{ github.event.pull_request.head.sha || github.sha }}
         run: npm run smoke:pi-git-install
