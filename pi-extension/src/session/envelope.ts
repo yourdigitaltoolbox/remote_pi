@@ -4,12 +4,19 @@ import { randomBytes } from "node:crypto";
  * 5-field envelope for the agent-network local protocol (plano 19).
  * Serialized as JSONL (one JSON object per line) over UDS streams.
  */
+export interface DeliveryReceiptRequest {
+  /** Broker-added marker: target must retain before acknowledging this envelope. */
+  required: true;
+}
+
 export interface Envelope {
   from: string;
   to: string | string[];        // single name, list of names, or "broadcast"
   id: string;                   // UUID v7
   re: string | null;            // id of the message this replies to, or null
   body: unknown;
+  /** Trusted only when added by the receiving broker's delivery path. */
+  deliveryReceipt?: DeliveryReceiptRequest;
 }
 
 const UUID_RE =
@@ -90,12 +97,19 @@ export function parse(line: string): Envelope {
   if (!("body" in o)) {
     throw new EnvelopeError("body required");
   }
+  const deliveryReceipt = o["deliveryReceipt"];
+  if (deliveryReceipt !== undefined
+    && (!deliveryReceipt || typeof deliveryReceipt !== "object" || Array.isArray(deliveryReceipt)
+      || (deliveryReceipt as Record<string, unknown>)["required"] !== true)) {
+    throw new EnvelopeError("deliveryReceipt must be { required: true }");
+  }
   return {
     from: o["from"] as string,
     to: to as string | string[],
     id: o["id"] as string,
     re: re as string | null,
     body: o["body"],
+    ...(deliveryReceipt === undefined ? {} : { deliveryReceipt: { required: true } }),
   };
 }
 

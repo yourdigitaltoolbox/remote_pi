@@ -75,6 +75,7 @@ import {
 } from "./actions/handlers.js";
 import { ensureModelRegistry } from "./actions/registry.js";
 import { RemoteLifecycleController } from "./lifecycle/remote_lifecycle.js";
+import { MeshSpool, resolveMeshSpoolMode, type MeshLane } from "./session/mesh_spool.js";
 import {
   ensureGlobalDirs,
   LOCAL_SESSION_NAME,
@@ -253,6 +254,7 @@ const _loadedRemotePiIdentity = loadRemotePiPackageIdentity();
 let _runtimeIdentity: RuntimeIdentity | null = null;
 let _runtimePresentation: RuntimePresentation | null = null;
 let _runtimeSessionId: string | null = null;
+let _meshSpool: MeshSpool | null = null;
 
 // Remote Pi is a lifecycle consumer, not an owner. The controller exposes only
 // correlated operation metadata to paired owners; consumer bodies and resume
@@ -2101,6 +2103,7 @@ const extension: ExtensionFactory = (pi: ExtensionAPI): void => {
     }
     if (sessionId) _runtimeSessionId = sessionId;
     _remoteLifecycle.bind(sessionId);
+    _replaceMeshSpool(sessionId, ctx);
     // Pi → remote-pi name sync is presentation-only. Before the mesh exists it
     // updates only runtime presentation so the first join uses the Pi session
     // name; after join, turn_start may publish the same metadata through the
@@ -2195,6 +2198,8 @@ const extension: ExtensionFactory = (pi: ExtensionAPI): void => {
     // fired switch_session right after boot.
     _disposed = true;
     _remoteLifecycle.dispose();
+    _meshSpool?.dispose();
+    _meshSpool = null;
     if (_meshNode) {
       try { await _meshNode.close(); } catch { /* best-effort */ }
       _meshNode = null;
@@ -3896,52 +3901,101 @@ function _wakeAgent(
   }
 }
 
-/**
- * Deliver an inbound agent-network (mesh) message to the agent + the app.
- *
- * Display: the app renders it in the TOOL timeline (a matched
- * tool_request/tool_result "agent-network" pair) — NOT as the user's own
- * message, which is what `sendUserMessage` used to produce (the reported bug).
- *
- * Wake: we inject a CUSTOM message (role:"custom"), not a user message. The
- * SDK's `convertToLlm` maps custom → a user-role LLM message, so the agent
- * still sees + replies to it, but `message_end` does NOT buffer role:"custom",
- * so it never replays as `user_input` on session_sync. `triggerTurn` runs the
- * turn; `id` lets the LLM echo it via `agent_send(..., re=<id>)`.
- */
-function _deliverMeshMessageToAgent(
-  env: { id: string; from: string; re: string | null; body: unknown },
-): void {
-  const bodyText = typeof env.body === "string" ? env.body : JSON.stringify(env.body);
-  const toolCallId = `mesh_${env.id}`;
-  _broadcastToActive({
-    type: "tool_request",
-    tool_call_id: toolCallId,
-    tool: "agent-network",
-    args: env.re
-      ? { from: env.from, re: env.re, message: bodyText }
-      : { from: env.from, message: bodyText },
-  });
-  _broadcastToActive({ type: "tool_result", tool_call_id: toolCallId, result: { from: env.from, message: bodyText } });
+interface PersistedMeshSpoolEvent {
+  schemaVersion: 1;
+  sessionId: string;
+  state: "held" | "submitting" | "submitted";
+  lane: MeshLane;
+  generationId: string;
+  envelope: import("./session/envelope.js").Envelope;
+  submissionId?: string;
+}
 
-  const label = `agent-network message from "${env.from}"`;
-  if (!_pi) {
-    console.error(`[remote-pi] ${label}: agent session not bound yet — message dropped`);
-    return;
+function _isPersistedMeshSpoolEvent(value: unknown, sessionId: string): value is PersistedMeshSpoolEvent {
+  if (!value || typeof value !== "object" || Array.isArray(value)) return false;
+  const event = value as Partial<PersistedMeshSpoolEvent>;
+  return event.schemaVersion === 1
+    && event.sessionId === sessionId
+    && (event.state === "held" || event.state === "submitting" || event.state === "submitted")
+    && (event.lane === "mesh-reply" || event.lane === "mesh-unsolicited")
+    && typeof event.generationId === "string" && event.generationId.length > 0
+    && !!event.envelope && typeof event.envelope === "object"
+    && typeof event.envelope.id === "string" && typeof event.envelope.from === "string";
+}
+
+function _replaceMeshSpool(sessionId: string | undefined, ctx: ExtensionContext): void {
+  _meshSpool?.dispose();
+  _meshSpool = null;
+  if (!sessionId) return;
+  const spool = new MeshSpool({
+    mode: resolveMeshSpoolMode(),
+    getSessionId: () => _runtimeSessionId === sessionId ? sessionId : null,
+    submit: (lane, envelopes, submissionId, generationId) => _submitMeshSpoolBatch(sessionId, lane, envelopes, submissionId, generationId),
+    persist: (event) => {
+      if (_runtimeSessionId !== sessionId || !_pi) throw new Error("stale or unbound mesh spool runtime");
+      _pi.appendEntry("remote-pi:mesh-spool", { schemaVersion: 1, sessionId, ...event } satisfies PersistedMeshSpoolEvent);
+    },
+    onBlocked: (code) => console.error(`[remote-pi] mesh spool blocked: ${code}`),
+  });
+  // Custom entries are domain-owned persistence. Rehydrate only a same-session
+  // held record. A pre-send `submitting` marker is replayed only when the
+  // corresponding durable custom-message submission proof is absent.
+  const states = new Map<string, PersistedMeshSpoolEvent>();
+  const submittedEnvelopeGenerations = new Map<string, string>();
+  const entries = (ctx.sessionManager as Partial<ExtensionContext["sessionManager"]>).getEntries?.() ?? [];
+  for (const entry of entries) {
+    if (entry.type === "custom" && entry.customType === "remote-pi:mesh-spool" && _isPersistedMeshSpoolEvent(entry.data, sessionId)) {
+      states.set(entry.data.envelope.id, entry.data);
+    }
+    if (entry.type === "custom_message" && entry.customType === "remote-pi:mesh-batch" && _isMeshBatchProof(entry.details, sessionId)) {
+      for (const id of entry.details.envelopeIds) submittedEnvelopeGenerations.set(id, entry.details.generationId);
+    }
   }
-  const header = `[agent-network] message from "${env.from}" (id=${env.id}${env.re ? `, re=${env.re}` : ""}):`;
-  const footer = env.re
-    ? "(This is a reply to a previous message of yours.)"
-    : `(If a reply is expected, call agent_send with to="${env.from}" and re="${env.id}".)`;
+  for (const event of states.values()) {
+    if (event.state === "held" || (event.state === "submitting" && submittedEnvelopeGenerations.get(event.envelope.id) !== event.generationId)) {
+      spool.restore(event.lane, event.envelope, event.generationId);
+    }
+  }
+  spool.reconcile();
+  _meshSpool = spool;
+}
+
+function _isMeshBatchProof(value: unknown, sessionId: string): value is { sessionId: string; generationId: string; envelopeIds: string[]; submissionId: string } {
+  if (!value || typeof value !== "object" || Array.isArray(value)) return false;
+  const proof = value as { sessionId?: unknown; generationId?: unknown; envelopeIds?: unknown; submissionId?: unknown };
+  return proof.sessionId === sessionId && typeof proof.generationId === "string" && typeof proof.submissionId === "string" && Array.isArray(proof.envelopeIds) && proof.envelopeIds.every((id) => typeof id === "string");
+}
+
+function _submitMeshSpoolBatch(sessionId: string, lane: MeshLane, envelopes: readonly import("./session/envelope.js").Envelope[], submissionId: string, generationId: string): boolean {
+  if (_runtimeSessionId !== sessionId || !_pi || envelopes.length === 0) return false;
+  const notices = envelopes.map((env) => {
+    const bodyText = typeof env.body === "string" ? env.body : JSON.stringify(env.body);
+    const toolCallId = `mesh_${env.id}`;
+    _broadcastToActive({
+      type: "tool_request",
+      tool_call_id: toolCallId,
+      tool: "agent-network",
+      args: env.re ? { from: env.from, re: env.re, message: bodyText } : { from: env.from, message: bodyText },
+    });
+    _broadcastToActive({ type: "tool_result", tool_call_id: toolCallId, result: { from: env.from, message: bodyText } });
+    const footer = env.re
+      ? "(This is a reply to a previous message of yours.)"
+      : `(If a reply is expected, call agent_send with to="${env.from}" and re="${env.id}".)`;
+    return `[agent-network] message from "${env.from}" (id=${env.id}${env.re ? `, re=${env.re}` : ""}):\n${bodyText}\n\n${footer}`;
+  });
   try {
-    _pi.sendMessage(
-      { customType: "remote-pi:mesh-message", content: `${header}\n${bodyText}\n\n${footer}`, display: true },
-      { triggerTurn: true },
-    );
-  } catch (err) {
-    const detail = err instanceof Error ? err.message : String(err);
-    console.error(`[remote-pi] ${label}: agent rejected incoming message: ${detail}`);
-    _lastCtx?.ui.notify(`[remote-pi] failed to process incoming message: ${detail}`, "error");
+    _pi.sendMessage({
+      customType: "remote-pi:mesh-batch", content: notices.join("\n\n---\n\n"), display: true,
+      details: { sessionId, generationId, submissionId, envelopeIds: envelopes.map((env) => env.id) },
+    }, { triggerTurn: true, deliverAs: "nextTurn" });
+    // Only a successful SDK submission owns a mesh turn correlation. Existing
+    // app-originated turn correlation is never replaced by a held mesh receipt.
+    if (_currentTurnId === null) _currentTurnId = `mesh_${envelopes[0]!.id}`;
+    return true;
+  } catch (error) {
+    const detail = error instanceof Error ? error.message : String(error);
+    console.error(`[remote-pi] mesh ${lane} submission failed: ${detail}`);
+    return false;
   }
 }
 
@@ -4055,10 +4109,21 @@ async function _cmdJoin(ctx: Pick<ExtensionContext, "ui" | "cwd">): Promise<void
     }
     if (env.from === "broker") return;  // other broker control messages — ignore
 
-    // Real agent-to-agent message (SessionPeer already correlated replies via
-    // env.re before this point). Show it in the app's TOOL timeline and wake
-    // the agent as a CUSTOM message — never as the user's own message.
-    _deliverMeshMessageToAgent(env);
+    // Real agent-to-agent message. Target-side retention happens before the
+    // broker is allowed to report `received`; lifecycle then decides whether
+    // the bounded reply/unsolicited lane can start a model turn now or later.
+    const acceptance = _meshSpool?.accept(env) ?? { status: "denied" as const, code: "mesh-spool-unavailable" };
+    if (env.deliveryReceipt?.required) {
+      void peer.send("broker", {
+        type: "mesh_delivery_receipt",
+        envelopeId: env.id,
+        status: acceptance.status,
+        ...(acceptance.status === "denied" ? { code: acceptance.code } : {}),
+      }).catch(() => { /* source receives timeout/denied; never forge receipt */ });
+    }
+    if (acceptance.status === "denied") {
+      console.error(`[remote-pi] mesh envelope ${env.id} denied before model wake: ${acceptance.code}`);
+    }
   });
 
   // After failover (leader died, we re-elected): the new broker's peers map

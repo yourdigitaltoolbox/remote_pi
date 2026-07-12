@@ -135,6 +135,13 @@ describe("BrokerRemote.tryRouteOutbound", () => {
       siblings: [{ pcLabel: "trab", pcPubkey: "K_B" }],
     });
 
+    // A receipt-v1 roster is the compatibility proof required before source
+    // routing can ever report a positive cross-PC delivery.
+    fakePi.emit("envelope", envelope(
+      "trab:_broker_remote", "casa:_broker_remote",
+      { type: "peers_update", peers: ["agent-1"], receipt_protocol: 1 },
+    ), "K_B");
+    fakePi.sent.length = 0;
     const env = envelope("sess-3", "trab:agent-1", { x: 1 });
     expect(br.tryRouteOutbound(env)).toBe(true);
     expect(fakePi.sent.length).toBeGreaterThanOrEqual(1);
@@ -145,7 +152,7 @@ describe("BrokerRemote.tryRouteOutbound", () => {
     expect(main!.env.to).toBe("trab:agent-1");
   });
 
-  test("cache miss triggers a peers_request alongside the main send", () => {
+  test("missing receipt capability requests roster but refuses to send false-positive work", () => {
     const fakePi = new FakePi();
     const { broker } = makeFakeBroker();
     const br = new BrokerRemote({
@@ -154,17 +161,37 @@ describe("BrokerRemote.tryRouteOutbound", () => {
       siblings: [{ pcLabel: "trab", pcPubkey: "K_B" }],
     });
     // Bootstrap fires peers_request to every sibling on construction.
-    // Clear that out so we can verify the cache-miss path also fires one.
+    // Clear that out so we can verify unknown capability requests one again.
     fakePi.sent.length = 0;
 
     const env = envelope("sess-3", "trab:agent-1", { x: 1 });
-    br.tryRouteOutbound(env);
+    expect(br.tryRouteOutbound(env)).toBe(false);
+    expect(fakePi.sent.some((sent) => sent.env.id === env.id)).toBe(false);
 
     const peersReq = fakePi.sent.find((s) =>
       (s.env.body as { type?: string } | null)?.type === "peers_request",
     );
     expect(peersReq).toBeDefined();
     expect(peersReq!.toPc).toBe("K_B");
+  });
+
+  test("legacy cross-PC roster is incompatible and cannot produce received", () => {
+    const fakePi = new FakePi();
+    const { broker } = makeFakeBroker();
+    const br = new BrokerRemote({
+      broker, pi: fakePi as never,
+      selfPcLabel: "casa", selfPcPubkey: "K_A",
+      siblings: [{ pcLabel: "trab", pcPubkey: "K_B" }],
+    });
+    fakePi.emit("envelope", envelope(
+      "trab:_broker_remote", "casa:_broker_remote",
+      { type: "peers_update", peers: ["agent-1"] },
+    ), "K_B");
+    fakePi.sent.length = 0;
+    const env = envelope("sess-3", "trab:agent-1", { x: 1 });
+    expect(br.tryRouteOutbound(env)).toBe(false);
+    expect(fakePi.sent.some((sent) => sent.env.id === env.id)).toBe(false);
+    expect(fakePi.sent.some((sent) => (sent.env.body as { type?: string }).type === "peers_request")).toBe(true);
   });
 
   test("does not trigger peers_request when cache is already populated", () => {
@@ -176,10 +203,10 @@ describe("BrokerRemote.tryRouteOutbound", () => {
       siblings: [{ pcLabel: "trab", pcPubkey: "K_B" }],
     });
 
-    // Prime the cache via peers_update
+    // Prime the cache via receipt-v1 peers_update.
     fakePi.emit("envelope", envelope(
       "trab:_broker_remote", "casa:_broker_remote",
-      { type: "peers_update", peers: ["agent-1"] },
+      { type: "peers_update", peers: ["agent-1"], receipt_protocol: 1 },
     ), "K_B");
 
     fakePi.sent.length = 0;
@@ -231,7 +258,7 @@ describe("BrokerRemote.handleIncoming (anti-spoof + injection)", () => {
     expect(logs.some((l) => /prefix\s+mismatches/.test(l))).toBe(true);
   });
 
-  test("valid envelope → strip to-prefix, injectFromRemote, ACK back", () => {
+  test("valid envelope → strip to-prefix, injectFromRemote, ACK back", async () => {
     const fakePi = new FakePi();
     const { broker, injectFromRemote } = makeFakeBroker({ injectStatus: "received" });
     new BrokerRemote({
@@ -247,6 +274,7 @@ describe("BrokerRemote.handleIncoming (anti-spoof + injection)", () => {
     const injected = injectFromRemote.mock.calls[0]![0] as Envelope;
     expect(injected.from).toBe("trab:agent-1");
     expect(injected.to).toBe("sess-3");  // prefix stripped
+    await Promise.resolve();
 
     // ACK packed back to K_B
     const ack = fakePi.sent.find((s) =>
@@ -256,6 +284,31 @@ describe("BrokerRemote.handleIncoming (anti-spoof + injection)", () => {
     expect(ack!.toPc).toBe("K_B");
     expect(ack!.env.re).toBe(inbound.id);
     expect((ack!.env.body as { status: string }).status).toBe("received");
+  });
+
+  test("cross-PC positive ACK waits for target retention outcome", async () => {
+    const fakePi = new FakePi();
+    const { broker, injectFromRemote } = makeFakeBroker();
+    let release!: () => void;
+    const retained = new Promise<void>((resolve) => { release = resolve; });
+    injectFromRemote.mockImplementationOnce(async () => {
+      await retained;
+      return "received";
+    });
+    const remote = new BrokerRemote({
+      broker, pi: fakePi as never,
+      selfPcLabel: "casa", selfPcPubkey: "K_A",
+      siblings: [{ pcLabel: "trab", pcPubkey: "K_B" }],
+    });
+    const inbound = envelope("trab:agent-1", "casa:sess-3", { hello: "retained-first" });
+    const handling = remote.handleIncoming(inbound, "K_B");
+    await Promise.resolve();
+    expect(fakePi.sent.some((sent) => (sent.env.body as { type?: string } | null)?.type === "ack")).toBe(false);
+
+    release();
+    await handling;
+    const ack = fakePi.sent.find((sent) => (sent.env.body as { type?: string } | null)?.type === "ack");
+    expect(ack?.env.body).toMatchObject({ status: "received" });
   });
 
   test("envelope addressed to third-party PC → drop", () => {

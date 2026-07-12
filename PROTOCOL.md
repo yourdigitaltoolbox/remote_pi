@@ -39,8 +39,8 @@ Atualizada em 2026-06-09.
 │  Routing           Local UDS broker  /  Cross-PC via relay forward  │
 │                    Prefix <pc>:<peer> distingue local vs remoto     │
 ├─────────────────────────────────────────────────────────────────────┤
-│  ACK protocol      received | busy | denied | timeout               │
-│                    Wrapper TS responde sem custar token              │
+│  ACK protocol      received | denied | timeout                       │
+│                    Target retains before receipt; no model token     │
 ├─────────────────────────────────────────────────────────────────────┤
 │  Transport         UDS (local)  /  WebSocket sobre TLS (relay)      │
 ├─────────────────────────────────────────────────────────────────────┤
@@ -80,11 +80,12 @@ Toda chamada de `agent_send` aguarda um ACK rápido (default 5s) gerado pelo **w
 
 | Status | Significado |
 |---|---|
-| `received` | Peer está livre e vai processar; mensagem enfileirada |
-| `busy` | Peer está em meio a um turn; mensagem **descartada**, sender retry |
-| `denied` | Peer recusou (futuro: blacklist); abandona |
-| `timeout` | ACK não chegou em 5s; trata como transport error |
+| `received` | O broker de destino recebeu confirmação de que o target reteve o envelope exato na spool limitada; só então pode acordar o modelo |
+| `denied` | Target não reteve (capacidade, lifecycle incompatível, ou falha local); sender não deve tratar como entregue |
+| `timeout` | O sender não recebeu ACK em 5s; ausência de receipt do target é convertida pelo broker em `denied` após 4s |
 | `transport_error` | Cross-PC apenas: relay reportou `offline`, `not_authorized`, ou `bad_envelope` |
+
+Antes de `received`, o broker adiciona `deliveryReceipt: { required: true }` somente no último salto ao target. O target armazena o envelope inteiro na spool Remote Pi (256 envelopes, 1 MiB total, 64 KiB por envelope) e devolve `mesh_delivery_receipt`; não há ACK positivo baseado apenas em `socket.write`. Respostas (`re`) ocupam a lane prioritária sobre envelopes não solicitados quando o lifecycle libera uma cut finita. Cross-PC exige `peers_update.receipt_protocol: 1`; um sibling legado/sem capability é incompatível para novo trabalho e resulta em falha visível, nunca `received` falso.
 
 **Reply de conteúdo** é assíncrona: peer responde com **outro send normal** carregando `re: <send-id-original>`. Sender vê a reply na inbox no próximo turn. Sem `agent_wait`, sem `agent_request` — padrão event-driven puro.
 
