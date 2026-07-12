@@ -27,6 +27,8 @@ jobs:
       - uses: actions/setup-node@v4
         with:
           node-version: 22
+      - name: Install the supported Pi CLI for the disposable package smoke
+        run: npm install --global @earendil-works/pi-coding-agent@0.80.6
       # This invokes the same root Git-install bridge Pi runs after cloning a
       # package. The nested pnpm lock is authoritative; dist is generated only.
       - run: npm run prepare
