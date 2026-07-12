@@ -13,7 +13,17 @@ function run(args) {
   const result = spawnSync(pnpm, ["--yes", pnpmVersion, "--dir", extension, ...args], {
     cwd: root,
     stdio: "inherit",
-    env: process.env,
+    // Pi installs Git packages with `npm install --omit=dev`. The nested
+    // extension build and its pinned Git lifecycle helper both require their
+    // declared build-time toolchain, so scope the dev omission override to this
+    // child only; it never changes the operator's npm/Pi configuration.
+    env: {
+      ...process.env,
+      npm_config_omit: "",
+      NPM_CONFIG_OMIT: "",
+      npm_config_production: "false",
+      NPM_CONFIG_PRODUCTION: "false",
+    },
   });
   if (result.error) throw result.error;
   if (result.status !== 0) process.exit(result.status ?? 1);
