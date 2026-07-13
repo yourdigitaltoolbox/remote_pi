@@ -13,6 +13,10 @@
     "./testing": {
       "types": "./dist/testing/index.d.ts",
       "import": "./dist/testing/index.js"
+    },
+    "./client": {
+      "types": "./dist/client/index.d.ts",
+      "import": "./dist/client/index.js"
     }
   },
   "bin": {
@@ -24,7 +28,8 @@
     "typecheck": "tsc --noEmit",
     "dev": "tsx src/index.ts",
     "test": "vitest run",
-    "prepublishOnly": "pnpm typecheck && pnpm test && pnpm build"
+    "prepublishOnly": "pnpm typecheck && pnpm test && pnpm build",
+    "prepare": "pnpm build"
   },
   "keywords": [
     "pi",

@@ -229,6 +229,74 @@ Os replies (`action_ok` / `models_list`) só confirmam dispatch. Efeitos visíve
 - Modelo trocado → evento `model_select` broadcast pra todos os owners conectados
 - Nova sessão → `pair_ok` (ou equivalente) com novo `session_started_at`
 
+### Paired lifecycle actions
+
+`lifecycle_status`, `session_compact` e `lifecycle_repair` são aceitos **somente**
+de um `PlainPeerChannel` anexado depois de relay challenge-response Ed25519 e
+`pair_request → pair_ok` correlacionado. Um peer autenticado no relay, mas ainda
+não pareado, não ganha autorização de owner e recebe `error { code:
+"unknown_peer" }`. O relay só transporta envelopes; ele não concede essa
+autorização nem avalia o payload lifecycle.
+
+```jsonc
+// status request/reply (metadata redacted; no consumer body or prompts)
+{ "type": "lifecycle_status", "id": "<uuid>" }
+{
+  "type": "lifecycle_status", "in_reply_to": "<uuid>",
+  "snapshot": {
+    "registry_state": "unavailable" | "ready" | "disposing" | "incompatible",
+    "sequence": 42,
+    "session_id": "<optional>", "generation_id": "<optional>",
+    "phase": "idle" | "pending-settle" | "observed-preflight" | "compacting" |
+             "resuming" | "releasing" | "blocked-unknown",
+    "operation_id": "<optional>",
+    "reason": "self" | "remote" | "builtin" | "threshold" | "overflow",
+    "last_outcome": "completed" | "failed" | "cancelled" | "timed-out"
+  },
+  "diagnostics": [{ "sequence": 42, "timestamp": 0, "code": "<redacted code>",
+    "operation_id": "<optional>", "phase": "<optional>", "outcome": "<optional>" }]
+}
+
+// compaction admission and terminal outcome are distinct correlations.
+{ "type": "session_compact", "id": "<uuid>" }
+{ "type": "action_ok", "in_reply_to": "<uuid>", "action": "session_compact",
+  "disposition": "accepted" | "joined", "operation_id": "<optional>",
+  "generation_id": "<optional>" }
+{ "type": "lifecycle_outcome", "operation_id": "<id>", "session_id": "<id>",
+  "generation_id": "<id>", "outcome": "completed" | "failed" | "cancelled" | "blocked",
+  "code": "<optional redacted code>" }
+
+// repair: every CAS predicate is mandatory; optional evidence locators are
+// required only by the selected evidence class.
+{ "type": "lifecycle_repair", "id": "<uuid>",
+  "action": "recognize-resume-admitted" | "retry-resume-pending" |
+            "abandon-ambiguous-resume" | "retry-blocked-drainer" |
+            "abandon-interrupted-operation",
+  "operation_id": "<id>", "session_id": "<id>", "generation_id": "<id>",
+  "expected_phase": "blocked-unknown", "expected_sequence": 41,
+  "evidence_class": "persisted-resume-message" | "persisted-resume-run-settled" |
+                    "no-admission-attempt" | "current-process-quiescent" |
+                    "owner-process-replaced" | "idempotent-drainer-state" |
+                    "branch-validated-owner-replaced",
+  "consumer_id": "<optional>", "lane_id": "<optional>", "evidence_entry_id": "<optional>" }
+{ "type": "lifecycle_repair", "in_reply_to": "<uuid>",
+  "disposition": "applied" | "rejected", "action": "<applied only>",
+  "operation_id": "<applied only>", "generation_id": "<optional>",
+  "sequence": 42, "code": "<rejected only>" }
+```
+
+The lifecycle authority, not Remote Pi, evaluates the repair. It compares
+`expected_sequence` before session, operation, and phase predicates. A sequence
+observed as old must be rejected with `code: "snapshot-sequence-mismatch"` and
+the current `sequence`; clients must read a newer snapshot rather than retrying
+with guessed values. Repair never bypasses actor (`operator`), channel
+(`remote`), evidence, generation, or phase checks.
+
+Pairing tokens, private keys, full pairing URIs, profile paths, prompt bodies,
+consumer payloads, credentials, and diagnostic bodies must never be logged or
+retained in receipts. Safe evidence is message type/order, correlation presence,
+redacted disposition/code, and monotonic sequence relations.
+
 ### Por que ações tipadas em vez de picker genérico
 
 O SDK `@mariozechner/pi-coding-agent` não expõe API genérica de invocação dos slash commands builtin (`/compact`, `/model`, `/fork`, `/copy`, etc.) — apenas alguns têm equivalente em `ExtensionContextActions`. Tentar espelhar o picker do TUI exigiria mirror manual da lista builtin + matriz de invocabilidade + UX de chip canonizado, com vários comandos sendo só hint informativo. Vocabulário tipado é mais simples, mais honesto, e cobre 100% das ações que fazem sentido em mobile. Padrão validado pelo adapter `pi-telegram` (mesmo abordagem: vocabulário curado, sem picker genérico).

@@ -17,7 +17,7 @@ first time it asks a couple of questions and you are done.
 
 For wire format, identity model, ACK protocol, cross-PC routing, mesh
 membership, and the trust model (what the relay sees and doesn't see),
-read [`PROTOCOL.md`](../PROTOCOL.md) at the repo root. It is the canonical
+read the package-visible [`docs/PROTOCOL.md`](./docs/PROTOCOL.md). The repository root copy is canonical
 document — this README only covers user-facing setup.
 
 ---
@@ -143,7 +143,7 @@ Pairing is one-time and per device, via QR code.
 
 Communication: WebSocket over TLS to the relay (ciphertext in transit).
 The relay sees plaintext envelopes at rest and in forwarding — see
-[`PROTOCOL.md`](../PROTOCOL.md) for the trust model.
+[`docs/PROTOCOL.md`](./docs/PROTOCOL.md) for the paired-client protocol and trust model.
 
 **Get the app** — all current download options (Google Play, App Store, and
 direct builds while public releases roll out):
@@ -168,14 +168,33 @@ when the input is empty) to open the Quick Actions sheet:
 Each action gets a structured `action_ok` / `action_error` reply so the app
 can show a SnackBar on failure. Visible side-effects (chat output, model
 change broadcasts, compaction notice) still flow through the normal chat
-channels. The wire schema is documented in [`PROTOCOL.md`](../PROTOCOL.md)
-under "App actions".
+channels. The wire schema is documented in [`docs/PROTOCOL.md`](./docs/PROTOCOL.md)
+under "Lifecycle wire schema".
 
 It is **not** a generic slash-command picker. The Pi SDK does not expose
 programmatic invocation for most builtins (those live in the TUI's
 interactive loop), so the app exposes only the actions that have a clean
 SDK call. The [`pi-telegram`](https://github.com/llblab/pi-telegram) adapter
 follows the same pattern.
+
+### Public paired Node client
+
+Automation that must traverse the real paired relay boundary can import only
+`remote-pi/client` (never `dist/**`, the root router, or `remote-pi/testing`):
+
+```ts
+import { PairedClient } from "remote-pi/client";
+const client = await PairedClient.connect({ relayUrl, pairingUri, deviceName: "ephemeral client" });
+if ((await client.pair()).type !== "pair_ok") throw new Error("pairing rejected");
+const status = await client.lifecycleStatus();
+```
+
+The client uses an ephemeral Ed25519 identity, authenticates to the relay, and
+requires correlated `pair_ok` before owner actions. It exposes typed
+`lifecycleStatus`, `compact`, `lifecycleRepair`, and `onLifecycleOutcome` only;
+it does not read profiles or expose router, singleton, or test seams. See
+[`docs/PROTOCOL.md`](./docs/PROTOCOL.md) for lifecycle schemas, CAS/rejection,
+pairing authorization, and redaction requirements.
 
 ### Archive candidate testing
 
