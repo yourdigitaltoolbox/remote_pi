@@ -1,8 +1,8 @@
 import type { AgentSession } from "@earendil-works/pi-coding-agent";
 import { handleSessionCompact, type ActionReplySender } from "../actions/handlers.js";
 import { RemoteLifecycleController, type RemoteLifecycleEvent } from "../lifecycle/remote_lifecycle.js";
-import { MeshSpool } from "../session/mesh_spool.js";
 import type { ServerMessage } from "../protocol/types.js";
+import { productionMeshProbe, type ProductionMeshProbe } from "./production_mesh_probe.js";
 
 export type RemotePiProbeInjection =
   | Readonly<{ consumer: "remote-pi"; kind: "compact-request"; id: string; ownerId: string }>
@@ -25,38 +25,30 @@ export interface RemotePiProbeOptions {
 }
 
 /**
- * Archive-testing adapter for the same two ingress paths Remote Pi uses in a
- * live extension: authenticated compact actions and mesh target admission.
- * It intentionally has no relay, filesystem profile, or coordinator controls.
+ * Archive-testing adapter for the real compact action and the MeshSpool owned
+ * by the loaded Remote Pi extension. It owns no lifecycle gate or mesh queue.
  */
 export class RemotePiProbeAdapter {
   private readonly receipts: Readonly<RemotePiProbeReceipt>[] = [];
   private readonly compactRequests = new Map<string, string>();
   private readonly lifecycle: RemoteLifecycleController;
-  private readonly meshSpool: MeshSpool;
+  private readonly meshIds = new Set<string>();
+  private readonly meshProbe: ProductionMeshProbe | undefined;
+  private readonly stopObservingMesh: (() => void) | undefined;
   private disposed = false;
 
   constructor(private readonly options: RemotePiProbeOptions) {
     this.lifecycle = new RemoteLifecycleController((event) => this.observeLifecycle(event));
     this.lifecycle.bind(options.session.sessionId);
-    this.meshSpool = new MeshSpool({
-      mode: "managed",
-      getSessionId: () => this.disposed ? null : options.session.sessionId,
-      submit: (_lane, envelopes, submissionId, generationId) => {
-        // AgentSession.sendCustomMessage is the documented SDK action surface.
-        // The probe sends no mesh payload: only opaque envelope IDs reach Pi.
-        void options.session.sendCustomMessage({
-          customType: "remote-pi:mesh-batch",
-          content: "",
-          display: false,
-          details: {
-            generationId,
-            submissionId,
-            envelopeIds: envelopes.map((envelope) => envelope.id),
-          },
-        }, { triggerTurn: true, deliverAs: "nextTurn" }).catch(() => undefined);
-        return true;
-      },
+    this.meshProbe = productionMeshProbe(options.session.sessionId);
+    this.stopObservingMesh = this.meshProbe?.observe((transition) => {
+      if (!this.meshIds.has(transition.id)) return;
+      this.record({
+        consumer: "remote-pi",
+        id: transition.id,
+        outcome: transition.outcome,
+        generationId: transition.generationId,
+      });
     });
   }
 
@@ -77,17 +69,16 @@ export class RemotePiProbeAdapter {
   dispose(): void {
     if (this.disposed) return;
     this.disposed = true;
+    this.stopObservingMesh?.();
     this.lifecycle.dispose();
-    this.meshSpool.dispose();
     this.compactRequests.clear();
+    this.meshIds.clear();
   }
 
   private injectCompact(input: Extract<RemotePiProbeInjection, { kind: "compact-request" }>): Readonly<RemotePiProbeReceipt> {
     if (!isOpaqueId(input.ownerId)) return this.record({ consumer: "remote-pi", id: input.id, outcome: "rejected" });
     const replies: ServerMessage[] = [];
     const sender: ActionReplySender = { send: (message) => { replies.push(message); } };
-    // This is the production authenticated-action handler. The owner ID is
-    // validated at this ingress boundary but is never exposed in a receipt.
     handleSessionCompact(this.lifecycle, sender, { type: "session_compact", id: input.id });
     const reply = replies[0];
     if (reply?.type === "action_ok" && reply.action === "session_compact" && typeof reply.operation_id === "string") {
@@ -104,21 +95,16 @@ export class RemotePiProbeAdapter {
   }
 
   private injectMesh(input: Extract<RemotePiProbeInjection, { kind: "mesh-arrival" }>): Readonly<RemotePiProbeReceipt> {
-    const before = this.meshSpool.counts();
-    const accepted = this.meshSpool.accept({
-      // The source, target, and body are intentionally synthetic and opaque.
-      // No caller-provided message content can cross this testing seam.
-      from: `remote-pi-probe-${String(this.options.seed)}`,
-      to: "remote-pi-probe-target",
-      id: input.id,
-      re: input.lane === "reply" ? input.id : null,
-      body: null,
-      deliveryReceipt: { required: true },
-    });
-    if (accepted.status === "denied") return this.record({ consumer: "remote-pi", id: input.id, outcome: "rejected" });
-    const after = this.meshSpool.counts();
-    const held = after.replies + after.unsolicited > before.replies + before.unsolicited;
-    return this.record({ consumer: "remote-pi", id: input.id, outcome: held ? "held" : "accepted" });
+    const probe = this.meshProbe;
+    if (!probe) return this.record({ consumer: "remote-pi", id: input.id, outcome: "rejected" });
+    this.meshIds.add(input.id);
+    const result = probe.accept({ id: input.id, lane: input.lane === "reply" ? "mesh-reply" : "mesh-unsolicited" });
+    if (result.status === "denied") {
+      this.meshIds.delete(input.id);
+      return this.record({ consumer: "remote-pi", id: input.id, outcome: "rejected" });
+    }
+    const held = [...this.receipts].reverse().find((receipt) => receipt.id === input.id && receipt.outcome === "held");
+    return held ?? this.record({ consumer: "remote-pi", id: input.id, outcome: "accepted" });
   }
 
   private observeLifecycle(event: RemoteLifecycleEvent): void {

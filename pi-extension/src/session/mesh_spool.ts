@@ -19,6 +19,12 @@ export const MAX_MESH_TOTAL_BYTES = 1024 * 1024;
 export type MeshSpoolMode = "managed" | "compatibility";
 export type MeshLane = "mesh-reply" | "mesh-unsolicited";
 export type MeshAcceptance = { status: "received" } | { status: "denied"; code: string };
+/** Redacted lifecycle receipts for the production-owned testing bridge. */
+export interface MeshSpoolTransition {
+  readonly id: string;
+  readonly outcome: "held" | "released";
+  readonly generationId: string;
+}
 
 export interface MeshSpoolAuthority {
   snapshot(): Snapshot;
@@ -54,6 +60,8 @@ export interface MeshSpoolOptions {
   submit(lane: MeshLane, envelopes: readonly Envelope[], submissionId: string, generationId: string): boolean;
   /** Domain-owned persistence hook; the lifecycle registry never receives bodies. */
   persist?(event: { state: "held" | "submitting" | "submitted"; lane: MeshLane; generationId: string; envelope: Envelope; submissionId?: string }): void;
+  /** Observes redacted retention/release transitions without exposing envelopes. */
+  onTransition?(event: MeshSpoolTransition): void;
   onBlocked?(code: string): void;
   authority?: MeshSpoolAuthority;
 }
@@ -108,6 +116,7 @@ export class MeshSpool {
     }
     this.held[lane].push(record);
     this.totalBytes += bytes;
+    this.options.onTransition?.({ id: envelope.id, outcome: "held", generationId });
     if (admission === "deliver") this.flush(lane, snapshot);
     return { status: "received" };
   }
@@ -269,7 +278,10 @@ export class MeshSpool {
   private remove(lane: MeshLane, records: readonly HeldEnvelope[]): void {
     const set = new Set(records);
     this.held[lane] = this.held[lane].filter((record) => !set.has(record));
-    for (const record of records) this.totalBytes -= record.bytes;
+    for (const record of records) {
+      this.totalBytes -= record.bytes;
+      this.options.onTransition?.({ id: record.envelope.id, outcome: "released", generationId: record.generationId });
+    }
   }
 
   private recordsAtOrBefore(lane: MeshLane, watermark: number): HeldEnvelope[] {

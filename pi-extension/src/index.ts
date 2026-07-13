@@ -75,7 +75,9 @@ import {
 } from "./actions/handlers.js";
 import { ensureModelRegistry } from "./actions/registry.js";
 import { RemoteLifecycleController } from "./lifecycle/remote_lifecycle.js";
-import { MeshSpool, resolveMeshSpoolMode, type MeshLane } from "./session/mesh_spool.js";
+import { MeshSpool, resolveMeshSpoolMode, type MeshLane, type MeshAcceptance } from "./session/mesh_spool.js";
+import type { Envelope } from "./session/envelope.js";
+import { bindProductionMeshProbe } from "./testing/production_mesh_probe.js";
 import {
   ensureGlobalDirs,
   LOCAL_SESSION_NAME,
@@ -255,6 +257,7 @@ let _runtimeIdentity: RuntimeIdentity | null = null;
 let _runtimePresentation: RuntimePresentation | null = null;
 let _runtimeSessionId: string | null = null;
 let _meshSpool: MeshSpool | null = null;
+let _meshProbeBinding: ReturnType<typeof bindProductionMeshProbe> | null = null;
 
 // Remote Pi is a lifecycle consumer, not an owner. The controller exposes only
 // correlated operation metadata to paired owners; consumer bodies and resume
@@ -2198,6 +2201,8 @@ const extension: ExtensionFactory = (pi: ExtensionAPI): void => {
     // fired switch_session right after boot.
     _disposed = true;
     _remoteLifecycle.dispose();
+    _meshProbeBinding?.dispose();
+    _meshProbeBinding = null;
     _meshSpool?.dispose();
     _meshSpool = null;
     if (_meshNode) {
@@ -3924,9 +3929,12 @@ function _isPersistedMeshSpoolEvent(value: unknown, sessionId: string): value is
 }
 
 function _replaceMeshSpool(sessionId: string | undefined, ctx: ExtensionContext): void {
+  _meshProbeBinding?.dispose();
+  _meshProbeBinding = null;
   _meshSpool?.dispose();
   _meshSpool = null;
   if (!sessionId) return;
+  let probeBinding: ReturnType<typeof bindProductionMeshProbe> | null = null;
   const spool = new MeshSpool({
     mode: resolveMeshSpoolMode(),
     getSessionId: () => _runtimeSessionId === sessionId ? sessionId : null,
@@ -3935,6 +3943,7 @@ function _replaceMeshSpool(sessionId: string | undefined, ctx: ExtensionContext)
       if (_runtimeSessionId !== sessionId || !_pi) throw new Error("stale or unbound mesh spool runtime");
       _pi.appendEntry("remote-pi:mesh-spool", { schemaVersion: 1, sessionId, ...event } satisfies PersistedMeshSpoolEvent);
     },
+    onTransition: (event) => probeBinding?.publish(event),
     onBlocked: (code) => console.error(`[remote-pi] mesh spool blocked: ${code}`),
   });
   // Custom entries are domain-owned persistence. Rehydrate only a same-session
@@ -3958,6 +3967,20 @@ function _replaceMeshSpool(sessionId: string | undefined, ctx: ExtensionContext)
   }
   spool.reconcile();
   _meshSpool = spool;
+  probeBinding = bindProductionMeshProbe(sessionId, ({ id, lane }) => _admitMeshEnvelope({
+    from: "remote-pi-probe",
+    to: "remote-pi-probe-target",
+    id,
+    re: lane === "mesh-reply" ? id : null,
+    body: null,
+    deliveryReceipt: { required: true },
+  }));
+  _meshProbeBinding = probeBinding;
+}
+
+/** The broker and archive probe share this exact production admission path. */
+function _admitMeshEnvelope(env: Envelope): MeshAcceptance {
+  return _meshSpool?.accept(env) ?? { status: "denied", code: "mesh-spool-unavailable" };
 }
 
 function _isMeshBatchProof(value: unknown, sessionId: string): value is { sessionId: string; generationId: string; envelopeIds: string[]; submissionId: string } {
@@ -4112,7 +4135,7 @@ async function _cmdJoin(ctx: Pick<ExtensionContext, "ui" | "cwd">): Promise<void
     // Real agent-to-agent message. Target-side retention happens before the
     // broker is allowed to report `received`; lifecycle then decides whether
     // the bounded reply/unsolicited lane can start a model turn now or later.
-    const acceptance = _meshSpool?.accept(env) ?? { status: "denied" as const, code: "mesh-spool-unavailable" };
+    const acceptance = _admitMeshEnvelope(env);
     if (env.deliveryReceipt?.required) {
       void peer.send("broker", {
         type: "mesh_delivery_receipt",
