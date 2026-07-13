@@ -3569,7 +3569,7 @@ describe("child-safe legacy exposure", () => {
     expect(ctx.ui.notify).toHaveBeenCalledWith(expect.stringMatching(/forged_capability/), "warning");
   });
 
-  test("a stale child relay activation reply cannot publish a lease or touch its old context", async () => {
+  test.each(["reply", "rejection"] as const)("a stale child relay activation %s cannot publish a lease or touch its old context", async (outcome) => {
     const descriptor = await currentRelayDescriptor();
     const capability = `rpel1.77777777-7777-4777-8777-777777777777.${"a".repeat(43)}`;
     process.env["PI_SUBAGENT_CHILD"] = "1";
@@ -3577,7 +3577,7 @@ describe("child-safe legacy exposure", () => {
     process.env["PI_SUBAGENT_RELAY_EXPOSURE_CAPABILITY"] = capability;
     const { MeshNode } = await import("./session/mesh_node.js");
     const originalRequest = MeshNode.prototype.request;
-    let resolveActivation!: (reply: unknown) => void;
+    let settleActivation!: () => void;
     const request = vi.spyOn(MeshNode.prototype, "request").mockImplementation(function (
       this: InstanceType<typeof MeshNode>,
       to: string,
@@ -3585,7 +3585,43 @@ describe("child-safe legacy exposure", () => {
       timeoutMs?: number,
     ) {
       if (to === "broker" && (body as { type?: string } | null)?.type === "relay_lease_activate") {
-        return new Promise((resolve) => { resolveActivation = resolve; });
+        return new Promise((resolve, reject) => {
+          settleActivation = () => {
+            if (outcome === "rejection") {
+              reject(new Error("stale child activation rejected"));
+              return;
+            }
+            const issuedAt = Date.now();
+            resolve({
+              from: "broker",
+              to: descriptor.agentId,
+              id: "88888888-8888-4888-8888-888888888888",
+              re: "99999999-9999-4999-9999-999999999999",
+              body: {
+                type: "relay_lease_activate_result",
+                ok: true,
+                state: "activated",
+                lease: {
+                  relayExposureLeaseId: "77777777-7777-4777-8777-777777777777",
+                  parent: {
+                    workspaceId: descriptor.workspaceId,
+                    agentId: descriptor.parentAgentId,
+                    processEpoch: "55555555-5555-4555-8555-555555555555",
+                  },
+                  binding: {
+                    runId: descriptor.runId,
+                    workspaceId: descriptor.workspaceId,
+                    agentId: descriptor.agentId,
+                    processEpoch: descriptor.processEpoch,
+                    mode: "relay",
+                  },
+                  issuedAt,
+                  expiresAt: issuedAt + 30_000,
+                },
+              },
+            });
+          };
+        });
       }
       return originalRequest.call(this, to, body, timeoutMs);
     });
@@ -3612,35 +3648,7 @@ describe("child-safe legacy exposure", () => {
 
       stale = true;
       await captureEventHandler("session_shutdown")({ type: "session_shutdown", reason: "reload" });
-      const issuedAt = Date.now();
-      resolveActivation({
-        from: "broker",
-        to: descriptor.agentId,
-        id: "88888888-8888-4888-8888-888888888888",
-        re: "99999999-9999-4999-8999-999999999999",
-        body: {
-          type: "relay_lease_activate_result",
-          ok: true,
-          state: "activated",
-          lease: {
-            relayExposureLeaseId: "77777777-7777-4777-8777-777777777777",
-            parent: {
-              workspaceId: descriptor.workspaceId,
-              agentId: descriptor.parentAgentId,
-              processEpoch: "55555555-5555-4555-8555-555555555555",
-            },
-            binding: {
-              runId: descriptor.runId,
-              workspaceId: descriptor.workspaceId,
-              agentId: descriptor.agentId,
-              processEpoch: descriptor.processEpoch,
-              mode: "relay",
-            },
-            issuedAt,
-            expiresAt: issuedAt + 30_000,
-          },
-        },
-      });
+      settleActivation();
       await expect(oldRoot).resolves.toBeUndefined();
       expect(oldUi.notify).toHaveBeenCalledTimes(notificationsBeforeShutdown);
       expect(_getRelayExposureLeaseForTest()).toBeNull();
