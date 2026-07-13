@@ -45,9 +45,9 @@ function meshAuthority() {
 }
 
 describe("remote-pi/testing", () => {
-  test("reports held then released only from the production-owned mesh spool", async () => {
+  test("reports lane-tagged held and released receipts in reply-before-unsolicited order from the production-owned mesh spool", async () => {
     const controlled = meshAuthority();
-    const submitted: string[] = [];
+    const submitted: Array<{ lane: string; ids: string[] }> = [];
     const followUps: string[] = [];
     let settled = false;
     let binding: ReturnType<typeof bindProductionMeshProbe> | undefined;
@@ -55,12 +55,12 @@ describe("remote-pi/testing", () => {
       mode: "managed",
       getSessionId: () => "remote-pi-probe-session",
       authority: controlled.authority,
-      submit: (_lane, envelopes) => {
+      submit: (lane, envelopes) => {
         // The production boundary receives this callback only after the
         // lifecycle's post-settlement release cut; model it as one follow-up
         // turn per released batch, not a turn while the receipt is held.
         expect(settled).toBe(true);
-        submitted.push(...envelopes.map((envelope) => envelope.id));
+        submitted.push({ lane, ids: envelopes.map((envelope) => envelope.id) });
         followUps.push(...envelopes.map((envelope) => envelope.id));
         return true;
       },
@@ -80,25 +80,43 @@ describe("remote-pi/testing", () => {
       packageDirectory: "/candidate/node_modules/remote-pi",
     });
 
-    const receipt = await probe.inject({
+    const unsolicitedReceipt = await probe.inject({
       consumer: "remote-pi",
       kind: "mesh-arrival",
-      id: "mesh-opaque-id",
+      id: "mesh-unsolicited-id",
       lane: "unsolicited",
     });
-    expect(receipt).toMatchObject({ consumer: "remote-pi", id: "mesh-opaque-id", outcome: "held", generationId: "generation-a" });
-    expect(Object.isFrozen(receipt)).toBe(true);
-    // The archive seam observes a held receipt before it can wake Pi.
+    const replyReceipt = await probe.inject({
+      consumer: "remote-pi",
+      kind: "mesh-arrival",
+      id: "mesh-reply-id",
+      lane: "reply",
+    });
+    expect(unsolicitedReceipt).toEqual({
+      consumer: "remote-pi", id: "mesh-unsolicited-id", lane: "mesh-unsolicited", outcome: "held", generationId: "generation-a",
+    });
+    expect(replyReceipt).toEqual({
+      consumer: "remote-pi", id: "mesh-reply-id", lane: "mesh-reply", outcome: "held", generationId: "generation-a",
+    });
+    expect(Object.isFrozen(replyReceipt)).toBe(true);
+    // The archive seam observes both held receipts before either can wake Pi.
     expect(submitted).toEqual([]);
     expect(followUps).toEqual([]);
 
     settled = true;
     controlled.settle();
-    expect(submitted).toEqual(["mesh-opaque-id"]);
-    expect(followUps).toEqual(["mesh-opaque-id"]);
+    // Actual production spool submission and the redacted testing receipts
+    // expose the same reply-first lane ordering without envelope contents.
+    expect(submitted).toEqual([
+      { lane: "mesh-reply", ids: ["mesh-reply-id"] },
+      { lane: "mesh-unsolicited", ids: ["mesh-unsolicited-id"] },
+    ]);
+    expect(followUps).toEqual(["mesh-reply-id", "mesh-unsolicited-id"]);
     expect(await probe.observations()).toEqual([
-      receipt,
-      expect.objectContaining({ consumer: "remote-pi", id: "mesh-opaque-id", outcome: "released", generationId: "generation-a" }),
+      unsolicitedReceipt,
+      replyReceipt,
+      { consumer: "remote-pi", id: "mesh-reply-id", lane: "mesh-reply", outcome: "released", generationId: "generation-a" },
+      { consumer: "remote-pi", id: "mesh-unsolicited-id", lane: "mesh-unsolicited", outcome: "released", generationId: "generation-a" },
     ]);
 
     await probe.dispose();

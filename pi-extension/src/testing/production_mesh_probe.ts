@@ -5,8 +5,10 @@ export interface ProductionMeshProbeInjection {
   readonly lane: MeshLane;
 }
 
+/** Redacted production receipt; it deliberately excludes envelope data. */
 export interface ProductionMeshProbeTransition {
   readonly id: string;
+  readonly lane: MeshLane;
   readonly outcome: "held" | "released";
   readonly generationId: string;
 }

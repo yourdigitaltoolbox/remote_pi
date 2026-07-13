@@ -22,6 +22,7 @@ export type MeshAcceptance = { status: "received" } | { status: "denied"; code: 
 /** Redacted lifecycle receipts for the production-owned testing bridge. */
 export interface MeshSpoolTransition {
   readonly id: string;
+  readonly lane: MeshLane;
   readonly outcome: "held" | "released";
   readonly generationId: string;
 }
@@ -116,7 +117,7 @@ export class MeshSpool {
     }
     this.held[lane].push(record);
     this.totalBytes += bytes;
-    this.options.onTransition?.({ id: envelope.id, outcome: "held", generationId });
+    this.options.onTransition?.({ id: envelope.id, lane, outcome: "held", generationId });
     if (admission === "deliver") this.flush(lane, snapshot);
     return { status: "received" };
   }
@@ -280,7 +281,7 @@ export class MeshSpool {
     this.held[lane] = this.held[lane].filter((record) => !set.has(record));
     for (const record of records) {
       this.totalBytes -= record.bytes;
-      this.options.onTransition?.({ id: record.envelope.id, outcome: "released", generationId: record.generationId });
+      this.options.onTransition?.({ id: record.envelope.id, lane, outcome: "released", generationId: record.generationId });
     }
   }
 

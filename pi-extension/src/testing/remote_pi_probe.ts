@@ -2,6 +2,7 @@ import type { AgentSession } from "@earendil-works/pi-coding-agent";
 import { handleSessionCompact, type ActionReplySender } from "../actions/handlers.js";
 import { RemoteLifecycleController, type RemoteLifecycleEvent } from "../lifecycle/remote_lifecycle.js";
 import type { ServerMessage } from "../protocol/types.js";
+import type { MeshLane } from "../session/mesh_spool.js";
 import { productionMeshProbe, type ProductionMeshProbe } from "./production_mesh_probe.js";
 
 export type RemotePiProbeInjection =
@@ -10,14 +11,18 @@ export type RemotePiProbeInjection =
 
 export type RemotePiProbeOutcome = "accepted" | "held" | "released" | "coalesced" | "rejected" | "completed" | "failed";
 
-export interface RemotePiProbeReceipt {
+interface RemotePiProbeReceiptBase {
   readonly consumer: "remote-pi";
   readonly id: string;
-  readonly outcome: RemotePiProbeOutcome;
   readonly operationId?: string;
   readonly generationId?: string;
   readonly notificationCount?: number;
 }
+
+/** Redacted mesh transitions retain lane identity without exposing envelopes. */
+export type RemotePiProbeReceipt =
+  | (RemotePiProbeReceiptBase & Readonly<{ outcome: "held" | "released"; lane: MeshLane }>)
+  | (RemotePiProbeReceiptBase & Readonly<{ outcome: Exclude<RemotePiProbeOutcome, "held" | "released">; lane?: never }>);
 
 export interface RemotePiProbeOptions {
   readonly session: AgentSession;
@@ -46,6 +51,7 @@ export class RemotePiProbeAdapter {
       this.record({
         consumer: "remote-pi",
         id: transition.id,
+        lane: transition.lane,
         outcome: transition.outcome,
         generationId: transition.generationId,
       });
