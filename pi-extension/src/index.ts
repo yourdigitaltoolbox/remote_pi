@@ -4042,6 +4042,11 @@ function _isMeshBatchProof(value: unknown, sessionId: string): value is { sessio
   return proof.sessionId === sessionId && typeof proof.generationId === "string" && typeof proof.submissionId === "string" && Array.isArray(proof.envelopeIds) && proof.envelopeIds.every((id) => typeof id === "string");
 }
 
+/** Test-only seam for the production mesh submission boundary. */
+export function _submitMeshSpoolBatchForTest(sessionId: string, lane: MeshLane, envelopes: readonly import("./session/envelope.js").Envelope[], submissionId: string, generationId: string): boolean {
+  return _submitMeshSpoolBatch(sessionId, lane, envelopes, submissionId, generationId);
+}
+
 function _submitMeshSpoolBatch(sessionId: string, lane: MeshLane, envelopes: readonly import("./session/envelope.js").Envelope[], submissionId: string, generationId: string): boolean {
   if (_runtimeSessionId !== sessionId || !_pi || envelopes.length === 0) return false;
   const notices = envelopes.map((env) => {
@@ -4063,7 +4068,11 @@ function _submitMeshSpoolBatch(sessionId: string, lane: MeshLane, envelopes: rea
     _pi.sendMessage({
       customType: "remote-pi:mesh-batch", content: notices.join("\n\n---\n\n"), display: true,
       details: { sessionId, generationId, submissionId, envelopeIds: envelopes.map((env) => env.id) },
-    }, { triggerTurn: true, deliverAs: "nextTurn" });
+    // Pi 0.80.6 handles `nextTurn` before `triggerTurn`, so that mode only
+    // waits for unrelated future input. Release follows its `agent_settled`
+    // barrier; documented `followUp` avoids that special branch, allowing this
+    // explicit wake to start the released batch's follow-up turn.
+    }, { triggerTurn: true, deliverAs: "followUp" });
     // Only a successful SDK submission owns a mesh turn correlation. Existing
     // app-originated turn correlation is never replaced by a held mesh receipt.
     if (_currentTurnId === null) _currentTurnId = `mesh_${envelopes[0]!.id}`;

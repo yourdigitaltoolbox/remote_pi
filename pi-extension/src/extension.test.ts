@@ -183,6 +183,7 @@ const {
   _handleControl,
   _setBeforePersistentRenameWriteForTest,
   _syncNameFromPiForTest,
+  _submitMeshSpoolBatchForTest,
   CTRL_PREFIX,
 } = await import("./index.js");
 const { acquireIdentityLock } = await import("./session/cwd_lock.js");
@@ -912,6 +913,34 @@ function captureEventHandler(eventName: string): EventHandler {
   if (!captured) throw new Error(`event "${eventName}" handler not registered`);
   return captured;
 }
+
+describe("released mesh spool submission", () => {
+  afterEach(() => {
+    _setPiForTest(null);
+    _resetCwdLockForTest();
+  });
+
+  test("uses Pi 0.80.6 followUp delivery so a released batch explicitly wakes its follow-up turn", () => {
+    const sessionId = "mesh-followup-session";
+    const onSessionStart = captureEventHandler("session_start");
+    onSessionStart({ type: "session_start" }, {
+      ...makeMockCtx("/tmp/remote-pi-mesh-followup"),
+      sessionManager: { getSessionId: () => sessionId },
+    });
+    const sendMessage = vi.fn();
+    _setPiForTest({ sendMessage } as unknown as ExtensionAPI);
+
+    expect(_submitMeshSpoolBatchForTest(sessionId, "mesh-unsolicited", [{
+      id: "released-mesh-message", from: "mesh-peer", to: "local", re: null, body: "released body",
+    }], "submission-a", "generation-a")).toBe(true);
+
+    expect(sendMessage).toHaveBeenCalledOnce();
+    expect(sendMessage).toHaveBeenCalledWith(expect.objectContaining({
+      customType: "remote-pi:mesh-batch",
+      details: expect.objectContaining({ sessionId, submissionId: "submission-a", generationId: "generation-a" }),
+    }), { triggerTurn: true, deliverAs: "followUp" });
+  });
+});
 
 async function _pairForTest(appPeerId: string): Promise<void> {
   captureHandler("remote-pi");

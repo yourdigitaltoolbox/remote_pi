@@ -54,20 +54,27 @@ function retainedMessageAtSerializedBytes(bytes: number) {
 }
 
 describe("MeshSpool", () => {
-  test("retains before a positive receipt and flushes reply before unsolicited after release", () => {
+  test("holds work until settlement, then releases reply before unsolicited follow-up submissions", () => {
     const controlled = fakeAuthority();
     const submitted: Array<{ lane: string; ids: string[] }> = [];
+    const followUps: string[] = [];
     const spool = new MeshSpool({
       mode: "managed",
       getSessionId: () => "session-a",
       authority: controlled.authority,
-      submit: (lane, values) => { submitted.push({ lane, ids: values.map((value) => value.id) }); return true; },
+      submit: (lane, values) => {
+        submitted.push({ lane, ids: values.map((value) => value.id) });
+        followUps.push(...values.map((value) => value.id));
+        return true;
+      },
     });
     const unsolicited = message({ type: "notice" });
     const reply = message({ type: "reply" }, "00000000-0000-7000-8000-000000000001");
     expect(spool.accept(unsolicited)).toEqual({ status: "received" });
     expect(spool.accept(reply)).toEqual({ status: "received" });
+    // No model follow-up is submitted while lifecycle settlement still holds it.
     expect(submitted).toEqual([]);
+    expect(followUps).toEqual([]);
     expect(spool.counts()).toMatchObject({ replies: 1, unsolicited: 1 });
 
     controlled.set(snapshot({ sequence: 2, phase: "idle" }));
@@ -75,6 +82,7 @@ describe("MeshSpool", () => {
       { lane: "mesh-reply", ids: [reply.id] },
       { lane: "mesh-unsolicited", ids: [unsolicited.id] },
     ]);
+    expect(followUps).toEqual([reply.id, unsolicited.id]);
     expect(spool.counts()).toMatchObject({ replies: 0, unsolicited: 0 });
   });
 

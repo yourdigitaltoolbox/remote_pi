@@ -48,13 +48,20 @@ describe("remote-pi/testing", () => {
   test("reports held then released only from the production-owned mesh spool", async () => {
     const controlled = meshAuthority();
     const submitted: string[] = [];
+    const followUps: string[] = [];
+    let settled = false;
     let binding: ReturnType<typeof bindProductionMeshProbe> | undefined;
     const spool = new MeshSpool({
       mode: "managed",
       getSessionId: () => "remote-pi-probe-session",
       authority: controlled.authority,
       submit: (_lane, envelopes) => {
+        // The production boundary receives this callback only after the
+        // lifecycle's post-settlement release cut; model it as one follow-up
+        // turn per released batch, not a turn while the receipt is held.
+        expect(settled).toBe(true);
         submitted.push(...envelopes.map((envelope) => envelope.id));
+        followUps.push(...envelopes.map((envelope) => envelope.id));
         return true;
       },
       onTransition: (transition) => binding?.publish(transition),
@@ -81,10 +88,14 @@ describe("remote-pi/testing", () => {
     });
     expect(receipt).toMatchObject({ consumer: "remote-pi", id: "mesh-opaque-id", outcome: "held", generationId: "generation-a" });
     expect(Object.isFrozen(receipt)).toBe(true);
+    // The archive seam observes a held receipt before it can wake Pi.
     expect(submitted).toEqual([]);
+    expect(followUps).toEqual([]);
 
+    settled = true;
     controlled.settle();
     expect(submitted).toEqual(["mesh-opaque-id"]);
+    expect(followUps).toEqual(["mesh-opaque-id"]);
     expect(await probe.observations()).toEqual([
       receipt,
       expect.objectContaining({ consumer: "remote-pi", id: "mesh-opaque-id", outcome: "released", generationId: "generation-a" }),
