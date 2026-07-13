@@ -2756,25 +2756,48 @@ type ChildRelayActivation =
   | { ok: true; lease: RelayExposureLease }
   | { ok: false; reason: string };
 
-async function _activateCurrentChildRelay(exposure: SessionExposurePolicy): Promise<ChildRelayActivation> {
+async function _activateCurrentChildRelay(
+  exposure: SessionExposurePolicy,
+  actionEpoch: number,
+): Promise<ChildRelayActivation> {
+  if (!_isCurrentSessionAction(actionEpoch)) return { ok: false, reason: "stale_session_action" };
   const descriptor = exposure.descriptor;
   if (exposure.classification !== "child_current" || exposure.requestedMode !== "relay" || !descriptor) {
     return { ok: false, reason: "relay_not_requested" };
   }
-  if (!_meshNode || !_runtimeIdentity) return { ok: false, reason: "local_mesh_unavailable" };
-  if (!_runtimeEpochFence.isCurrent(_runtimeIdentity)) return { ok: false, reason: "stale_process_epoch" };
+  const meshNode = _meshNode;
+  const identity = _runtimeIdentity;
+  if (!meshNode || !identity) return { ok: false, reason: "local_mesh_unavailable" };
+  if (!_runtimeEpochFence.isCurrent(identity)) return { ok: false, reason: "stale_process_epoch" };
   const capability = _sessionClaim[RELAY_EXPOSURE_CAPABILITY_ENV];
   if (!capability) return { ok: false, reason: "missing_capability" };
   let activationReply: ReturnType<typeof parseRelayExposureActivationBrokerReply>;
   try {
-    const reply = await _meshNode.request("broker", {
+    const reply = await meshNode.request("broker", {
       type: "relay_lease_activate",
       capability,
       runId: descriptor.runId,
       mode: "relay",
     }, 2_000);
+    // A session replacement may have changed the runtime identity, mesh, or
+    // lease while the broker request was in flight. Do not inspect or publish
+    // mutable state on behalf of the outgoing command action.
+    if (!_isCurrentSessionAction(actionEpoch)
+      || _meshNode !== meshNode
+      || _runtimeIdentity !== identity
+      || !_runtimeEpochFence.isCurrent(identity)) {
+      return { ok: false, reason: "stale_session_action" };
+    }
     activationReply = parseRelayExposureActivationBrokerReply(reply.body, capability);
   } catch {
+    // A rejected activation is also an async continuation. Preserve the stale
+    // result so the caller cannot turn it into an outgoing-context warning.
+    if (!_isCurrentSessionAction(actionEpoch)
+      || _meshNode !== meshNode
+      || _runtimeIdentity !== identity
+      || !_runtimeEpochFence.isCurrent(identity)) {
+      return { ok: false, reason: "stale_session_action" };
+    }
     return { ok: false, reason: "broker_unavailable" };
   }
   if (!activationReply) return { ok: false, reason: "invalid_activation_reply" };
@@ -2782,9 +2805,9 @@ async function _activateCurrentChildRelay(exposure: SessionExposurePolicy): Prom
   const lease = activationReply.lease;
   const now = Date.now();
   if (lease.binding.runId !== descriptor.runId
-    || lease.binding.workspaceId.toLowerCase() !== _runtimeIdentity.workspaceId.toLowerCase()
-    || lease.binding.agentId.toLowerCase() !== _runtimeIdentity.agentId.toLowerCase()
-    || lease.binding.processEpoch.toLowerCase() !== _runtimeIdentity.processEpoch.toLowerCase()
+    || lease.binding.workspaceId.toLowerCase() !== identity.workspaceId.toLowerCase()
+    || lease.binding.agentId.toLowerCase() !== identity.agentId.toLowerCase()
+    || lease.binding.processEpoch.toLowerCase() !== identity.processEpoch.toLowerCase()
     || lease.expiresAt <= now) {
     return { ok: false, reason: "invalid_activation_reply" };
   }
@@ -2806,6 +2829,7 @@ async function _cmdStart(
   options: RelayStartOptions = {},
   actionEpoch = _sessionActionEpoch,
 ): Promise<boolean> {
+  if (!_isCurrentSessionAction(actionEpoch)) return false;
   const cwd = "cwd" in ctx ? (ctx as ExtensionCommandContext).cwd : process.cwd();
   const exposure = _sessionExposure(cwd);
   let childLease: RelayExposureLease | null = null;
@@ -2822,8 +2846,8 @@ async function _cmdStart(
       }
       childLease = options.preactivatedLease;
     } else {
-      const activation = await _activateCurrentChildRelay(exposure);
-      if (actionEpoch !== _sessionActionEpoch) return false;
+      const activation = await _activateCurrentChildRelay(exposure, actionEpoch);
+      if (!_isCurrentSessionAction(actionEpoch)) return false;
       if (!activation.ok) {
         ctx.ui.notify(
           `[remote-pi] Relay denied for ${exposure.classification}; child remains ${exposure.mode} (source: ${exposure.source}, lease: ${activation.reason}).`,
@@ -2846,7 +2870,7 @@ async function _cmdStart(
   try {
     edKp = await getOrCreateEd25519Keypair();
   } catch (err) {
-    if (actionEpoch !== _sessionActionEpoch) return false;
+    if (!_isCurrentSessionAction(actionEpoch)) return false;
     if (err instanceof KeyringUnavailableError) {
       // The platform keyring (macOS Keychain / Windows Credential Manager) is
       // locked/denied and there's no file identity to fall back to. We refuse
@@ -2864,7 +2888,7 @@ async function _cmdStart(
     }
     throw err;
   }
-  if (actionEpoch !== _sessionActionEpoch) return false;
+  if (!_isCurrentSessionAction(actionEpoch)) return false;
   _cachedEd25519 = edKp;
 
   const { url: relayUrl, source } = resolveRelayUrl();
@@ -2940,6 +2964,9 @@ async function _cmdStart(
   try {
     await relay.connect({ roomId, roomMeta });
   } catch (err) {
+    // Fence failure continuations too: an old command context is no safer to
+    // notify through than a successfully connected stale relay is to publish.
+    if (!_isCurrentSessionAction(actionEpoch)) return false;
     if (err instanceof RoomAlreadyOpenError) {
       ctx.ui.notify(
         "[remote-pi] Already running in this cwd. Stop the other terminal first.",
@@ -4059,6 +4086,7 @@ async function _cmdJoin(
   ctx: Pick<ExtensionContext, "ui" | "cwd">,
   actionEpoch = _sessionActionEpoch,
 ): Promise<void> {
+  if (!_isCurrentSessionAction(actionEpoch)) return;
   const cwd = "cwd" in ctx ? (ctx as ExtensionCommandContext).cwd : process.cwd();
   const local = loadLocalConfig(cwd);
   const exposure = _sessionExposure(cwd);
@@ -4081,8 +4109,18 @@ async function _cmdJoin(
   // Singleton ownership is immutable-ID keyed. Two children with the same cwd
   // and display name coexist because their agentIds differ; a duplicate
   // logical ID fails before broker or relay mutation.
-  if (_cwdLock === null) {
+  let lockForJoin = _cwdLock;
+  if (lockForJoin === null) {
     const result = await acquireIdentityLock(identity);
+    // This action can win the OS lock after a replacement has already begun.
+    // Release only its local acquisition; never publish or clear the current
+    // action's global lock and never dereference the outgoing command context.
+    if (!_isCurrentSessionAction(actionEpoch)) {
+      if (result.ok) {
+        try { result.release(); } catch { /* best effort */ }
+      }
+      return;
+    }
     if (!result.ok) {
       ctx.ui.notify(
         `[remote-pi] Could not start: runtime identity ${identity.agentId} is already active in workspace ${identity.workspaceId}.`,
@@ -4091,6 +4129,7 @@ async function _cmdJoin(
       return;
     }
     _cwdLock = result;
+    lockForJoin = result;
     _lockedName = requestedName; // compatibility/test presentation accessor
   }
   const agentName = _runtimePresentation?.displayName ?? requestedName;
@@ -4247,9 +4286,15 @@ async function _cmdJoin(
     // again from `_cmdStart`).
     _attachBridgeIfReady();
   } catch (err) {
-    try { _cwdLock?.release(); } catch { /* best effort */ }
-    _cwdLock = null;
-    _lockedName = null;
+    // `peer.connect()` can reject after replacement has installed its own
+    // lock/context. Fence before every mutable-state or UI continuation, and
+    // only release the exact lock this action observed/acquired.
+    if (!_isCurrentSessionAction(actionEpoch)) return;
+    if (_cwdLock === lockForJoin && lockForJoin !== null) {
+      try { lockForJoin.release(); } catch { /* best effort */ }
+      _cwdLock = null;
+      _lockedName = null;
+    }
     ctx.ui.notify(`[remote-pi] join failed: ${String(err)}`, "error");
   }
 }
