@@ -4,10 +4,12 @@ const SERVER_TYPES = new Set<ServerMessage["type"]>([
   "pair_ok",
   "pair_error",
   "user_input",
+  "user_message",
   "queued_message_state",
   "agent_chunk",
   "agent_done",
   "agent_message",
+  "compaction",
   "tool_request",
   "tool_result",
   "error",
@@ -15,6 +17,12 @@ const SERVER_TYPES = new Set<ServerMessage["type"]>([
   "pong",
   "bye",
   "session_history",
+  "action_ok",
+  "action_error",
+  "models_list",
+  "lifecycle_status",
+  "lifecycle_repair",
+  "lifecycle_outcome",
 ]);
 
 export class DecodeError extends Error {

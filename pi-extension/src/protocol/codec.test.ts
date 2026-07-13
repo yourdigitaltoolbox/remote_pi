@@ -11,6 +11,7 @@ const SERVER_TYPE_FILES = new Set([
   "pair_ok.jsonl",
   "pair_error.jsonl",
   "user_input.jsonl",
+  "user_message.jsonl",
   "agent_stream.jsonl",
   "agent_message.jsonl",
   "tool_request.jsonl",
@@ -53,6 +54,20 @@ describe("fixtures", () => {
       }
     });
   }
+});
+
+describe("paired action replies", () => {
+  test("decodes action and lifecycle replies available from remote-pi/client", () => {
+    for (const line of [
+      '{"type":"action_ok","in_reply_to":"compact","action":"session_compact","disposition":"accepted"}',
+      '{"type":"action_error","in_reply_to":"compact","action":"session_compact","error":"unavailable"}',
+      '{"type":"lifecycle_status","in_reply_to":"status","snapshot":{"registry_state":"ready","sequence":4},"diagnostics":[]}',
+      '{"type":"lifecycle_repair","in_reply_to":"repair","disposition":"rejected","code":"snapshot-sequence-mismatch","sequence":4}',
+      '{"type":"lifecycle_outcome","operation_id":"operation","session_id":"session","generation_id":"generation","outcome":"completed"}',
+    ]) {
+      expect(decodeServer(line)).toHaveProperty("type");
+    }
+  });
 });
 
 describe("rejects junk", () => {

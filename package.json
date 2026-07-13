@@ -1,0 +1,21 @@
+{
+  "name": "remote-pi-git-bridge",
+  "private": true,
+  "version": "0.5.5",
+  "description": "Pi Git-install bridge for the Remote Pi extension source package.",
+  "type": "module",
+  "engines": {
+    "node": ">=22.19.0"
+  },
+  "scripts": {
+    "prepare": "node scripts/prepare-pi-extension.mjs",
+    "build:pi-extension": "node scripts/prepare-pi-extension.mjs",
+    "check:pi-extension": "npx --yes pnpm@10.26.1 --dir pi-extension typecheck && npx --yes pnpm@10.26.1 --dir pi-extension test && npx --yes pnpm@10.26.1 --dir pi-extension build",
+    "smoke:pi-git-install": "node scripts/smoke-pi-git-install.mjs"
+  },
+  "pi": {
+    "extensions": [
+      "./pi-extension/dist"
+    ]
+  }
+}

@@ -74,6 +74,10 @@ import {
   type ActionCtx,
 } from "./actions/handlers.js";
 import { ensureModelRegistry } from "./actions/registry.js";
+import { RemoteLifecycleController } from "./lifecycle/remote_lifecycle.js";
+import { MeshSpool, resolveMeshSpoolMode, type MeshLane, type MeshAcceptance } from "./session/mesh_spool.js";
+import type { Envelope } from "./session/envelope.js";
+import { bindProductionMeshProbe } from "./testing/production_mesh_probe.js";
 import {
   ensureGlobalDirs,
   LOCAL_SESSION_NAME,
@@ -220,6 +224,14 @@ let _sessionPeerCount = 0;
 // re-evaluates the module on every session replacement), so the replacement
 // instance starts fresh with `_disposed = false`.
 let _disposed = false;
+// Monotonically invalidates async command work across a session replacement.
+// A host may reuse this module instance and clear `_disposed` at the next
+// session_start while an old `_cmdRoot` is still awaiting mesh/relay setup.
+// That old continuation must not resume against its stale command context.
+let _sessionActionEpoch = 0;
+function _isCurrentSessionAction(epoch: number): boolean {
+  return !_disposed && epoch === _sessionActionEpoch;
+}
 // True once the auto-init has run on the first session_start for this
 // process. Prevents re-running on session replacements (those re-init via
 // the _disposed re-arm path above). The session_start handler below auto-starts
@@ -252,6 +264,28 @@ const _loadedRemotePiIdentity = loadRemotePiPackageIdentity();
 let _runtimeIdentity: RuntimeIdentity | null = null;
 let _runtimePresentation: RuntimePresentation | null = null;
 let _runtimeSessionId: string | null = null;
+let _meshSpool: MeshSpool | null = null;
+let _meshProbeBinding: ReturnType<typeof bindProductionMeshProbe> | null = null;
+
+// Remote Pi is a lifecycle consumer, not an owner. The controller exposes only
+// correlated operation metadata to paired owners; consumer bodies and resume
+// content remain in their owning extensions.
+const _remoteLifecycle = new RemoteLifecycleController((event) => {
+  if (event.type !== "terminal") {
+    _publishWorking(true);
+    return;
+  }
+  // A blocked operation is explicit degraded state, never stranded working UI.
+  _publishWorking(false);
+  _broadcastToActive({
+    type: "lifecycle_outcome",
+    operation_id: event.operationId,
+    session_id: event.sessionId,
+    generation_id: event.generationId,
+    outcome: event.outcome,
+    ...(event.code ? { code: event.code } : {}),
+  });
+});
 let _runtimeCwd: string | null = null;
 let _runtimeProcessEpoch = randomUUID();
 const _runtimeEpochFence = new EpochFence();
@@ -2069,6 +2103,10 @@ const extension: ExtensionFactory = (pi: ExtensionAPI): void => {
   // New session. Fires on startup/new/fork/reload/resume; the ctx is always
   // bound to the current session.
   pi.on("session_start", (_event, ctx) => {
+    // Invalidate any async command action that captured the outgoing session's
+    // ctx. A reused module clears `_disposed` below, so `_disposed` alone is
+    // not sufficient to distinguish the old continuation from this fresh ctx.
+    _sessionActionEpoch += 1;
     _lastEventCtx = ctx;
     if ("cwd" in ctx && typeof ctx.cwd === "string") _sessionCwd = ctx.cwd;
     const sessionId = _sessionIdFromContext(ctx);
@@ -2079,6 +2117,8 @@ const extension: ExtensionFactory = (pi: ExtensionAPI): void => {
       _runtimeProcessEpoch = randomUUID();
     }
     if (sessionId) _runtimeSessionId = sessionId;
+    _remoteLifecycle.bind(sessionId);
+    _replaceMeshSpool(sessionId, ctx);
     // Pi → remote-pi name sync is presentation-only. Before the mesh exists it
     // updates only runtime presentation so the first join uses the Pi session
     // name; after join, turn_start may publish the same metadata through the
@@ -2167,11 +2207,19 @@ const extension: ExtensionFactory = (pi: ExtensionAPI): void => {
   // best-effort: every step is guarded so a partially-initialised instance
   // (e.g. shutdown lands mid-`_cmdRoot`) tears down without throwing.
   pi.on("session_shutdown", async () => {
+    // Invalidate captured command actions before teardown. This remains needed
+    // even when the host reuses the module and later clears `_disposed`.
+    _sessionActionEpoch += 1;
     // Mark disposed FIRST so an in-flight `_cmdRoot`/`_cmdJoin` (the deferred
     // daemon connect) aborts instead of finishing as a ghost after we've torn
     // down — the race that left a mute `Backoffice` behind when the Cockpit
     // fired switch_session right after boot.
     _disposed = true;
+    _remoteLifecycle.dispose();
+    _meshProbeBinding?.dispose();
+    _meshProbeBinding = null;
+    _meshSpool?.dispose();
+    _meshSpool = null;
     if (_meshNode) {
       try { await _meshNode.close(); } catch { /* best-effort */ }
       _meshNode = null;
@@ -2567,7 +2615,8 @@ async function _cmdRoot(ctx: Pick<ExtensionContext, "ui" | "cwd">): Promise<void
   // This instance was torn down (session replacement) before its deferred
   // auto-init ran — don't connect, or we'd resurrect a ghost the broker can't
   // reach. The replacement instance (fresh module) drives the live connect.
-  if (_disposed) return;
+  const actionEpoch = _sessionActionEpoch;
+  if (!_isCurrentSessionAction(actionEpoch)) return;
 
   const cwd = "cwd" in ctx ? (ctx as ExtensionCommandContext).cwd : process.cwd();
   const exposure = _sessionExposure(cwd);
@@ -2579,12 +2628,14 @@ async function _cmdRoot(ctx: Pick<ExtensionContext, "ui" | "cwd">): Promise<void
   // identity. It can join the local mesh with runtime/default naming even when
   // this cwd has no remote-pi config yet.
   if (!localConfigExists(cwd) && isChildSession(exposure)) {
-    if (exposure.mode !== "off" && !_meshNode) await _cmdJoin(ctx);
+    if (exposure.mode !== "off" && !_meshNode) await _cmdJoin(ctx, actionEpoch);
+    if (!_isCurrentSessionAction(actionEpoch)) return;
     if (exposure.classification === "child_current"
       && exposure.requestedMode === "relay"
       && _state === "idle") {
-      await _cmdStart(ctx);
+      await _cmdStart(ctx, {}, actionEpoch);
     }
+    if (!_isCurrentSessionAction(actionEpoch)) return;
     _cmdStatus(ctx);
     return;
   }
@@ -2601,6 +2652,7 @@ async function _cmdRoot(ctx: Pick<ExtensionContext, "ui" | "cwd">): Promise<void
       agent_name: baseDefault,
       use_relay: true,
     });
+    if (!_isCurrentSessionAction(actionEpoch)) return;
     if (!newConfig) {
       ctx.ui.notify("[remote-pi] Setup cancelled.", "info");
       return;
@@ -2620,8 +2672,10 @@ async function _cmdRoot(ctx: Pick<ExtensionContext, "ui" | "cwd">): Promise<void
       `[remote-pi] Config saved to ${cwd}/.pi/remote-pi/config.json`,
       "info",
     );
-    await _cmdJoin(ctx);
-    if (effectiveAutoStartRelay(newConfig)) await _cmdStart(ctx);
+    await _cmdJoin(ctx, actionEpoch);
+    if (!_isCurrentSessionAction(actionEpoch)) return;
+    if (effectiveAutoStartRelay(newConfig)) await _cmdStart(ctx, {}, actionEpoch);
+    if (!_isCurrentSessionAction(actionEpoch)) return;
     _cmdStatus(ctx);
     return;
   }
@@ -2636,16 +2690,17 @@ async function _cmdRoot(ctx: Pick<ExtensionContext, "ui" | "cwd">): Promise<void
     _cmdStatus(ctx);
     return;
   }
-  if (!_meshNode) await _cmdJoin(ctx);
+  if (!_meshNode) await _cmdJoin(ctx, actionEpoch);
   // `_cmdJoin` aborts cleanly when a `session_shutdown` lands mid-connect, but
   // returns void — so recheck here before bringing the relay up, or we'd start
   // a ghost relay connection on an already-disposed instance (the replacement
   // instance owns the live connect).
-  if (_disposed) return;
+  if (!_isCurrentSessionAction(actionEpoch)) return;
   const shouldStartRelay = isChildSession(exposure)
     ? exposure.classification === "child_current" && exposure.requestedMode === "relay"
     : exposure.mode === "relay" && effectiveAutoStartRelay(config);
-  if (shouldStartRelay && _state === "idle") await _cmdStart(ctx);
+  if (shouldStartRelay && _state === "idle") await _cmdStart(ctx, {}, actionEpoch);
+  if (!_isCurrentSessionAction(actionEpoch)) return;
   _cmdStatus(ctx);
 }
 
@@ -2701,25 +2756,48 @@ type ChildRelayActivation =
   | { ok: true; lease: RelayExposureLease }
   | { ok: false; reason: string };
 
-async function _activateCurrentChildRelay(exposure: SessionExposurePolicy): Promise<ChildRelayActivation> {
+async function _activateCurrentChildRelay(
+  exposure: SessionExposurePolicy,
+  actionEpoch: number,
+): Promise<ChildRelayActivation> {
+  if (!_isCurrentSessionAction(actionEpoch)) return { ok: false, reason: "stale_session_action" };
   const descriptor = exposure.descriptor;
   if (exposure.classification !== "child_current" || exposure.requestedMode !== "relay" || !descriptor) {
     return { ok: false, reason: "relay_not_requested" };
   }
-  if (!_meshNode || !_runtimeIdentity) return { ok: false, reason: "local_mesh_unavailable" };
-  if (!_runtimeEpochFence.isCurrent(_runtimeIdentity)) return { ok: false, reason: "stale_process_epoch" };
+  const meshNode = _meshNode;
+  const identity = _runtimeIdentity;
+  if (!meshNode || !identity) return { ok: false, reason: "local_mesh_unavailable" };
+  if (!_runtimeEpochFence.isCurrent(identity)) return { ok: false, reason: "stale_process_epoch" };
   const capability = _sessionClaim[RELAY_EXPOSURE_CAPABILITY_ENV];
   if (!capability) return { ok: false, reason: "missing_capability" };
   let activationReply: ReturnType<typeof parseRelayExposureActivationBrokerReply>;
   try {
-    const reply = await _meshNode.request("broker", {
+    const reply = await meshNode.request("broker", {
       type: "relay_lease_activate",
       capability,
       runId: descriptor.runId,
       mode: "relay",
     }, 2_000);
+    // A session replacement may have changed the runtime identity, mesh, or
+    // lease while the broker request was in flight. Do not inspect or publish
+    // mutable state on behalf of the outgoing command action.
+    if (!_isCurrentSessionAction(actionEpoch)
+      || _meshNode !== meshNode
+      || _runtimeIdentity !== identity
+      || !_runtimeEpochFence.isCurrent(identity)) {
+      return { ok: false, reason: "stale_session_action" };
+    }
     activationReply = parseRelayExposureActivationBrokerReply(reply.body, capability);
   } catch {
+    // A rejected activation is also an async continuation. Preserve the stale
+    // result so the caller cannot turn it into an outgoing-context warning.
+    if (!_isCurrentSessionAction(actionEpoch)
+      || _meshNode !== meshNode
+      || _runtimeIdentity !== identity
+      || !_runtimeEpochFence.isCurrent(identity)) {
+      return { ok: false, reason: "stale_session_action" };
+    }
     return { ok: false, reason: "broker_unavailable" };
   }
   if (!activationReply) return { ok: false, reason: "invalid_activation_reply" };
@@ -2727,9 +2805,9 @@ async function _activateCurrentChildRelay(exposure: SessionExposurePolicy): Prom
   const lease = activationReply.lease;
   const now = Date.now();
   if (lease.binding.runId !== descriptor.runId
-    || lease.binding.workspaceId.toLowerCase() !== _runtimeIdentity.workspaceId.toLowerCase()
-    || lease.binding.agentId.toLowerCase() !== _runtimeIdentity.agentId.toLowerCase()
-    || lease.binding.processEpoch.toLowerCase() !== _runtimeIdentity.processEpoch.toLowerCase()
+    || lease.binding.workspaceId.toLowerCase() !== identity.workspaceId.toLowerCase()
+    || lease.binding.agentId.toLowerCase() !== identity.agentId.toLowerCase()
+    || lease.binding.processEpoch.toLowerCase() !== identity.processEpoch.toLowerCase()
     || lease.expiresAt <= now) {
     return { ok: false, reason: "invalid_activation_reply" };
   }
@@ -2749,7 +2827,9 @@ interface RelayStartOptions {
 async function _cmdStart(
   ctx: Pick<ExtensionContext, "ui" | "cwd">,
   options: RelayStartOptions = {},
+  actionEpoch = _sessionActionEpoch,
 ): Promise<boolean> {
+  if (!_isCurrentSessionAction(actionEpoch)) return false;
   const cwd = "cwd" in ctx ? (ctx as ExtensionCommandContext).cwd : process.cwd();
   const exposure = _sessionExposure(cwd);
   let childLease: RelayExposureLease | null = null;
@@ -2766,7 +2846,8 @@ async function _cmdStart(
       }
       childLease = options.preactivatedLease;
     } else {
-      const activation = await _activateCurrentChildRelay(exposure);
+      const activation = await _activateCurrentChildRelay(exposure, actionEpoch);
+      if (!_isCurrentSessionAction(actionEpoch)) return false;
       if (!activation.ok) {
         ctx.ui.notify(
           `[remote-pi] Relay denied for ${exposure.classification}; child remains ${exposure.mode} (source: ${exposure.source}, lease: ${activation.reason}).`,
@@ -2789,6 +2870,7 @@ async function _cmdStart(
   try {
     edKp = await getOrCreateEd25519Keypair();
   } catch (err) {
+    if (!_isCurrentSessionAction(actionEpoch)) return false;
     if (err instanceof KeyringUnavailableError) {
       // The platform keyring (macOS Keychain / Windows Credential Manager) is
       // locked/denied and there's no file identity to fall back to. We refuse
@@ -2806,6 +2888,7 @@ async function _cmdStart(
     }
     throw err;
   }
+  if (!_isCurrentSessionAction(actionEpoch)) return false;
   _cachedEd25519 = edKp;
 
   const { url: relayUrl, source } = resolveRelayUrl();
@@ -2881,6 +2964,9 @@ async function _cmdStart(
   try {
     await relay.connect({ roomId, roomMeta });
   } catch (err) {
+    // Fence failure continuations too: an old command context is no safer to
+    // notify through than a successfully connected stale relay is to publish.
+    if (!_isCurrentSessionAction(actionEpoch)) return false;
     if (err instanceof RoomAlreadyOpenError) {
       ctx.ui.notify(
         "[remote-pi] Already running in this cwd. Stop the other terminal first.",
@@ -2903,7 +2989,7 @@ async function _cmdStart(
   // instance's own connect is refused with `room_already_open` — the agent never enters
   // the cross-PC mesh. Close the fresh relay and bail; the replacement instance
   // (fresh module) drives the real connect. Mirrors the `_cmdJoin` guard.
-  if (_disposed
+  if (!_isCurrentSessionAction(actionEpoch)
     || (childLease !== null
       && (!_relayExposureLease || !_relayExposureLeaseCoversSnapshot(_relayExposureLease, childLease)))) {
     try { relay.close(); } catch { /* best-effort */ }
@@ -3873,52 +3959,128 @@ function _wakeAgent(
   }
 }
 
-/**
- * Deliver an inbound agent-network (mesh) message to the agent + the app.
- *
- * Display: the app renders it in the TOOL timeline (a matched
- * tool_request/tool_result "agent-network" pair) — NOT as the user's own
- * message, which is what `sendUserMessage` used to produce (the reported bug).
- *
- * Wake: we inject a CUSTOM message (role:"custom"), not a user message. The
- * SDK's `convertToLlm` maps custom → a user-role LLM message, so the agent
- * still sees + replies to it, but `message_end` does NOT buffer role:"custom",
- * so it never replays as `user_input` on session_sync. `triggerTurn` runs the
- * turn; `id` lets the LLM echo it via `agent_send(..., re=<id>)`.
- */
-function _deliverMeshMessageToAgent(
-  env: { id: string; from: string; re: string | null; body: unknown },
-): void {
-  const bodyText = typeof env.body === "string" ? env.body : JSON.stringify(env.body);
-  const toolCallId = `mesh_${env.id}`;
-  _broadcastToActive({
-    type: "tool_request",
-    tool_call_id: toolCallId,
-    tool: "agent-network",
-    args: env.re
-      ? { from: env.from, re: env.re, message: bodyText }
-      : { from: env.from, message: bodyText },
-  });
-  _broadcastToActive({ type: "tool_result", tool_call_id: toolCallId, result: { from: env.from, message: bodyText } });
+interface PersistedMeshSpoolEvent {
+  schemaVersion: 1;
+  sessionId: string;
+  state: "held" | "submitting" | "submitted";
+  lane: MeshLane;
+  generationId: string;
+  envelope: import("./session/envelope.js").Envelope;
+  submissionId?: string;
+}
 
-  const label = `agent-network message from "${env.from}"`;
-  if (!_pi) {
-    console.error(`[remote-pi] ${label}: agent session not bound yet — message dropped`);
-    return;
+function _isPersistedMeshSpoolEvent(value: unknown, sessionId: string): value is PersistedMeshSpoolEvent {
+  if (!value || typeof value !== "object" || Array.isArray(value)) return false;
+  const event = value as Partial<PersistedMeshSpoolEvent>;
+  return event.schemaVersion === 1
+    && event.sessionId === sessionId
+    && (event.state === "held" || event.state === "submitting" || event.state === "submitted")
+    && (event.lane === "mesh-reply" || event.lane === "mesh-unsolicited")
+    && typeof event.generationId === "string" && event.generationId.length > 0
+    && !!event.envelope && typeof event.envelope === "object"
+    && typeof event.envelope.id === "string" && typeof event.envelope.from === "string";
+}
+
+function _replaceMeshSpool(sessionId: string | undefined, ctx: ExtensionContext): void {
+  _meshProbeBinding?.dispose();
+  _meshProbeBinding = null;
+  _meshSpool?.dispose();
+  _meshSpool = null;
+  if (!sessionId) return;
+  let probeBinding: ReturnType<typeof bindProductionMeshProbe> | null = null;
+  const spool = new MeshSpool({
+    mode: resolveMeshSpoolMode(),
+    getSessionId: () => _runtimeSessionId === sessionId ? sessionId : null,
+    submit: (lane, envelopes, submissionId, generationId) => _submitMeshSpoolBatch(sessionId, lane, envelopes, submissionId, generationId),
+    persist: (event) => {
+      if (_runtimeSessionId !== sessionId || !_pi) throw new Error("stale or unbound mesh spool runtime");
+      _pi.appendEntry("remote-pi:mesh-spool", { schemaVersion: 1, sessionId, ...event } satisfies PersistedMeshSpoolEvent);
+    },
+    onTransition: (event) => probeBinding?.publish(event),
+    onBlocked: (code) => console.error(`[remote-pi] mesh spool blocked: ${code}`),
+  });
+  // Custom entries are domain-owned persistence. Rehydrate only a same-session
+  // held record. A pre-send `submitting` marker is replayed only when the
+  // corresponding durable custom-message submission proof is absent.
+  const states = new Map<string, PersistedMeshSpoolEvent>();
+  const submittedEnvelopeGenerations = new Map<string, string>();
+  const entries = (ctx.sessionManager as Partial<ExtensionContext["sessionManager"]>).getEntries?.() ?? [];
+  for (const entry of entries) {
+    if (entry.type === "custom" && entry.customType === "remote-pi:mesh-spool" && _isPersistedMeshSpoolEvent(entry.data, sessionId)) {
+      states.set(entry.data.envelope.id, entry.data);
+    }
+    if (entry.type === "custom_message" && entry.customType === "remote-pi:mesh-batch" && _isMeshBatchProof(entry.details, sessionId)) {
+      for (const id of entry.details.envelopeIds) submittedEnvelopeGenerations.set(id, entry.details.generationId);
+    }
   }
-  const header = `[agent-network] message from "${env.from}" (id=${env.id}${env.re ? `, re=${env.re}` : ""}):`;
-  const footer = env.re
-    ? "(This is a reply to a previous message of yours.)"
-    : `(If a reply is expected, call agent_send with to="${env.from}" and re="${env.id}".)`;
+  for (const event of states.values()) {
+    if (event.state === "held" || (event.state === "submitting" && submittedEnvelopeGenerations.get(event.envelope.id) !== event.generationId)) {
+      spool.restore(event.lane, event.envelope, event.generationId);
+    }
+  }
+  spool.reconcile();
+  _meshSpool = spool;
+  probeBinding = bindProductionMeshProbe(sessionId, ({ id, lane }) => _admitMeshEnvelope({
+    from: "remote-pi-probe",
+    to: "remote-pi-probe-target",
+    id,
+    re: lane === "mesh-reply" ? id : null,
+    body: null,
+    deliveryReceipt: { required: true },
+  }));
+  _meshProbeBinding = probeBinding;
+}
+
+/** The broker and archive probe share this exact production admission path. */
+function _admitMeshEnvelope(env: Envelope): MeshAcceptance {
+  return _meshSpool?.accept(env) ?? { status: "denied", code: "mesh-spool-unavailable" };
+}
+
+function _isMeshBatchProof(value: unknown, sessionId: string): value is { sessionId: string; generationId: string; envelopeIds: string[]; submissionId: string } {
+  if (!value || typeof value !== "object" || Array.isArray(value)) return false;
+  const proof = value as { sessionId?: unknown; generationId?: unknown; envelopeIds?: unknown; submissionId?: unknown };
+  return proof.sessionId === sessionId && typeof proof.generationId === "string" && typeof proof.submissionId === "string" && Array.isArray(proof.envelopeIds) && proof.envelopeIds.every((id) => typeof id === "string");
+}
+
+/** Test-only seam for the production mesh submission boundary. */
+export function _submitMeshSpoolBatchForTest(sessionId: string, lane: MeshLane, envelopes: readonly import("./session/envelope.js").Envelope[], submissionId: string, generationId: string): boolean {
+  return _submitMeshSpoolBatch(sessionId, lane, envelopes, submissionId, generationId);
+}
+
+function _submitMeshSpoolBatch(sessionId: string, lane: MeshLane, envelopes: readonly import("./session/envelope.js").Envelope[], submissionId: string, generationId: string): boolean {
+  if (_runtimeSessionId !== sessionId || !_pi || envelopes.length === 0) return false;
+  const notices = envelopes.map((env) => {
+    const bodyText = typeof env.body === "string" ? env.body : JSON.stringify(env.body);
+    const toolCallId = `mesh_${env.id}`;
+    _broadcastToActive({
+      type: "tool_request",
+      tool_call_id: toolCallId,
+      tool: "agent-network",
+      args: env.re ? { from: env.from, re: env.re, message: bodyText } : { from: env.from, message: bodyText },
+    });
+    _broadcastToActive({ type: "tool_result", tool_call_id: toolCallId, result: { from: env.from, message: bodyText } });
+    const footer = env.re
+      ? "(This is a reply to a previous message of yours.)"
+      : `(If a reply is expected, call agent_send with to="${env.from}" and re="${env.id}".)`;
+    return `[agent-network] message from "${env.from}" (id=${env.id}${env.re ? `, re=${env.re}` : ""}):\n${bodyText}\n\n${footer}`;
+  });
   try {
-    _pi.sendMessage(
-      { customType: "remote-pi:mesh-message", content: `${header}\n${bodyText}\n\n${footer}`, display: true },
-      { triggerTurn: true },
-    );
-  } catch (err) {
-    const detail = err instanceof Error ? err.message : String(err);
-    console.error(`[remote-pi] ${label}: agent rejected incoming message: ${detail}`);
-    _lastCtx?.ui.notify(`[remote-pi] failed to process incoming message: ${detail}`, "error");
+    _pi.sendMessage({
+      customType: "remote-pi:mesh-batch", content: notices.join("\n\n---\n\n"), display: true,
+      details: { sessionId, generationId, submissionId, envelopeIds: envelopes.map((env) => env.id) },
+    // Pi 0.80.6 handles `nextTurn` before `triggerTurn`, so that mode only
+    // waits for unrelated future input. Release follows its `agent_settled`
+    // barrier; documented `followUp` avoids that special branch, allowing this
+    // explicit wake to start the released batch's follow-up turn.
+    }, { triggerTurn: true, deliverAs: "followUp" });
+    // Only a successful SDK submission owns a mesh turn correlation. Existing
+    // app-originated turn correlation is never replaced by a held mesh receipt.
+    if (_currentTurnId === null) _currentTurnId = `mesh_${envelopes[0]!.id}`;
+    return true;
+  } catch (error) {
+    const detail = error instanceof Error ? error.message : String(error);
+    console.error(`[remote-pi] mesh ${lane} submission failed: ${detail}`);
+    return false;
   }
 }
 
@@ -3929,7 +4091,11 @@ function _deliverMeshMessageToAgent(
  * longer user-configurable: every Pi on the same machine joins the same
  * broker.
  */
-async function _cmdJoin(ctx: Pick<ExtensionContext, "ui" | "cwd">): Promise<void> {
+async function _cmdJoin(
+  ctx: Pick<ExtensionContext, "ui" | "cwd">,
+  actionEpoch = _sessionActionEpoch,
+): Promise<void> {
+  if (!_isCurrentSessionAction(actionEpoch)) return;
   const cwd = "cwd" in ctx ? (ctx as ExtensionCommandContext).cwd : process.cwd();
   const local = loadLocalConfig(cwd);
   const exposure = _sessionExposure(cwd);
@@ -3952,8 +4118,18 @@ async function _cmdJoin(ctx: Pick<ExtensionContext, "ui" | "cwd">): Promise<void
   // Singleton ownership is immutable-ID keyed. Two children with the same cwd
   // and display name coexist because their agentIds differ; a duplicate
   // logical ID fails before broker or relay mutation.
-  if (_cwdLock === null) {
+  let lockForJoin = _cwdLock;
+  if (lockForJoin === null) {
     const result = await acquireIdentityLock(identity);
+    // This action can win the OS lock after a replacement has already begun.
+    // Release only its local acquisition; never publish or clear the current
+    // action's global lock and never dereference the outgoing command context.
+    if (!_isCurrentSessionAction(actionEpoch)) {
+      if (result.ok) {
+        try { result.release(); } catch { /* best effort */ }
+      }
+      return;
+    }
     if (!result.ok) {
       ctx.ui.notify(
         `[remote-pi] Could not start: runtime identity ${identity.agentId} is already active in workspace ${identity.workspaceId}.`,
@@ -3962,6 +4138,7 @@ async function _cmdJoin(ctx: Pick<ExtensionContext, "ui" | "cwd">): Promise<void
       return;
     }
     _cwdLock = result;
+    lockForJoin = result;
     _lockedName = requestedName; // compatibility/test presentation accessor
   }
   const agentName = _runtimePresentation?.displayName ?? requestedName;
@@ -4032,10 +4209,21 @@ async function _cmdJoin(ctx: Pick<ExtensionContext, "ui" | "cwd">): Promise<void
     }
     if (env.from === "broker") return;  // other broker control messages — ignore
 
-    // Real agent-to-agent message (SessionPeer already correlated replies via
-    // env.re before this point). Show it in the app's TOOL timeline and wake
-    // the agent as a CUSTOM message — never as the user's own message.
-    _deliverMeshMessageToAgent(env);
+    // Real agent-to-agent message. Target-side retention happens before the
+    // broker is allowed to report `received`; lifecycle then decides whether
+    // the bounded reply/unsolicited lane can start a model turn now or later.
+    const acceptance = _admitMeshEnvelope(env);
+    if (env.deliveryReceipt?.required) {
+      void peer.send("broker", {
+        type: "mesh_delivery_receipt",
+        envelopeId: env.id,
+        status: acceptance.status,
+        ...(acceptance.status === "denied" ? { code: acceptance.code } : {}),
+      }).catch(() => { /* source receives timeout/denied; never forge receipt */ });
+    }
+    if (acceptance.status === "denied") {
+      console.error(`[remote-pi] mesh envelope ${env.id} denied before model wake: ${acceptance.code}`);
+    }
   });
 
   // After failover (leader died, we re-elected): the new broker's peers map
@@ -4057,7 +4245,7 @@ async function _cmdJoin(ctx: Pick<ExtensionContext, "ui" | "cwd">): Promise<void
     // in flight (the broker now has us registered, but this instance is being
     // discarded). Leave immediately instead of publishing a ghost peer that
     // the replacement instance would then collide with as `name#2`.
-    if (_disposed || !_runtimeEpochFence.isCurrent(identity)) {
+    if (!_isCurrentSessionAction(actionEpoch) || !_runtimeEpochFence.isCurrent(identity)) {
       try { await peer.close(); } catch { /* best-effort */ }
       return;
     }
@@ -4107,9 +4295,15 @@ async function _cmdJoin(ctx: Pick<ExtensionContext, "ui" | "cwd">): Promise<void
     // again from `_cmdStart`).
     _attachBridgeIfReady();
   } catch (err) {
-    try { _cwdLock?.release(); } catch { /* best effort */ }
-    _cwdLock = null;
-    _lockedName = null;
+    // `peer.connect()` can reject after replacement has installed its own
+    // lock/context. Fence before every mutable-state or UI continuation, and
+    // only release the exact lock this action observed/acquired.
+    if (!_isCurrentSessionAction(actionEpoch)) return;
+    if (_cwdLock === lockForJoin && lockForJoin !== null) {
+      try { lockForJoin.release(); } catch { /* best effort */ }
+      _cwdLock = null;
+      _lockedName = null;
+    }
     ctx.ui.notify(`[remote-pi] join failed: ${String(err)}`, "error");
   }
 }
@@ -4177,6 +4371,73 @@ export function _routeClientMessageFrom(
         in_reply_to: msg.id,
         message: `Abort failed: ${String(err)}`,
       });
+    }
+    return;
+  }
+  // Lifecycle actions do not need a direct Pi call. Handle them before the
+  // generic Pi-binding guard so an owner can diagnose an unavailable registry
+  // rather than having its authenticated request silently dropped.
+  if (msg.type === "session_compact") {
+    handleSessionCompact(_remoteLifecycle, sender, msg);
+    return;
+  }
+  if (msg.type === "lifecycle_status") {
+    const status = _remoteLifecycle.status();
+    sender.send({
+      type: "lifecycle_status",
+      in_reply_to: msg.id,
+      snapshot: {
+        registry_state: status.snapshot.registryState,
+        sequence: status.snapshot.sequence,
+        ...(status.snapshot.sessionId ? { session_id: status.snapshot.sessionId } : {}),
+        ...(status.snapshot.generationId ? { generation_id: status.snapshot.generationId } : {}),
+        ...(status.snapshot.phase ? { phase: status.snapshot.phase } : {}),
+        ...(status.snapshot.operationId ? { operation_id: status.snapshot.operationId } : {}),
+        ...(status.snapshot.reason ? { reason: status.snapshot.reason } : {}),
+        ...(status.snapshot.lastOutcome ? { last_outcome: status.snapshot.lastOutcome } : {}),
+      },
+      diagnostics: status.diagnostics.map((record) => ({
+        sequence: record.sequence,
+        timestamp: record.timestamp,
+        code: record.code,
+        ...(record.operationId ? { operation_id: record.operationId } : {}),
+        ...(record.phase ? { phase: record.phase } : {}),
+        ...(record.outcome ? { outcome: record.outcome } : {}),
+      })),
+    });
+    return;
+  }
+  if (msg.type === "lifecycle_repair") {
+    // This route is only reached from an authenticated paired channel. The
+    // lifecycle owner still validates operation/session/generation/phase/
+    // sequence CAS and evidence; Remote Pi supplies no bypass authority.
+    if (!Number.isSafeInteger(msg.expected_sequence) || msg.expected_sequence < 0) {
+      sender.send({ type: "lifecycle_repair", in_reply_to: msg.id, disposition: "rejected", code: "invalid-expected-sequence" });
+      return;
+    }
+    try {
+      const result = _remoteLifecycle.repair({
+        action: msg.action,
+        operationId: msg.operation_id,
+        sessionId: msg.session_id,
+        generationId: msg.generation_id,
+        expectedPhase: msg.expected_phase,
+        expectedSequence: msg.expected_sequence,
+        evidenceClass: msg.evidence_class,
+        ...(msg.consumer_id ? { consumerId: msg.consumer_id } : {}),
+        ...(msg.lane_id ? { laneId: msg.lane_id } : {}),
+        ...(msg.evidence_entry_id ? { evidenceEntryId: msg.evidence_entry_id } : {}),
+      });
+      sender.send({
+        type: "lifecycle_repair",
+        in_reply_to: msg.id,
+        disposition: result.disposition,
+        ...(result.disposition === "applied"
+          ? { action: result.action, operation_id: result.operationId, generation_id: result.generationId }
+          : { code: result.code, ...(result.generationId ? { generation_id: result.generationId } : {}), ...(result.sequence === undefined ? {} : { sequence: result.sequence }) }),
+      });
+    } catch (error) {
+      sender.send({ type: "lifecycle_repair", in_reply_to: msg.id, disposition: "rejected", code: error instanceof Error ? error.message : String(error) });
     }
     return;
   }
@@ -4267,14 +4528,6 @@ export function _routeClientMessageFrom(
     // null or a narrower Pick than the handlers want, so we cast to
     // `ActionCtx` — fields that aren't present at runtime are surfaced
     // as `action_error` by the handlers, not as a TypeError.
-    case "session_compact":
-      // Route through _lastEventCtx (refreshed on every session_start), NOT the
-      // capturable-stale _lastCtx — compact must never hit a ctx left stale by
-      // a prior New session. compact() is a base-ctx method, so the
-      // session_start ctx suffices. Fall back to _lastCtx defensively if no
-      // session_start has landed yet (keeps the pre-replacement happy path).
-      handleSessionCompact((_lastEventCtx ?? _lastCtx) as ActionCtx | null, sender, msg);
-      break;
     case "session_new": {
       const actionCtx = _lastCtx as ActionCtx | null;
       if (process.env["REMOTE_PI_DAEMON"] === "1" && !actionCtx?.newSession) {
