@@ -1,5 +1,7 @@
 import { describe, expect, test } from "vitest";
 import type { CompactDisposition, DiagnosticRecord, LifecycleEvent, RepairDisposition, RepairRequest, Snapshot } from "@yourdigitaltoolbox/pi-context-lifecycle";
+import { handleSessionCompact } from "../actions/handlers.js";
+import type { ServerMessage } from "../protocol/types.js";
 import { RemoteLifecycleController, type LifecycleAuthority } from "./remote_lifecycle.js";
 
 function snapshot(overrides: Partial<Snapshot> = {}): Snapshot {
@@ -52,9 +54,27 @@ describe("RemoteLifecycleController", () => {
     const controller = new RemoteLifecycleController((event) => events.push(event), controlled.value);
     controller.bind("session-a");
 
-    expect(controller.request("request-a")).toMatchObject({ disposition: "accepted", operationId: "operation-a" });
+    const replies: ServerMessage[] = [];
+    // This is the authenticated paired-action handler's production boundary:
+    // only the server-side controller adds the lifecycle attestation.
+    handleSessionCompact(controller, { send: (message) => replies.push(message) }, { type: "session_compact", id: "request-a" });
+    expect(replies).toEqual([{
+      type: "action_ok",
+      in_reply_to: "request-a",
+      action: "session_compact",
+      operation_id: "operation-a",
+      generation_id: "generation-a",
+      disposition: "accepted",
+    }]);
     expect(controlled.requests).toEqual([{
-      requestId: "request-a", sessionId: "session-a", generationId: "generation-a", reason: "remote", source: "remote-pi-action",
+      requestId: "request-a",
+      sessionId: "session-a",
+      generationId: "generation-a",
+      reason: "remote",
+      source: "remote-pi-action",
+      actor: "operator",
+      channel: "remote",
+      settlementPolicy: "current-or-next-settled-boundary",
     }]);
     controlled.setResult({ disposition: "joined", operationId: "operation-a", generationId: "generation-a" });
     expect(controller.request("request-b")).toMatchObject({ disposition: "joined" });

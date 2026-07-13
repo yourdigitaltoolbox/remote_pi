@@ -91,6 +91,9 @@ export class RemoteLifecycleController {
       generationId: snapshot.generationId,
       reason: "remote",
       source: "remote-pi-action",
+      actor: "operator",
+      channel: "remote",
+      settlementPolicy: "current-or-next-settled-boundary",
     });
     if (result.disposition === "accepted" || result.disposition === "joined") {
       this.activeOperationId = result.operationId;

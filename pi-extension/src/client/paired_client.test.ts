@@ -107,6 +107,10 @@ describe("PairedClient", () => {
       } else if (message.type === "lifecycle_status") {
         send({ type: "lifecycle_status", in_reply_to: message.id, snapshot: { registry_state: "ready", sequence: 8, session_id: "session", generation_id: "generation", phase: "blocked-unknown", operation_id: "operation" }, diagnostics: [] });
       } else if (message.type === "session_compact") {
+        // The public paired-client wire remains minimal. The fixed lifecycle
+        // adapter attestation belongs only to the authenticated Remote Pi
+        // server path, never to caller-controlled client input.
+        expect(message).toEqual({ type: "session_compact", id: expect.any(String) });
         send({ type: "action_ok", in_reply_to: message.id, action: "session_compact", disposition: "accepted", operation_id: "operation", generation_id: "generation" });
         send({ type: "lifecycle_outcome", operation_id: "operation", session_id: "session", generation_id: "generation", outcome: "completed" });
       } else if (message.type === "lifecycle_repair") {
