@@ -177,6 +177,14 @@ interactive loop), so the app exposes only the actions that have a clean
 SDK call. The [`pi-telegram`](https://github.com/llblab/pi-telegram) adapter
 follows the same pattern.
 
+### Archive candidate testing
+
+Reviewed lifecycle candidates can import the package-only `remote-pi/testing`
+subpath and call `createExactCandidateProbe({ session, seed, packageDirectory })`.
+The seam accepts only opaque compact-action and mesh-arrival identifiers, drives
+the production action/admission paths, and returns immutable opaque receipts.
+It neither opens a relay nor reads or changes a live Pi profile.
+
 ### Images
 
 The app can attach **one image** (camera or gallery) to a message. It's

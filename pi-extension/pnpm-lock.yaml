@@ -28,8 +28,8 @@ importers:
         specifier: ^3.1.0
         version: 3.1.0
       '@yourdigitaltoolbox/pi-context-lifecycle':
-        specifier: github:yourdigitaltoolbox/pi-context-lifecycle#a140cd4405761c1d33c16576414cfbf238ed1643
-        version: https://codeload.github.com/yourdigitaltoolbox/pi-context-lifecycle/tar.gz/a140cd4405761c1d33c16576414cfbf238ed1643(@earendil-works/pi-ai@0.80.6(@modelcontextprotocol/sdk@1.29.0(zod@4.4.3))(ws@8.21.0)(zod@4.4.3))(@earendil-works/pi-coding-agent@0.80.6(@modelcontextprotocol/sdk@1.29.0(zod@4.4.3))(ws@8.21.0)(zod@4.4.3))
+        specifier: github:yourdigitaltoolbox/pi-context-lifecycle#7ea5301120702bd896f4872fae7c078c1ee72bc7
+        version: https://codeload.github.com/yourdigitaltoolbox/pi-context-lifecycle/tar.gz/7ea5301120702bd896f4872fae7c078c1ee72bc7(@earendil-works/pi-ai@0.80.6(@modelcontextprotocol/sdk@1.29.0(zod@4.4.3))(ws@8.21.0)(zod@4.4.3))(@earendil-works/pi-coding-agent@0.80.6(@modelcontextprotocol/sdk@1.29.0(zod@4.4.3))(ws@8.21.0)(zod@4.4.3))
       croner:
         specifier: ^10.0.1
         version: 10.0.1
@@ -774,8 +774,8 @@ packages:
   '@vitest/utils@4.1.9':
     resolution: {integrity: sha512-A51o8ymO5PpqlWNnBP9ZHPXDIpuMtTLlGSjN7la4US+LJzoUMyhwjA5QXlm39JexgwHKW4Xjs8Z2d3dLCXOeuA==}
 
-  '@yourdigitaltoolbox/pi-context-lifecycle@https://codeload.github.com/yourdigitaltoolbox/pi-context-lifecycle/tar.gz/a140cd4405761c1d33c16576414cfbf238ed1643':
-    resolution: {tarball: https://codeload.github.com/yourdigitaltoolbox/pi-context-lifecycle/tar.gz/a140cd4405761c1d33c16576414cfbf238ed1643}
+  '@yourdigitaltoolbox/pi-context-lifecycle@https://codeload.github.com/yourdigitaltoolbox/pi-context-lifecycle/tar.gz/7ea5301120702bd896f4872fae7c078c1ee72bc7':
+    resolution: {tarball: https://codeload.github.com/yourdigitaltoolbox/pi-context-lifecycle/tar.gz/7ea5301120702bd896f4872fae7c078c1ee72bc7}
     version: 0.1.0
     engines: {node: '>=22.19.0'}
     peerDependencies:
@@ -2400,7 +2400,7 @@ snapshots:
       convert-source-map: 2.0.0
       tinyrainbow: 3.1.0
 
-  '@yourdigitaltoolbox/pi-context-lifecycle@https://codeload.github.com/yourdigitaltoolbox/pi-context-lifecycle/tar.gz/a140cd4405761c1d33c16576414cfbf238ed1643(@earendil-works/pi-ai@0.80.6(@modelcontextprotocol/sdk@1.29.0(zod@4.4.3))(ws@8.21.0)(zod@4.4.3))(@earendil-works/pi-coding-agent@0.80.6(@modelcontextprotocol/sdk@1.29.0(zod@4.4.3))(ws@8.21.0)(zod@4.4.3))':
+  '@yourdigitaltoolbox/pi-context-lifecycle@https://codeload.github.com/yourdigitaltoolbox/pi-context-lifecycle/tar.gz/7ea5301120702bd896f4872fae7c078c1ee72bc7(@earendil-works/pi-ai@0.80.6(@modelcontextprotocol/sdk@1.29.0(zod@4.4.3))(ws@8.21.0)(zod@4.4.3))(@earendil-works/pi-coding-agent@0.80.6(@modelcontextprotocol/sdk@1.29.0(zod@4.4.3))(ws@8.21.0)(zod@4.4.3))':
     dependencies:
       '@earendil-works/pi-ai': 0.80.6(@modelcontextprotocol/sdk@1.29.0(zod@4.4.3))(ws@8.21.0)(zod@4.4.3)
       '@earendil-works/pi-coding-agent': 0.80.6(@modelcontextprotocol/sdk@1.29.0(zod@4.4.3))(ws@8.21.0)(zod@4.4.3)
