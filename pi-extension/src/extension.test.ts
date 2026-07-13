@@ -2890,6 +2890,61 @@ describe("session_shutdown teardown", () => {
     expect(_getState()).toBe("idle");         // never transitioned to "started"
   });
 
+  test("all-producers compaction/reload interleaving leaves an old root action inert (no stale status ctx or second relay start)", async () => {
+    // This models the archive race: Remote Pi is still awaiting relay setup
+    // while lifecycle compaction triggers a session replacement/reload. A host
+    // that reuses the module clears `_disposed` at session_start, so the old
+    // root action must additionally be fenced by its captured session epoch.
+    const cwd = mkdtempSync(join(tmpdir(), "remote-pi-stale-root-"));
+    const previousDirectConfig = process.env["REMOTE_PI_DIRECT_CONFIG"];
+    process.env["REMOTE_PI_DIRECT_CONFIG"] = JSON.stringify({
+      agent_name: "archive-race", auto_start_relay: true,
+    });
+    let releaseConnect!: () => void;
+    _defaultConnectImpl = () => new Promise<void>((resolve) => { releaseConnect = resolve; });
+    let stale = false;
+    const ui = { notify: vi.fn() };
+    const oldCtx = {
+      get ui() {
+        if (stale) throw new Error("stale command context dereferenced");
+        return ui;
+      },
+      cwd,
+      abort: vi.fn(),
+      sessionManager: { getSessionId: () => testSessionId(cwd) },
+    } as ReturnType<typeof makeMockCtx>;
+
+    try {
+      // The regular archive runtime obtains this from its session_start ctx;
+      // seed the same stable identity for this isolated command-handler test.
+      _seedRuntimeIdentityForTest(oldCtx);
+      const root = captureHandler("remote-pi");
+      const oldRoot = root("", oldCtx);
+      await vi.waitFor(() => expect(relayRef.current).not.toBeNull());
+      const oldRelay = relayRef.current!;
+
+      // A compaction is in progress when Pi replaces the session. The mesh
+      // producer is represented by the held relay-start action; replacement
+      // must not let it resume and publish status through the old ctx.
+      captureEventHandler("session_before_compact")({ type: "session_before_compact" });
+      stale = true;
+      await captureEventHandler("session_shutdown")({ type: "session_shutdown", reason: "reload" });
+      captureEventHandler("session_start")(
+        { type: "session_start" },
+        { ui: { notify: vi.fn() }, cwd: mkdtempSync(join(tmpdir(), "remote-pi-fresh-root-")), abort: vi.fn(), compact: vi.fn() },
+      );
+
+      releaseConnect();
+      await expect(oldRoot).resolves.toBeUndefined();
+      expect(oldRelay.close).toHaveBeenCalledTimes(1);
+      expect(relayInstances).toHaveLength(1); // old action never starts a replacement relay
+    } finally {
+      if (previousDirectConfig === undefined) delete process.env["REMOTE_PI_DIRECT_CONFIG"];
+      else process.env["REMOTE_PI_DIRECT_CONFIG"] = previousDirectConfig;
+      rmSync(cwd, { recursive: true, force: true });
+    }
+  });
+
   test("after a clean reset, connect works again (flag is per-instance, not sticky)", async () => {
     // beforeEach already reset _disposed → a fresh connect must join the mesh.
     captureHandler("remote-pi");

@@ -224,6 +224,14 @@ let _sessionPeerCount = 0;
 // re-evaluates the module on every session replacement), so the replacement
 // instance starts fresh with `_disposed = false`.
 let _disposed = false;
+// Monotonically invalidates async command work across a session replacement.
+// A host may reuse this module instance and clear `_disposed` at the next
+// session_start while an old `_cmdRoot` is still awaiting mesh/relay setup.
+// That old continuation must not resume against its stale command context.
+let _sessionActionEpoch = 0;
+function _isCurrentSessionAction(epoch: number): boolean {
+  return !_disposed && epoch === _sessionActionEpoch;
+}
 // True once the auto-init has run on the first session_start for this
 // process. Prevents re-running on session replacements (those re-init via
 // the _disposed re-arm path above). The session_start handler below auto-starts
@@ -2095,6 +2103,10 @@ const extension: ExtensionFactory = (pi: ExtensionAPI): void => {
   // New session. Fires on startup/new/fork/reload/resume; the ctx is always
   // bound to the current session.
   pi.on("session_start", (_event, ctx) => {
+    // Invalidate any async command action that captured the outgoing session's
+    // ctx. A reused module clears `_disposed` below, so `_disposed` alone is
+    // not sufficient to distinguish the old continuation from this fresh ctx.
+    _sessionActionEpoch += 1;
     _lastEventCtx = ctx;
     if ("cwd" in ctx && typeof ctx.cwd === "string") _sessionCwd = ctx.cwd;
     const sessionId = _sessionIdFromContext(ctx);
@@ -2195,6 +2207,9 @@ const extension: ExtensionFactory = (pi: ExtensionAPI): void => {
   // best-effort: every step is guarded so a partially-initialised instance
   // (e.g. shutdown lands mid-`_cmdRoot`) tears down without throwing.
   pi.on("session_shutdown", async () => {
+    // Invalidate captured command actions before teardown. This remains needed
+    // even when the host reuses the module and later clears `_disposed`.
+    _sessionActionEpoch += 1;
     // Mark disposed FIRST so an in-flight `_cmdRoot`/`_cmdJoin` (the deferred
     // daemon connect) aborts instead of finishing as a ghost after we've torn
     // down — the race that left a mute `Backoffice` behind when the Cockpit
@@ -2600,7 +2615,8 @@ async function _cmdRoot(ctx: Pick<ExtensionContext, "ui" | "cwd">): Promise<void
   // This instance was torn down (session replacement) before its deferred
   // auto-init ran — don't connect, or we'd resurrect a ghost the broker can't
   // reach. The replacement instance (fresh module) drives the live connect.
-  if (_disposed) return;
+  const actionEpoch = _sessionActionEpoch;
+  if (!_isCurrentSessionAction(actionEpoch)) return;
 
   const cwd = "cwd" in ctx ? (ctx as ExtensionCommandContext).cwd : process.cwd();
   const exposure = _sessionExposure(cwd);
@@ -2612,12 +2628,14 @@ async function _cmdRoot(ctx: Pick<ExtensionContext, "ui" | "cwd">): Promise<void
   // identity. It can join the local mesh with runtime/default naming even when
   // this cwd has no remote-pi config yet.
   if (!localConfigExists(cwd) && isChildSession(exposure)) {
-    if (exposure.mode !== "off" && !_meshNode) await _cmdJoin(ctx);
+    if (exposure.mode !== "off" && !_meshNode) await _cmdJoin(ctx, actionEpoch);
+    if (!_isCurrentSessionAction(actionEpoch)) return;
     if (exposure.classification === "child_current"
       && exposure.requestedMode === "relay"
       && _state === "idle") {
-      await _cmdStart(ctx);
+      await _cmdStart(ctx, {}, actionEpoch);
     }
+    if (!_isCurrentSessionAction(actionEpoch)) return;
     _cmdStatus(ctx);
     return;
   }
@@ -2634,6 +2652,7 @@ async function _cmdRoot(ctx: Pick<ExtensionContext, "ui" | "cwd">): Promise<void
       agent_name: baseDefault,
       use_relay: true,
     });
+    if (!_isCurrentSessionAction(actionEpoch)) return;
     if (!newConfig) {
       ctx.ui.notify("[remote-pi] Setup cancelled.", "info");
       return;
@@ -2653,8 +2672,10 @@ async function _cmdRoot(ctx: Pick<ExtensionContext, "ui" | "cwd">): Promise<void
       `[remote-pi] Config saved to ${cwd}/.pi/remote-pi/config.json`,
       "info",
     );
-    await _cmdJoin(ctx);
-    if (effectiveAutoStartRelay(newConfig)) await _cmdStart(ctx);
+    await _cmdJoin(ctx, actionEpoch);
+    if (!_isCurrentSessionAction(actionEpoch)) return;
+    if (effectiveAutoStartRelay(newConfig)) await _cmdStart(ctx, {}, actionEpoch);
+    if (!_isCurrentSessionAction(actionEpoch)) return;
     _cmdStatus(ctx);
     return;
   }
@@ -2669,16 +2690,17 @@ async function _cmdRoot(ctx: Pick<ExtensionContext, "ui" | "cwd">): Promise<void
     _cmdStatus(ctx);
     return;
   }
-  if (!_meshNode) await _cmdJoin(ctx);
+  if (!_meshNode) await _cmdJoin(ctx, actionEpoch);
   // `_cmdJoin` aborts cleanly when a `session_shutdown` lands mid-connect, but
   // returns void — so recheck here before bringing the relay up, or we'd start
   // a ghost relay connection on an already-disposed instance (the replacement
   // instance owns the live connect).
-  if (_disposed) return;
+  if (!_isCurrentSessionAction(actionEpoch)) return;
   const shouldStartRelay = isChildSession(exposure)
     ? exposure.classification === "child_current" && exposure.requestedMode === "relay"
     : exposure.mode === "relay" && effectiveAutoStartRelay(config);
-  if (shouldStartRelay && _state === "idle") await _cmdStart(ctx);
+  if (shouldStartRelay && _state === "idle") await _cmdStart(ctx, {}, actionEpoch);
+  if (!_isCurrentSessionAction(actionEpoch)) return;
   _cmdStatus(ctx);
 }
 
@@ -2782,6 +2804,7 @@ interface RelayStartOptions {
 async function _cmdStart(
   ctx: Pick<ExtensionContext, "ui" | "cwd">,
   options: RelayStartOptions = {},
+  actionEpoch = _sessionActionEpoch,
 ): Promise<boolean> {
   const cwd = "cwd" in ctx ? (ctx as ExtensionCommandContext).cwd : process.cwd();
   const exposure = _sessionExposure(cwd);
@@ -2800,6 +2823,7 @@ async function _cmdStart(
       childLease = options.preactivatedLease;
     } else {
       const activation = await _activateCurrentChildRelay(exposure);
+      if (actionEpoch !== _sessionActionEpoch) return false;
       if (!activation.ok) {
         ctx.ui.notify(
           `[remote-pi] Relay denied for ${exposure.classification}; child remains ${exposure.mode} (source: ${exposure.source}, lease: ${activation.reason}).`,
@@ -2822,6 +2846,7 @@ async function _cmdStart(
   try {
     edKp = await getOrCreateEd25519Keypair();
   } catch (err) {
+    if (actionEpoch !== _sessionActionEpoch) return false;
     if (err instanceof KeyringUnavailableError) {
       // The platform keyring (macOS Keychain / Windows Credential Manager) is
       // locked/denied and there's no file identity to fall back to. We refuse
@@ -2839,6 +2864,7 @@ async function _cmdStart(
     }
     throw err;
   }
+  if (actionEpoch !== _sessionActionEpoch) return false;
   _cachedEd25519 = edKp;
 
   const { url: relayUrl, source } = resolveRelayUrl();
@@ -2936,7 +2962,7 @@ async function _cmdStart(
   // instance's own connect is refused with `room_already_open` — the agent never enters
   // the cross-PC mesh. Close the fresh relay and bail; the replacement instance
   // (fresh module) drives the real connect. Mirrors the `_cmdJoin` guard.
-  if (_disposed
+  if (!_isCurrentSessionAction(actionEpoch)
     || (childLease !== null
       && (!_relayExposureLease || !_relayExposureLeaseCoversSnapshot(_relayExposureLease, childLease)))) {
     try { relay.close(); } catch { /* best-effort */ }
@@ -4029,7 +4055,10 @@ function _submitMeshSpoolBatch(sessionId: string, lane: MeshLane, envelopes: rea
  * longer user-configurable: every Pi on the same machine joins the same
  * broker.
  */
-async function _cmdJoin(ctx: Pick<ExtensionContext, "ui" | "cwd">): Promise<void> {
+async function _cmdJoin(
+  ctx: Pick<ExtensionContext, "ui" | "cwd">,
+  actionEpoch = _sessionActionEpoch,
+): Promise<void> {
   const cwd = "cwd" in ctx ? (ctx as ExtensionCommandContext).cwd : process.cwd();
   const local = loadLocalConfig(cwd);
   const exposure = _sessionExposure(cwd);
@@ -4168,7 +4197,7 @@ async function _cmdJoin(ctx: Pick<ExtensionContext, "ui" | "cwd">): Promise<void
     // in flight (the broker now has us registered, but this instance is being
     // discarded). Leave immediately instead of publishing a ghost peer that
     // the replacement instance would then collide with as `name#2`.
-    if (_disposed || !_runtimeEpochFence.isCurrent(identity)) {
+    if (!_isCurrentSessionAction(actionEpoch) || !_runtimeEpochFence.isCurrent(identity)) {
       try { await peer.close(); } catch { /* best-effort */ }
       return;
     }
