@@ -2486,11 +2486,17 @@ function _cmdStatus(ctx: Pick<ExtensionContext, "ui"> & Partial<Pick<ExtensionCo
   const cwd = ctx.cwd ?? process.cwd();
   const exposure = _sessionExposure(cwd);
 
-  // Mesh line
+  // Mesh line. Show the durable identity route (the stable "id under the hood")
+  // ABOVE the pretty display name, so the name can be renamed freely while the
+  // id that peers actually address stays visible and constant.
   let meshLine: string;
   if (_meshNode) {
     const name = _meshNode.name();
-    meshLine = `🟢 Local mesh: connected as "${name}" (${_sessionPeerCount} peer${_sessionPeerCount === 1 ? "" : "s"})`;
+    const route = _meshNode.address();
+    meshLine =
+      `🟢 Local mesh: connected (${_sessionPeerCount} peer${_sessionPeerCount === 1 ? "" : "s"})`
+      + `\n     id:   ${route}`
+      + `\n     name: "${name}"`;
   } else {
     meshLine = "⚪ Local mesh: not connected";
   }
@@ -4997,27 +5003,35 @@ async function _cmdClaudeCli(args: string[]): Promise<void> {
   // flag's value (e.g. the id in `--resume <id>`) for the cwd.
   const hasCwdArg = args.length > 0 && !args[0]!.startsWith("-");
   const targetCwd = hasCwdArg ? args[0]! : process.cwd();
-  const passthroughArgs = hasCwdArg ? args.slice(1) : args;
+  const rest = hasCwdArg ? args.slice(1) : args;
 
-  // Wizard when no local config exists
-  if (!localConfigExists(targetCwd)) {
-    const suggested = defaultAgentName(targetCwd);
-    process.stdout.write(`\n[remote-pi] No config found for ${targetCwd}\n`);
-    process.stdout.write("Let's set up this agent.\n\n");
-
-    const rl = createInterface({ input: process.stdin, output: process.stdout });
-    const agentName: string = await new Promise((res) =>
-      rl.question(`Agent name [${suggested}]: `, (ans) => { rl.close(); res(ans.trim() || suggested); }),
-    );
-
-    const inspection = inspectLocalConfig(targetCwd);
-    saveLocalConfig(targetCwd, { agent_name: agentName, auto_start_relay: true }, {
-      expectedRevision: inspection.revision,
-      expectedState: inspection.state,
-      expectedHash: "hash" in inspection ? inspection.hash ?? null : null,
-    });
-    process.stdout.write(`[remote-pi] Config saved: agent="${agentName}"\n\n`);
+  // Pull our own `--agent-name <name>` out of the args (consumed here, NOT
+  // forwarded to the `claude` binary). Everything else passes through verbatim.
+  let explicitName: string | undefined;
+  const passthroughArgs: string[] = [];
+  for (let i = 0; i < rest.length; i++) {
+    if (rest[i] === "--agent-name" && rest[i + 1] !== undefined) { explicitName = rest[++i]; }
+    else passthroughArgs.push(rest[i]!);
   }
+
+  // Per-session mesh name, resolved ONCE here and exported to the child via
+  // REMOTE_PI_MCP_NAME so it stays stable across this session's /mcp reconnects
+  // (every mesh-server respawn inherits the env). Deliberately independent of any
+  // per-folder config: many agents run from one root, so a folder-derived name
+  // would make them collide. Precedence: explicit flag → cmux tab id → random.
+  const _shortId = (s: string) => s.replace(/[^A-Za-z0-9]/g, "").slice(0, 8);
+  // One stable per-session key drives BOTH the durable identity (agentId, derived
+  // in mesh_server from REMOTE_PI_SESSION_KEY) and the default display name — so
+  // the identity/lock and the auto name stay stable across /mcp reconnects.
+  const sessionKey = process.env["CMUX_PANEL_ID"] ?? randomUUID();
+  const meshName = explicitName ?? `agent-${_shortId(sessionKey)}`;
+
+  // No per-folder config wizard: an agent's mesh name is now per-session (see
+  // `meshName` above), not read from a shared folder config. Running many agents
+  // from one root is a first-class case, so we don't prompt for or write a
+  // folder-scoped `agent_name`. Set an explicit name with `--agent-name "X"`
+  // (or the REMOTE_PI_MCP_NAME env), or rename at runtime via `remote-pi rename`.
+  process.stdout.write(`\n[remote-pi] launching as mesh agent "${meshName}"${explicitName ? "" : " (auto; pass --agent-name \"X\" to set one)"}\n\n`);
 
   // Resolve mesh server script path (dist/mcp/mesh_server.js)
   const here = fileURLToPath(import.meta.url);
@@ -5111,6 +5125,15 @@ async function _cmdClaudeCli(args: string[]): Promise<void> {
       cwd: absCwd,
       stdio: "inherit",
       shell: false,
+      env: {
+        ...process.env,
+        // Stable per-session name + identity key (both survive /mcp reconnects —
+        // the child respawns and re-inherits these) and an explicit "real mesh
+        // session" marker so the server joins even with no per-folder config.
+        REMOTE_PI_MCP_NAME: meshName,
+        REMOTE_PI_SESSION_KEY: sessionKey,
+        REMOTE_PI_MESH_SESSION: "1",
+      },
     });
   } finally {
     // Session over — drop the ephemeral config so it never lingers as a stray
