@@ -73,3 +73,24 @@ describe("parse rejects malformed envelopes", () => {
     expect(() => parse(JSON.stringify({ from: "a", to: "b", id: uuidv7(), re: null }))).toThrow(/body/);
   });
 });
+
+describe("deliveryReceipt interop marker (context-lifecycle lineage)", () => {
+  test("parse preserves { required: true } round-trip", () => {
+    const env = { ...envelope("orq", "backend", { q: 1 }), deliveryReceipt: { required: true as const } };
+    const parsed = parse(serialize(env).trim());
+    expect(parsed.deliveryReceipt).toEqual({ required: true });
+  });
+
+  test("parse of a plain envelope leaves deliveryReceipt absent", () => {
+    const parsed = parse(serialize(envelope("orq", "backend", { q: 1 })).trim());
+    expect("deliveryReceipt" in parsed).toBe(false);
+  });
+
+  test("parse rejects a malformed deliveryReceipt", () => {
+    const base = { from: "a", to: "b", id: uuidv7(), re: null, body: 1 };
+    expect(() => parse(JSON.stringify({ ...base, deliveryReceipt: { required: false } }))).toThrow(/deliveryReceipt/);
+    expect(() => parse(JSON.stringify({ ...base, deliveryReceipt: "yes" }))).toThrow(/deliveryReceipt/);
+    expect(() => parse(JSON.stringify({ ...base, deliveryReceipt: [] }))).toThrow(/deliveryReceipt/);
+    expect(() => parse(JSON.stringify({ ...base, deliveryReceipt: null }))).toThrow(/deliveryReceipt/);
+  });
+});

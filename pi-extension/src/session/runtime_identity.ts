@@ -32,7 +32,7 @@ export type RuntimeIdentityResolution =
 
 const UUID_PATTERN = /^[0-9a-f]{8}-[0-9a-f]{4}-[1-5][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i;
 
-function uuidFromStableText(domain: string, value: string): string {
+export function uuidFromStableText(domain: string, value: string): string {
   const bytes = createHash("sha256").update(domain).update("\0").update(value).digest().subarray(0, 16);
   bytes[6] = (bytes[6]! & 0x0f) | 0x50;
   bytes[8] = (bytes[8]! & 0x3f) | 0x80;
