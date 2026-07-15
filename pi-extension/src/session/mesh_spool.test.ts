@@ -245,6 +245,34 @@ describe("MeshSpool", () => {
     expect(attempts[1]!.submissionId).not.toBe(attempts[0]!.submissionId);
   });
 
+  test("does not requeue a fresh lifecycle release batch started during the same settled event", () => {
+    const controlled = fakeAuthority(snapshot({ phase: "idle" }));
+    let runtimeIdle = true;
+    let attempt!: { submissionId: string; generationId: string; ids: string[] };
+    const states: string[] = [];
+    const spool = new MeshSpool({
+      mode: "managed",
+      getSessionId: () => "session-a",
+      isRuntimeIdle: () => runtimeIdle,
+      authority: controlled.authority,
+      submit: (_lane, values, submissionId, generationId) => {
+        attempt = { submissionId, generationId, ids: values.map((value) => value.id) };
+        // The SDK synchronously starts the release batch's own model turn.
+        runtimeIdle = false;
+        return true;
+      },
+      persist: (event) => states.push(event.state),
+    });
+    expect(spool.accept(message({ released: "during-agent-settled" }))).toEqual({ status: "received" });
+    expect(states).toEqual(["held", "submitting"]);
+
+    spool.retryUnproved();
+    expect(states).toEqual(["held", "submitting"]);
+    expect(spool.counts().unsolicited).toBe(1);
+    expect(spool.confirmSubmission({ ...attempt, envelopeIds: attempt.ids })).toBe(true);
+    expect(spool.counts().unsolicited).toBe(0);
+  });
+
   test("durable proof prevents duplicate delivery even if the advisory terminal marker fails", () => {
     const controlled = fakeAuthority(snapshot({ phase: "idle" }));
     let attempt!: { submissionId: string; generationId: string; ids: string[] };

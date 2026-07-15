@@ -238,8 +238,12 @@ export class MeshSpool {
     return true;
   }
 
-  /** Return every proofless attempt to retained state at a genuine settlement. */
+  /** Return every proofless attempt to retained state at a genuine idle settlement. */
   retryUnproved(): void {
+    // Another lifecycle listener may start a release batch during the same
+    // agent_settled event. Its new turn makes Pi non-idle; do not misclassify
+    // that fresh dispatch as an unproved attempt from the run that just ended.
+    if (!this.runtimeIdle()) return;
     for (const lane of ["mesh-reply", "mesh-unsolicited"] as const) {
       const batch = this.dispatching[lane];
       if (!batch) continue;
