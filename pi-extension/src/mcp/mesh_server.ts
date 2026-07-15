@@ -201,8 +201,27 @@ mcp.registerTool("list_peers", {
 }, async () => {
   if (!meshReady) return notReady();
   try {
-    const peers = await mesh.listPeers();
-    return { content: [{ type: "text" as const, text: peers.length > 0 ? peers.join("\n") : "(no peers)" }] };
+    // Render the display-name label alongside each stable identity route so an
+    // operator can tell peers apart without a separate probe. The `route` stays
+    // the verbatim echo-safe key; `alias` is the diagnostic cwd/name route. A
+    // peer with no structured detail (legacy/mixed sibling) falls back to its
+    // bare route rather than being dropped.
+    const { routes, detailed } = await mesh.listPeersDetailed();
+    const text = routes.length === 0
+      ? "(no peers)"
+      : routes.map((route) => {
+          const info = detailed.find((c) => (c.identityAddress ?? c.address) === route);
+          return info
+            ? JSON.stringify({
+                route,
+                name: info.name,
+                cwd: info.cwd,
+                ...(info.pc ? { pc: info.pc } : {}),
+                ...(info.identityAddress ? { alias: info.address } : {}),
+              })
+            : route;
+        }).join("\n");
+    return { content: [{ type: "text" as const, text }] };
   } catch (e) {
     return { content: [{ type: "text" as const, text: `list_peers failed: ${String(e)}` }], isError: true };
   }
@@ -328,6 +347,18 @@ async function main(): Promise<void> {
       at: isoNow(),
     };
     inbox.push(msg);
+    // Interop with the context-lifecycle broker (8886c66 lineage): it withholds
+    // the sender's `received` ACK until the target confirms retention with a
+    // `mesh_delivery_receipt`, and reports `denied` after its window otherwise.
+    // The MCP inbox buffers unconditionally, so retention is already true here —
+    // confirm it, or every send from a lifecycle peer to this agent false-denies.
+    if (env.deliveryReceipt?.required) {
+      void mesh.send("broker", {
+        type: "mesh_delivery_receipt",
+        envelopeId: env.id,
+        status: "received",
+      }).catch(() => { /* sender sees timeout/denied; never forge a receipt */ });
+    }
     // Push via claude/channel so Claude wakes immediately (when the session
     // was launched with --dangerously-load-development-channels server:remote-pi-mesh).
     void mcp.server.notification({

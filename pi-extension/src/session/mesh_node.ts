@@ -1,6 +1,6 @@
 import { SessionPeer, type AckResult, type SessionPeerOptions } from "./peer.js";
 import type { Envelope } from "./envelope.js";
-import type { Broker } from "./broker.js";
+import type { Broker, PeerInfo } from "./broker.js";
 import type { BrokerRemote } from "./broker_remote.js";
 import type { PiForwardClient } from "../transport/pi_forward_client.js";
 import { RelayClient } from "../transport/relay_client.js";
@@ -398,6 +398,32 @@ export class MeshNode {
     const body = reply.body as { peers?: string[] } | null;
     // Peers are ADDRESSES now — filter self by address, not the clean name.
     return (body?.peers ?? []).filter((p) => p !== this.peer_.address());
+  }
+
+  /**
+   * Structured roster (plan/38) — the same peers as {@link listPeers} but each
+   * carrying the presentation `name`, `cwd`, optional cross-PC `pc`, and the
+   * cwd/name compatibility `address` alongside its stable identity route. Lets a
+   * client show a label next to the immutable id without parsing route strings.
+   *
+   * Returns both the flat `routes` (the authoritative echo-safe list, self
+   * excluded) and the `detailed` records aligned to them. A route with no
+   * matching detail — a legacy/mixed-version sibling that sent only flat
+   * `peers` — is still present in `routes`, so callers fall back to the bare
+   * route for it rather than dropping the peer.
+   */
+  async listPeersDetailed(
+    timeoutMs = 2_000,
+  ): Promise<{ routes: string[]; detailed: PeerInfo[] }> {
+    const reply = await this.peer_.request("broker", { type: "list_peers" }, timeoutMs);
+    const body = reply.body as { peers?: string[]; peers_detailed?: PeerInfo[] } | null;
+    const self = this.peer_.address();
+    const routes = (body?.peers ?? []).filter((p) => p !== self);
+    const detailed = (body?.peers_detailed ?? []).filter((info) => {
+      const route = info.identityAddress ?? info.address;
+      return route !== self && routes.includes(route);
+    });
+    return { routes, detailed };
   }
 
   /** Tear down the bridge (if any) and leave the mesh. */
