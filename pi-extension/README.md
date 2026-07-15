@@ -217,10 +217,14 @@ const result = await mesh.agentSend(orchestratorRoute, { decisionId, response })
 if (result.status !== "received") throw new Error(`decision not delivered: ${result.status}`);
 ```
 
-Select a target by exact `workspaceId` + `agentId` in `detailed`, then echo its
-broker-owned `identityAddress` (or legacy `address`) verbatim. Never construct
-or parse routes. Only `received` is a positive target-retention ACK; `busy`,
-`denied`, and `timeout` are non-delivery.
+Authority-bearing clients such as the orchestration dashboard must select
+exactly one target by `workspaceId` + `agentId` in `detailed`, require its
+broker-returned `identityAddress` to be non-empty, and echo that value verbatim.
+Absence or ambiguity fails closed: never fall back to `address`, display name,
+aliases, the flat `routes` list, route construction, or route parsing. Generic
+non-authority clients may still use broker-returned `routes`/`address` for
+legacy interoperability. Only `received` is a positive target-retention ACK;
+`busy`, `denied`, and `timeout` are non-delivery.
 
 The v1 facade is intentionally outbound-only. It exposes no `Broker`,
 `SessionPeer`, private storage, or inbound callback, and honestly denies inbound
