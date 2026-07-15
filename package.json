@@ -19,6 +19,23 @@
       "import": "./pi-extension/dist/client/mesh_client.js"
     }
   },
+  "files": [
+    "pi-extension/dist",
+    "pi-extension/package.json",
+    "README.md"
+  ],
+  "dependencies": {
+    "@earendil-works/pi-coding-agent": "^0.80.6",
+    "@modelcontextprotocol/sdk": "^1.29.0",
+    "@napi-rs/keyring": "^1.3.0",
+    "@noble/ed25519": "^3.1.0",
+    "@yourdigitaltoolbox/pi-context-lifecycle": "github:yourdigitaltoolbox/pi-context-lifecycle#a5fe93d85fa43ce1384894319771b7020bf582ca",
+    "croner": "^10.0.1",
+    "qrcode-terminal": "^0.12.0",
+    "typebox": "^1.1.38",
+    "ws": "^8.21.0",
+    "zod": "^4.4.3"
+  },
   "pi": {
     "extensions": [
       "./pi-extension/dist"
