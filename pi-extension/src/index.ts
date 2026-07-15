@@ -112,6 +112,7 @@ import { loadRemotePiPackageIdentity } from "./session/package_identity.js";
 import {
   EpochFence,
   resolveRuntimeIdentity,
+  rollRuntimeIdentity,
   type RuntimeIdentity,
   type RuntimePresentation,
 } from "./session/runtime_identity.js";
@@ -258,9 +259,11 @@ let _sessionClaim: Record<string, string | undefined> = {};
 const _loadedRemotePiIdentity = loadRemotePiPackageIdentity();
 
 // Immutable runtime identity is resolved once per Pi session/runtime
-// incarnation. A session resume keeps Pi's session id (and therefore agentId),
-// while a fresh extension runtime receives a new processEpoch. Presentation is
-// deliberately mutable and never participates in room/lock ownership.
+// incarnation. A session resume keeps Pi's session id and preferred agentId;
+// if another live process already owns that identity, only the normal-session
+// newcomer adopts one deterministic process-local alternate. A fresh extension
+// runtime receives a new processEpoch. Presentation is deliberately mutable and
+// never participates in room/lock ownership.
 let _runtimeIdentity: RuntimeIdentity | null = null;
 let _runtimePresentation: RuntimePresentation | null = null;
 let _runtimeSessionId: string | null = null;
@@ -289,6 +292,7 @@ const _remoteLifecycle = new RemoteLifecycleController((event) => {
 let _runtimeCwd: string | null = null;
 let _runtimeProcessEpoch = randomUUID();
 const _runtimeEpochFence = new EpochFence();
+let _meshJoinAttempt: { actionEpoch: number; promise: Promise<void> } | null = null;
 let _relayExposureLease: RelayExposureLease | null = null;
 
 function _sameRelayExposureBinding(
@@ -756,6 +760,7 @@ export function _getLockedNameForTest(): string | null { return _lockedName; }
 export function _getRuntimeIdentityForTest(): RuntimeIdentity | null {
   return _runtimeIdentity ? { ..._runtimeIdentity } : null;
 }
+export function _getRuntimeProcessEpochForTest(): string { return _runtimeProcessEpoch; }
 export function _getRuntimePresentationForTest(): string | null {
   return _runtimePresentation?.displayName ?? null;
 }
@@ -4096,6 +4101,24 @@ async function _cmdJoin(
   actionEpoch = _sessionActionEpoch,
 ): Promise<void> {
   if (!_isCurrentSessionAction(actionEpoch)) return;
+  const currentAttempt = _meshJoinAttempt;
+  if (currentAttempt?.actionEpoch === actionEpoch) return currentAttempt.promise;
+
+  const promise = _cmdJoinOnce(ctx, actionEpoch);
+  const attempt = { actionEpoch, promise };
+  _meshJoinAttempt = attempt;
+  try {
+    await promise;
+  } finally {
+    if (_meshJoinAttempt === attempt) _meshJoinAttempt = null;
+  }
+}
+
+async function _cmdJoinOnce(
+  ctx: Pick<ExtensionContext, "ui" | "cwd">,
+  actionEpoch: number,
+): Promise<void> {
+  if (!_isCurrentSessionAction(actionEpoch)) return;
   const cwd = "cwd" in ctx ? (ctx as ExtensionCommandContext).cwd : process.cwd();
   const local = loadLocalConfig(cwd);
   const exposure = _sessionExposure(cwd);
@@ -4112,15 +4135,19 @@ async function _cmdJoin(
     (piSessionName && sanitizeSegment(piSessionName))
     || local.agent_name
     || defaultAgentName(cwd);
-  const identity = _ensureRuntimeIdentity(cwd, exposure, requestedName, ctx);
+  let identity = _ensureRuntimeIdentity(cwd, exposure, requestedName, ctx);
   if (!identity) return;
 
-  // Singleton ownership is immutable-ID keyed. Two children with the same cwd
-  // and display name coexist because their agentIds differ; a duplicate
-  // logical ID fails before broker or relay mutation.
+  // Singleton ownership is immutable-ID keyed. Descriptor-backed children
+  // must retain their exact launcher identity and fail closed on collision.
+  // An ordinary Pi session, however, may be opened concurrently in two live
+  // processes. Preserve the existing owner and roll only the newcomer to a
+  // deterministic process-local agentId; broker duplicate rejection remains
+  // the defense-in-depth backstop.
   let lockForJoin = _cwdLock;
   if (lockForJoin === null) {
-    const result = await acquireIdentityLock(identity);
+    const preferredIdentity = identity;
+    let result = await acquireIdentityLock(identity);
     // This action can win the OS lock after a replacement has already begun.
     // Release only its local acquisition; never publish or clear the current
     // action's global lock and never dereference the outgoing command context.
@@ -4129,6 +4156,33 @@ async function _cmdJoin(
         try { result.release(); } catch { /* best effort */ }
       }
       return;
+    }
+    if (!result.ok && exposure.classification === "normal") {
+      if (_runtimeIdentity !== preferredIdentity || !_runtimeEpochFence.isCurrent(preferredIdentity)) return;
+      const rolledIdentity = rollRuntimeIdentity(preferredIdentity);
+      const rolledResult = await acquireIdentityLock(rolledIdentity);
+      if (!_isCurrentSessionAction(actionEpoch)
+        || _runtimeIdentity !== preferredIdentity
+        || !_runtimeEpochFence.isCurrent(preferredIdentity)) {
+        if (rolledResult.ok) {
+          try { rolledResult.release(); } catch { /* best effort */ }
+        }
+        return;
+      }
+      if (rolledResult.ok) {
+        // Publish the alternate only after this process owns its lock. A
+        // refused alternate leaves the preferred identity current so a later
+        // retry derives and attempts the same deterministic process-local ID.
+        _runtimeEpochFence.retire(preferredIdentity);
+        _runtimeIdentity = rolledIdentity;
+        _runtimeEpochFence.activate(rolledIdentity);
+        identity = rolledIdentity;
+        result = rolledResult;
+        ctx.ui.notify(
+          `[remote-pi] Preferred runtime identity ${preferredIdentity.agentId} was already active; rolled this process to ${identity.agentId}.`,
+          "warning",
+        );
+      }
     }
     if (!result.ok) {
       ctx.ui.notify(
