@@ -13,6 +13,12 @@
     "check:pi-extension": "npx --yes pnpm@10.26.1 --dir pi-extension typecheck && npx --yes pnpm@10.26.1 --dir pi-extension test && npx --yes pnpm@10.26.1 --dir pi-extension build",
     "smoke:pi-git-install": "node scripts/smoke-pi-git-install.mjs"
   },
+  "exports": {
+    "./mesh": {
+      "types": "./pi-extension/dist/client/mesh_client.d.ts",
+      "import": "./pi-extension/dist/client/mesh_client.js"
+    }
+  },
   "pi": {
     "extensions": [
       "./pi-extension/dist"

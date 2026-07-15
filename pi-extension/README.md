@@ -196,6 +196,38 @@ it does not read profiles or expose router, singleton, or test seams. See
 [`docs/PROTOCOL.md`](./docs/PROTOCOL.md) for lifecycle schemas, CAS/rejection,
 pairing authorization, and redaction requirements.
 
+### Public outbound mesh client
+
+A non-Pi Node service can join the real local/cross-PC mesh without importing
+private `dist/session/**` files through the supported `remote-pi/mesh` subpath:
+
+```ts
+import { MeshClient } from "remote-pi/mesh";
+
+const mesh = new MeshClient({
+  sockPath,
+  name: "orchestration-dashboard",
+  cwd,
+  identity: { workspaceId, agentId, processEpoch },
+  bridge: { relayUrl, cwd },
+});
+await mesh.connect();
+const { routes, detailed } = await mesh.listPeersDetailed();
+const result = await mesh.agentSend(orchestratorRoute, { decisionId, response });
+if (result.status !== "received") throw new Error(`decision not delivered: ${result.status}`);
+```
+
+Select a target by exact `workspaceId` + `agentId` in `detailed`, then echo its
+broker-owned `identityAddress` (or legacy `address`) verbatim. Never construct
+or parse routes. Only `received` is a positive target-retention ACK; `busy`,
+`denied`, and `timeout` are non-delivery.
+
+The v1 facade is intentionally outbound-only. It exposes no `Broker`,
+`SessionPeer`, private storage, or inbound callback, and honestly denies inbound
+acknowledged agent envelopes rather than accepting them without an application
+inbox. The repository-root Git bridge mirrors the same `./mesh` export so an
+exact-SHA dependency resolves the supported facade after its prepare build.
+
 ### Archive candidate testing
 
 Reviewed lifecycle candidates can import the package-only `remote-pi/testing`

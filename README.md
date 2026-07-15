@@ -107,7 +107,10 @@ pi install git:git@github.com:yourdigitaltoolbox/remote_pi@<full-40-character-sh
 
 Use only a reviewed full commit SHA. The bridge is not a global install and does
 not alter an existing live Pi profile outside the package target selected by the
-operator.
+operator. Exact-SHA Node consumers may also alias this Git dependency as
+`remote-pi` and import its supported `remote-pi/mesh` subpath; the root bridge
+maps that public export to the same prepared nested build documented in
+[`pi-extension/README.md`](./pi-extension/README.md).
 
 Then in the Pi chat, run:
 
