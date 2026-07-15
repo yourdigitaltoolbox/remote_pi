@@ -98,10 +98,14 @@ export function parse(line: string): Envelope {
     throw new EnvelopeError("body required");
   }
   const deliveryReceipt = o["deliveryReceipt"];
-  if (deliveryReceipt !== undefined
-    && (!deliveryReceipt || typeof deliveryReceipt !== "object" || Array.isArray(deliveryReceipt)
-      || (deliveryReceipt as Record<string, unknown>)["required"] !== true)) {
-    throw new EnvelopeError("deliveryReceipt must be { required: true }");
+  if (deliveryReceipt !== undefined) {
+    if (!deliveryReceipt || typeof deliveryReceipt !== "object" || Array.isArray(deliveryReceipt)) {
+      throw new EnvelopeError("deliveryReceipt must be exactly { required: true }");
+    }
+    const receipt = deliveryReceipt as Record<string, unknown>;
+    if (Object.keys(receipt).length !== 1 || receipt["required"] !== true) {
+      throw new EnvelopeError("deliveryReceipt must be exactly { required: true }");
+    }
   }
   return {
     from: o["from"] as string,

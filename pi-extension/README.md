@@ -198,8 +198,9 @@ pairing authorization, and redaction requirements.
 
 ### Public outbound mesh client
 
-A non-Pi Node service can join the real local/cross-PC mesh without importing
-private `dist/session/**` files through the supported `remote-pi/mesh` subpath:
+A non-Pi Node service can submit an authority-bearing message through the real
+local/cross-PC mesh without importing private `dist/session/**` files through
+the supported `remote-pi/mesh` subpath:
 
 ```ts
 import { MeshClient } from "remote-pi/mesh";
@@ -212,25 +213,34 @@ const mesh = new MeshClient({
   bridge: { relayUrl, cwd },
 });
 await mesh.connect();
-const { routes, detailed } = await mesh.listPeersDetailed();
-const result = await mesh.agentSend(orchestratorRoute, { decisionId, response });
+const orchestrator = await mesh.resolveIdentityTarget({
+  workspaceId: orchestratorWorkspaceId,
+  agentId: orchestratorAgentId,
+});
+const result = await mesh.agentSend(orchestrator, { decisionId, response });
 if (result.status !== "received") throw new Error(`decision not delivered: ${result.status}`);
 ```
 
-Authority-bearing clients such as the orchestration dashboard must select
-exactly one target by `workspaceId` + `agentId` in `detailed`, require its
-broker-returned `identityAddress` to be non-empty, and echo that value verbatim.
-Absence or ambiguity fails closed: never fall back to `address`, display name,
-aliases, the flat `routes` list, route construction, or route parsing. Generic
-non-authority clients may still use broker-returned `routes`/`address` for
-legacy interoperability. Only `received` is a positive target-retention ACK;
-`busy`, `denied`, and `timeout` are non-delivery.
+`resolveIdentityTarget` requires exactly one broker record matching both stable
+identity fields and a non-empty broker-returned `identityAddress`. It returns an
+opaque, non-serializable handle with no route/address getter. The module keeps
+the address private and `agentSend` accepts only a handle created by that exact
+client and connection generation, so address/name/alias fallback and route
+construction are structurally unavailable. Resolution fails with a typed
+`MeshIdentityResolutionError` code: `zero-match`, `multiple-match`,
+`missing-identity-address`, `disconnected`, or `timeout`.
 
-The v1 facade is intentionally outbound-only. It exposes no `Broker`,
-`SessionPeer`, private storage, or inbound callback, and honestly denies inbound
-acknowledged agent envelopes rather than accepting them without an application
-inbox. The repository-root Git bridge mirrors the same `./mesh` export so an
-exact-SHA dependency resolves the supported facade after its prepare build.
+Only `received` is a positive target-retention ACK; `busy`, `denied`, and
+`timeout` are non-delivery. The public ACK contains only `status` and envelope
+`id`, never the private target route.
+
+The v1 facade is intentionally outbound-only. It exposes no peer list, routes,
+addresses, `Broker`, `SessionPeer`, inbound callback, or reconnect callback,
+and honestly denies inbound acknowledged agent envelopes rather than accepting
+them without an application inbox. Transport reconnect remains internal and
+invalidates previously resolved handles. The repository-root Git bridge mirrors
+the same `./mesh` export so an exact-SHA dependency resolves the supported
+facade after its prepare build.
 
 ### Archive candidate testing
 

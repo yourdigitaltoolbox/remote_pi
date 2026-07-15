@@ -3,9 +3,13 @@ import { mkdtemp, rm } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { afterEach, describe, expect, test } from "vitest";
+import type { PeerInfo } from "../session/broker.js";
 import { SessionPeer } from "../session/peer.js";
 import type { RuntimeIdentity } from "../session/runtime_identity.js";
-import { MeshClient } from "./mesh_client.js";
+import {
+  MeshClient,
+  type MeshIdentityTarget,
+} from "./mesh_client.js";
 
 function identity(): RuntimeIdentity {
   return {
@@ -15,7 +19,7 @@ function identity(): RuntimeIdentity {
   };
 }
 
-describe("remote-pi/mesh public client", () => {
+describe("remote-pi/mesh authority client integration", () => {
   const cleanup: Array<() => Promise<void>> = [];
 
   afterEach(async () => {
@@ -28,7 +32,7 @@ describe("remote-pi/mesh public client", () => {
     return { path: join(dir, "broker.sock"), dir };
   }
 
-  test("lists structured peers and returns the target-retention ACK", async () => {
+  test("resolves one strict identity into an opaque target and strips the ACK route", async () => {
     const { path, dir } = await socket();
     const targetIdentity = identity();
     const target = new SessionPeer({
@@ -60,33 +64,44 @@ describe("remote-pi/mesh public client", () => {
       identity: identity(),
     });
     cleanup.push(() => client.close());
-    const connection = await client.connect();
-    expect(connection.address).toMatch(/^~identity\//);
-    expect(() => client.agentSend("broadcast", {})).toThrow(/unicast/i);
+    await expect(client.connect()).resolves.toBeUndefined();
 
-    const roster = await client.listPeersDetailed();
-    expect(roster.routes).toContain(target.address());
-    expect(roster.detailed).toContainEqual(expect.objectContaining({
-      name: "orchestrator",
+    const resolved = await client.resolveIdentityTarget({
       workspaceId: targetIdentity.workspaceId,
       agentId: targetIdentity.agentId,
-      processEpoch: targetIdentity.processEpoch,
-      identityAddress: target.address(),
-    }));
+    });
+    expect(Object.keys(resolved)).toEqual([]);
+    expect(Object.getOwnPropertyNames(resolved)).toEqual([]);
+    expect(() => JSON.stringify(resolved)).toThrow(/opaque.*non-serializable/i);
+    expect(() => client.agentSend({} as MeshIdentityTarget, {})).toThrow(/invalid or forged/i);
+    expect(() => client.agentSend("~identity/forged" as unknown as MeshIdentityTarget, {}))
+      .toThrow(/invalid or forged/i);
+    expect(() => client.agentSend(structuredClone(resolved), {})).toThrow(/invalid or forged/i);
+    expect("listPeersDetailed" in client).toBe(false);
+    expect("onMessage" in client).toBe(false);
+    expect("onReconnect" in client).toBe(false);
+    expect("node" in client).toBe(false);
 
-    const result = await client.agentSend(target.address(), {
+    const result = await client.agentSend(resolved, {
       decisionId: "decision-1",
       response: "approve",
     });
-    expect(result).toEqual({
-      status: "received",
-      id: expect.any(String),
-      target: target.address(),
-    });
+    expect(result).toEqual({ status: "received", id: expect.any(String) });
+    expect("target" in result).toBe(false);
     expect(receivedBody).toEqual({ decisionId: "decision-1", response: "approve" });
+
+    const foreign = new MeshClient({
+      sockPath: path,
+      name: "other-dashboard",
+      cwd: `${dir}/other`,
+      identity: identity(),
+    });
+    cleanup.push(() => foreign.close());
+    await foreign.connect();
+    expect(() => foreign.agentSend(resolved, {})).toThrow(/another client/i);
   });
 
-  test("honestly denies inbound acknowledged envelopes because v1 is outbound-only", async () => {
+  test("returns typed disconnected and zero-match resolution outcomes", async () => {
     const { path, dir } = await socket();
     const client = new MeshClient({
       sockPath: path,
@@ -95,7 +110,26 @@ describe("remote-pi/mesh public client", () => {
       identity: identity(),
     });
     cleanup.push(() => client.close());
-    const dashboard = await client.connect();
+
+    const wanted = { workspaceId: randomUUID(), agentId: randomUUID() };
+    await expect(client.resolveIdentityTarget(wanted))
+      .rejects.toMatchObject({ name: "MeshIdentityResolutionError", code: "disconnected" });
+    await client.connect();
+    await expect(client.resolveIdentityTarget(wanted))
+      .rejects.toMatchObject({ code: "zero-match" });
+  });
+
+  test("honestly denies inbound acknowledged envelopes because v1 is outbound-only", async () => {
+    const { path, dir } = await socket();
+    const dashboardIdentity = identity();
+    const client = new MeshClient({
+      sockPath: path,
+      name: "dashboard",
+      cwd: dir,
+      identity: dashboardIdentity,
+    });
+    cleanup.push(() => client.close());
+    await client.connect();
 
     const sender = new SessionPeer({
       sockPath: path,
@@ -106,12 +140,19 @@ describe("remote-pi/mesh public client", () => {
     await sender.start();
     cleanup.push(() => sender.leave());
 
-    const result = await sender.sendWithAck(dashboard.address, { message: "unsupported inbound" }, null, 1_000);
+    const roster = await sender.request("broker", { type: "list_peers" });
+    const details = (roster.body as { peers_detailed?: PeerInfo[] }).peers_detailed ?? [];
+    const dashboard = details.find((peer) =>
+      peer.workspaceId === dashboardIdentity.workspaceId
+      && peer.agentId === dashboardIdentity.agentId
+    );
+    expect(dashboard?.identityAddress).toMatch(/^~identity\//);
+
+    const result = await sender.sendWithAck(dashboard!.identityAddress!, { message: "unsupported inbound" }, null, 1_000);
     expect(result.status).toBe("denied");
-    expect(result.target).toBe(dashboard.address);
   });
 
-  test("requires a valid stable identity and a connected lifecycle", async () => {
+  test("requires a valid stable client identity", async () => {
     const { path, dir } = await socket();
     expect(() => new MeshClient({
       sockPath: path,
@@ -119,16 +160,5 @@ describe("remote-pi/mesh public client", () => {
       cwd: dir,
       identity: { workspaceId: "bad", agentId: randomUUID(), processEpoch: randomUUID() },
     })).toThrow(/identity.*valid/i);
-
-    const client = new MeshClient({
-      sockPath: path,
-      name: "dashboard",
-      cwd: dir,
-      identity: identity(),
-    });
-    expect(() => client.listPeersDetailed()).toThrow(/not connected/i);
-    expect(() => client.agentSend("broadcast", {})).toThrow(/not connected/i);
-    await client.close();
-    await expect(client.connect()).rejects.toThrow(/closed/i);
   });
 });
