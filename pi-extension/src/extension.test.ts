@@ -231,7 +231,8 @@ function makeMockCtx(cwd = "/home/user/projects/remote_pi") {
     ui: { notify: vi.fn() },
     cwd,
     abort: vi.fn(),
-    sessionManager: { getSessionId: () => testSessionId(cwd) },
+    isIdle: vi.fn(() => true),
+    sessionManager: { getSessionId: () => testSessionId(cwd), getEntries: () => [] },
   };
 }
 
@@ -922,7 +923,7 @@ describe("released mesh spool submission", () => {
     _resetCwdLockForTest();
   });
 
-  test("uses Pi 0.80.6 followUp delivery so a released batch explicitly wakes its follow-up turn", () => {
+  test("starts an idle mesh batch as its own turn without the active follow-up queue", () => {
     const sessionId = "mesh-followup-session";
     const onSessionStart = captureEventHandler("session_start");
     onSessionStart({ type: "session_start" }, {
@@ -940,7 +941,25 @@ describe("released mesh spool submission", () => {
     expect(sendMessage).toHaveBeenCalledWith(expect.objectContaining({
       customType: "remote-pi:mesh-batch",
       details: expect.objectContaining({ sessionId, submissionId: "submission-a", generationId: "generation-a" }),
-    }), { triggerTurn: true, deliverAs: "followUp" });
+    }), { triggerTurn: true });
+  });
+
+  test("refuses the SDK submission boundary while Pi is active", () => {
+    const sessionId = "mesh-active-session";
+    const ctx = makeMockCtx("/tmp/remote-pi-mesh-active");
+    ctx.isIdle.mockReturnValue(false);
+    const onSessionStart = captureEventHandler("session_start");
+    onSessionStart({ type: "session_start" }, {
+      ...ctx,
+      sessionManager: { getSessionId: () => sessionId, getEntries: () => [] },
+    });
+    const sendMessage = vi.fn();
+    _setPiForTest({ sendMessage } as unknown as ExtensionAPI);
+
+    expect(_submitMeshSpoolBatchForTest(sessionId, "mesh-unsolicited", [{
+      id: "held-during-active", from: "mesh-peer", to: "local", re: null, body: "held body",
+    }], "submission-active", "generation-a")).toBe(false);
+    expect(sendMessage).not.toHaveBeenCalled();
   });
 });
 

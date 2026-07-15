@@ -47,21 +47,21 @@ function meshAuthority() {
 describe("remote-pi/testing", () => {
   test("reports lane-tagged held and released receipts in reply-before-unsolicited order from the production-owned mesh spool", async () => {
     const controlled = meshAuthority();
-    const submitted: Array<{ lane: string; ids: string[] }> = [];
-    const followUps: string[] = [];
+    const submitted: Array<{ lane: string; ids: string[]; submissionId: string; generationId: string }> = [];
+    const modelInputs: string[] = [];
     let settled = false;
     let binding: ReturnType<typeof bindProductionMeshProbe> | undefined;
     const spool = new MeshSpool({
       mode: "managed",
       getSessionId: () => "remote-pi-probe-session",
       authority: controlled.authority,
-      submit: (lane, envelopes) => {
+      submit: (lane, envelopes, submissionId, generationId) => {
         // The production boundary receives this callback only after the
-        // lifecycle's post-settlement release cut; model it as one follow-up
-        // turn per released batch, not a turn while the receipt is held.
+        // lifecycle's post-settlement release cut; model it as one independent
+        // idle turn per batch, never active-turn follow-up input.
         expect(settled).toBe(true);
-        submitted.push({ lane, ids: envelopes.map((envelope) => envelope.id) });
-        followUps.push(...envelopes.map((envelope) => envelope.id));
+        submitted.push({ lane, ids: envelopes.map((envelope) => envelope.id), submissionId, generationId });
+        modelInputs.push(...envelopes.map((envelope) => envelope.id));
         return true;
       },
       onTransition: (transition) => binding?.publish(transition),
@@ -101,17 +101,25 @@ describe("remote-pi/testing", () => {
     expect(Object.isFrozen(replyReceipt)).toBe(true);
     // The archive seam observes both held receipts before either can wake Pi.
     expect(submitted).toEqual([]);
-    expect(followUps).toEqual([]);
+    expect(modelInputs).toEqual([]);
 
     settled = true;
     controlled.settle();
-    // Actual production spool submission and the redacted testing receipts
-    // expose the same reply-first lane ordering without envelope contents.
-    expect(submitted).toEqual([
+    // Actual production spool dispatch and the redacted testing receipts expose
+    // reply-first ordering; release appears only after each exact durable proof.
+    expect(submitted.map(({ lane, ids }) => ({ lane, ids }))).toEqual([
       { lane: "mesh-reply", ids: ["mesh-reply-id"] },
       { lane: "mesh-unsolicited", ids: ["mesh-unsolicited-id"] },
     ]);
-    expect(followUps).toEqual(["mesh-reply-id", "mesh-unsolicited-id"]);
+    expect(modelInputs).toEqual(["mesh-reply-id", "mesh-unsolicited-id"]);
+    expect(await probe.observations()).toEqual([unsolicitedReceipt, replyReceipt]);
+    for (const attempt of submitted) {
+      expect(spool.confirmSubmission({
+        submissionId: attempt.submissionId,
+        generationId: attempt.generationId,
+        envelopeIds: attempt.ids,
+      })).toBe(true);
+    }
     expect(await probe.observations()).toEqual([
       unsolicitedReceipt,
       replyReceipt,

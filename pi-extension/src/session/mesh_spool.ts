@@ -54,9 +54,76 @@ interface PendingRestore {
   generationId: string;
 }
 
+interface DispatchingBatch {
+  lane: MeshLane;
+  submissionId: string;
+  generationId: string;
+  records: readonly HeldEnvelope[];
+}
+
+export interface PersistedMeshSpoolEvent {
+  schemaVersion: 1;
+  sessionId: string;
+  state: "held" | "submitting" | "submitted";
+  lane: MeshLane;
+  generationId: string;
+  envelope: Envelope;
+  submissionId?: string;
+}
+
+export interface MeshBatchProof {
+  sessionId: string;
+  generationId: string;
+  submissionId: string;
+  envelopeIds: string[];
+}
+
+function batchKey(sessionId: string, generationId: string, submissionId: string): string {
+  return `${sessionId}\u0000${generationId}\u0000${submissionId}`;
+}
+
+function sameIds(left: readonly string[], right: readonly string[]): boolean {
+  return left.length === right.length && left.every((id, index) => id === right[index]);
+}
+
+/**
+ * Selects exact envelopes that still need recovery from the append-only V1
+ * stream. An exact durable batch proof wins over every marker state; otherwise
+ * held, submitting, and submitted records all remain recoverable.
+ */
+export function recoverableMeshSpoolEvents(
+  events: readonly PersistedMeshSpoolEvent[],
+  proofs: readonly MeshBatchProof[],
+): PersistedMeshSpoolEvent[] {
+  const latest = new Map<string, PersistedMeshSpoolEvent>();
+  const attempts = new Map<string, { generationId: string; submissionId: string; envelopeIds: string[] }>();
+  for (const event of events) {
+    latest.set(event.envelope.id, event);
+    if (event.state !== "submitting" || !event.submissionId) continue;
+    const key = batchKey(event.sessionId, event.generationId, event.submissionId);
+    const attempt = attempts.get(key) ?? {
+      generationId: event.generationId,
+      submissionId: event.submissionId,
+      envelopeIds: [],
+    };
+    if (!attempt.envelopeIds.includes(event.envelope.id)) attempt.envelopeIds.push(event.envelope.id);
+    attempts.set(key, attempt);
+  }
+
+  const provedEnvelopeIds = new Set<string>();
+  for (const proof of proofs) {
+    const attempt = attempts.get(batchKey(proof.sessionId, proof.generationId, proof.submissionId));
+    if (!attempt || !sameIds(attempt.envelopeIds, proof.envelopeIds)) continue;
+    for (const id of attempt.envelopeIds) provedEnvelopeIds.add(id);
+  }
+  return [...latest.values()].filter((event) => !provedEnvelopeIds.has(event.envelope.id));
+}
+
 export interface MeshSpoolOptions {
   mode: MeshSpoolMode;
   getSessionId(): string | null;
+  /** True only at a genuine Pi runtime idle boundary. */
+  isRuntimeIdle?(): boolean;
   /** Starts exactly one model submission for this ordered lane batch. */
   submit(lane: MeshLane, envelopes: readonly Envelope[], submissionId: string, generationId: string): boolean;
   /** Domain-owned persistence hook; the lifecycle registry never receives bodies. */
@@ -88,6 +155,7 @@ export class MeshSpool {
   private unsubscribe: (() => void) | undefined;
   private disposed = false;
   private flushing = new Set<MeshLane>();
+  private dispatching: Partial<Record<MeshLane, DispatchingBatch>> = {};
 
   constructor(private readonly options: MeshSpoolOptions) {
     this.authority = options.authority ?? defaultAuthority;
@@ -100,6 +168,9 @@ export class MeshSpool {
     if (this.disposed) return this.denied("spool-disposed");
     const lane: MeshLane = envelope.re ? "mesh-reply" : "mesh-unsolicited";
     const snapshot = this.authority.snapshot();
+    if (this.options.mode === "managed" && snapshot.phase === "blocked-unknown") {
+      return this.denied("lifecycle-blocked");
+    }
     const admission = this.admitLane(lane, snapshot, `${lane}:${envelope.id}`);
     if (admission === "blocked") return this.denied("lifecycle-authority-unavailable");
 
@@ -130,9 +201,51 @@ export class MeshSpool {
     return true;
   }
 
-  /** Re-evaluate admission after restoring domain-owned records. */
+  /** Re-evaluate admission after restoring domain-owned records or settlement. */
   reconcile(): void {
     this.handleSnapshot(this.authority.snapshot());
+  }
+
+  /**
+   * Commits one in-flight batch only after Pi exposes the exact custom-message
+   * proof. Until this succeeds, records remain capacity-accounted and durable.
+   */
+  confirmSubmission(proof: Pick<MeshBatchProof, "generationId" | "submissionId" | "envelopeIds">): boolean {
+    const batch = (["mesh-reply", "mesh-unsolicited"] as const)
+      .map((lane) => this.dispatching[lane])
+      .find((candidate) => candidate?.submissionId === proof.submissionId);
+    if (!batch || batch.generationId !== proof.generationId) return false;
+    const envelopeIds = batch.records.map((record) => record.envelope.id);
+    if (!sameIds(envelopeIds, proof.envelopeIds)) return false;
+    try {
+      for (const record of batch.records) {
+        this.options.persist?.({
+          state: "submitted",
+          lane: batch.lane,
+          generationId: record.generationId,
+          envelope: record.envelope,
+          submissionId: batch.submissionId,
+        });
+      }
+    } catch {
+      // The durable custom_message is authoritative even if this advisory
+      // terminal marker fails. Keeping it dispatching would duplicate delivery;
+      // startup recovery also suppresses the exact proved attempt.
+      this.options.onBlocked?.("mesh-submitted-marker-failed");
+    }
+    delete this.dispatching[batch.lane];
+    this.remove(batch.lane, batch.records);
+    return true;
+  }
+
+  /** Return every proofless attempt to retained state at a genuine settlement. */
+  retryUnproved(): void {
+    for (const lane of ["mesh-reply", "mesh-unsolicited"] as const) {
+      const batch = this.dispatching[lane];
+      if (!batch) continue;
+      if (!this.returnToHeld(batch)) continue;
+      delete this.dispatching[lane];
+    }
   }
 
   dispose(): void {
@@ -145,6 +258,7 @@ export class MeshSpool {
     this.held["mesh-reply"] = [];
     this.held["mesh-unsolicited"] = [];
     this.pendingRestores = [];
+    this.dispatching = {};
     this.totalBytes = 0;
   }
 
@@ -198,24 +312,24 @@ export class MeshSpool {
   }
 
   private drain(lane: MeshLane, permit: ReleasePermit): DrainAck {
+    if (this.dispatching[lane]) return this.ack(permit, "blocked", 0, 0);
     const records = this.recordsAtOrBefore(lane, permit.cut.watermark);
     if (records.length !== permit.cut.heldCount) return this.ack(permit, "blocked", 0, 0);
     if (records.length === 0) return this.ack(permit, "empty", 0, 0);
+    if (!this.runtimeIdle()) return this.ack(permit, "blocked", 0, 0);
     const snapshot = this.authority.snapshot();
     if (this.admitLane(lane, snapshot, `release:${permit.releaseId}`, permit) !== "deliver") return this.ack(permit, "blocked", 0, 0);
     if (!this.submit(lane, records)) return this.ack(permit, "blocked", 0, 0);
-    this.remove(lane, records);
     return this.ack(permit, "submitted", 1, records.length);
   }
 
   private flush(lane: MeshLane, snapshot: Snapshot): void {
-    if (this.flushing.has(lane)) return;
+    if (this.flushing.has(lane) || this.dispatching[lane]) return;
     const records = this.recordsAtOrBefore(lane, this.nextSequence);
-    if (records.length === 0 || this.admitLane(lane, snapshot, `${lane}:${this.nextSequence}`) !== "deliver") return;
+    if (records.length === 0 || !this.runtimeIdle() || this.admitLane(lane, snapshot, `${lane}:${this.nextSequence}`) !== "deliver") return;
     this.flushing.add(lane);
     try {
-      if (this.submit(lane, records)) this.remove(lane, records);
-      else if (this.options.mode === "managed") this.options.onBlocked?.("mesh-submit-failed");
+      if (!this.submit(lane, records) && this.options.mode === "managed") this.options.onBlocked?.("mesh-submit-failed");
     } finally {
       this.flushing.delete(lane);
     }
@@ -233,28 +347,42 @@ export class MeshSpool {
   }
 
   private submit(lane: MeshLane, records: readonly HeldEnvelope[]): boolean {
-    const submissionId = randomUUID();
+    if (records.length === 0 || this.dispatching[lane] || !this.runtimeIdle()) return false;
+    const batch: DispatchingBatch = {
+      lane,
+      submissionId: randomUUID(),
+      generationId: records[0]!.generationId,
+      records,
+    };
+    this.dispatching[lane] = batch;
     try {
-      // Intent precedes the public SDK send. A reload reconciles it against the
-      // durable custom-message submission proof before deciding whether replay
-      // is safe, closing both send→tombstone and intent→send crash windows.
-      for (const record of records) this.options.persist?.({ state: "submitting", lane, generationId: record.generationId, envelope: record.envelope, submissionId });
+      // The intent precedes the public SDK call, but is not a tombstone. The
+      // exact Pi custom-message proof is the only path to `submitted`+remove.
+      for (const record of records) {
+        this.options.persist?.({
+          state: "submitting",
+          lane,
+          generationId: record.generationId,
+          envelope: record.envelope,
+          submissionId: batch.submissionId,
+        });
+      }
     } catch {
+      if (this.returnToHeld(batch)) delete this.dispatching[lane];
       return false;
     }
     try {
-      if (!this.options.submit(lane, records.map((record) => record.envelope), submissionId, records[0]!.generationId)) return false;
+      if (this.options.submit(
+        lane,
+        records.map((record) => record.envelope),
+        batch.submissionId,
+        batch.generationId,
+      )) return true;
     } catch {
-      return false;
+      // The append-only retained state below keeps the attempt replayable.
     }
-    try {
-      for (const record of records) this.options.persist?.({ state: "submitted", lane, generationId: record.generationId, envelope: record.envelope, submissionId });
-    } catch {
-      // Pi's custom-message entry is the submission proof. Do not retry it in
-      // this runtime merely because the advisory terminal marker failed.
-      this.options.onBlocked?.("mesh-submitted-marker-failed");
-    }
-    return true;
+    if (this.returnToHeld(batch)) delete this.dispatching[lane];
+    return false;
   }
 
   private restorePending(snapshot: Snapshot): void {
@@ -262,18 +390,37 @@ export class MeshSpool {
     const pending = this.pendingRestores;
     this.pendingRestores = [];
     for (const record of pending) {
-      if (record.generationId !== snapshot.generationId) {
-        this.options.onBlocked?.("stale-mesh-spool-generation");
-        continue;
-      }
+      const generationId = snapshot.generationId;
+      if (record.generationId !== generationId) this.options.onBlocked?.("rebound-mesh-spool-generation");
       const bytes = Buffer.byteLength(serialize(record.envelope), "utf8");
       if (bytes > MAX_MESH_ENVELOPE_BYTES || this.heldCount() >= MAX_MESH_ENVELOPES || this.totalBytes + bytes > MAX_MESH_TOTAL_BYTES) {
         this.options.onBlocked?.("restored-mesh-spool-capacity");
         continue;
       }
-      this.held[record.lane].push({ sequence: ++this.nextSequence, bytes, generationId: record.generationId, envelope: record.envelope });
+      this.held[record.lane].push({ sequence: ++this.nextSequence, bytes, generationId, envelope: record.envelope });
       this.totalBytes += bytes;
     }
+  }
+
+  private returnToHeld(batch: DispatchingBatch): boolean {
+    try {
+      for (const record of batch.records) {
+        this.options.persist?.({
+          state: "held",
+          lane: batch.lane,
+          generationId: record.generationId,
+          envelope: record.envelope,
+        });
+      }
+      return true;
+    } catch {
+      this.options.onBlocked?.("mesh-retry-marker-failed");
+      return false;
+    }
+  }
+
+  private runtimeIdle(): boolean {
+    return this.options.isRuntimeIdle?.() ?? true;
   }
 
   private remove(lane: MeshLane, records: readonly HeldEnvelope[]): void {

@@ -75,7 +75,15 @@ import {
 } from "./actions/handlers.js";
 import { ensureModelRegistry } from "./actions/registry.js";
 import { RemoteLifecycleController } from "./lifecycle/remote_lifecycle.js";
-import { MeshSpool, resolveMeshSpoolMode, type MeshLane, type MeshAcceptance } from "./session/mesh_spool.js";
+import {
+  MeshSpool,
+  recoverableMeshSpoolEvents,
+  resolveMeshSpoolMode,
+  type MeshAcceptance,
+  type MeshBatchProof,
+  type MeshLane,
+  type PersistedMeshSpoolEvent,
+} from "./session/mesh_spool.js";
 import type { Envelope } from "./session/envelope.js";
 import { bindProductionMeshProbe } from "./testing/production_mesh_probe.js";
 import {
@@ -1708,7 +1716,7 @@ let _sessionCwd: string | null = null;
 // (an app Quick Action OR a `/new` typed in the Pi TUI). It carries only
 // base-ctx methods (no newSession — that's command-ctx only), so command ops
 // keep using `_lastCtx`.
-let _lastEventCtx: Pick<ExtensionContext, "compact" | "abort"> | null = null;
+let _lastEventCtx: Pick<ExtensionContext, "compact" | "abort" | "isIdle" | "sessionManager"> | null = null;
 const _noopCtx = { ui: { notify: () => undefined }, abort: () => undefined };
 
 // A single Pi process can load this extension TWICE in the SAME session:
@@ -2016,9 +2024,24 @@ const extension: ExtensionFactory = (pi: ExtensionAPI): void => {
   // turn — including turns initiated from the Pi terminal (source:"interactive")
   // or RPC. Previous impl overwrote on `agent_end` and lost everything but the
   // last turn (see diagnostics 14, 15).
-  pi.on("message_end", (event) => {
-    const m = event?.message as { role?: string; stopReason?: string; errorMessage?: string } | undefined;
+  pi.on("message_end", (event, ctx) => {
+    const m = event?.message as {
+      role?: string;
+      customType?: string;
+      details?: unknown;
+      stopReason?: string;
+      errorMessage?: string;
+    } | undefined;
     if (!m) return;
+    if (m.role === "custom" && m.customType === "remote-pi:mesh-batch") {
+      const sessionId = _sessionIdFromContext(ctx) ?? _runtimeSessionId;
+      const spool = _meshSpool;
+      if (sessionId && spool && _isMeshBatchProof(m.details, sessionId)) {
+        // Pi emits message_end before appending the custom_message entry. Scan on
+        // the next macrotask so only the durable session proof can tombstone it.
+        setTimeout(() => _reconcileMeshSpoolProofs(sessionId, ctx, spool), 0);
+      }
+    }
     if (m.role === "user" || m.role === "assistant" || m.role === "toolResult") {
       _messageBuffer.push(m as unknown as BufferMsg);
     }
@@ -2037,6 +2060,17 @@ const extension: ExtensionFactory = (pi: ExtensionAPI): void => {
         : { type: "error", code: "provider_error", message };
       _broadcastToActive(errMsg);
     }
+  });
+
+  pi.on("agent_settled", (_event, ctx) => {
+    const sessionId = _sessionIdFromContext(ctx) ?? _runtimeSessionId;
+    const spool = _meshSpool;
+    if (!sessionId || !spool || _runtimeSessionId !== sessionId) return;
+    // Proof always wins. Only proofless attempts return to held, and only at
+    // this genuine settled boundary are they eligible for one idle retry.
+    _reconcileMeshSpoolProofs(sessionId, ctx, spool);
+    spool.retryUnproved();
+    spool.reconcile();
   });
 
   pi.on("agent_end", () => {
@@ -3964,16 +3998,6 @@ function _wakeAgent(
   }
 }
 
-interface PersistedMeshSpoolEvent {
-  schemaVersion: 1;
-  sessionId: string;
-  state: "held" | "submitting" | "submitted";
-  lane: MeshLane;
-  generationId: string;
-  envelope: import("./session/envelope.js").Envelope;
-  submissionId?: string;
-}
-
 function _isPersistedMeshSpoolEvent(value: unknown, sessionId: string): value is PersistedMeshSpoolEvent {
   if (!value || typeof value !== "object" || Array.isArray(value)) return false;
   const event = value as Partial<PersistedMeshSpoolEvent>;
@@ -3996,6 +4020,7 @@ function _replaceMeshSpool(sessionId: string | undefined, ctx: ExtensionContext)
   const spool = new MeshSpool({
     mode: resolveMeshSpoolMode(),
     getSessionId: () => _runtimeSessionId === sessionId ? sessionId : null,
+    isRuntimeIdle: () => _runtimeSessionId === sessionId && ctx.isIdle(),
     submit: (lane, envelopes, submissionId, generationId) => _submitMeshSpoolBatch(sessionId, lane, envelopes, submissionId, generationId),
     persist: (event) => {
       if (_runtimeSessionId !== sessionId || !_pi) throw new Error("stale or unbound mesh spool runtime");
@@ -4004,24 +4029,22 @@ function _replaceMeshSpool(sessionId: string | undefined, ctx: ExtensionContext)
     onTransition: (event) => probeBinding?.publish(event),
     onBlocked: (code) => console.error(`[remote-pi] mesh spool blocked: ${code}`),
   });
-  // Custom entries are domain-owned persistence. Rehydrate only a same-session
-  // held record. A pre-send `submitting` marker is replayed only when the
-  // corresponding durable custom-message submission proof is absent.
-  const states = new Map<string, PersistedMeshSpoolEvent>();
-  const submittedEnvelopeGenerations = new Map<string, string>();
+  // Custom entries are domain-owned persistence. Restore every same-session V1
+  // state that lacks an exact durable custom-message proof—including the legacy
+  // `submitted`-without-proof shape that caused permanent message loss.
+  const persistedEvents: PersistedMeshSpoolEvent[] = [];
+  const proofs: MeshBatchProof[] = [];
   const entries = (ctx.sessionManager as Partial<ExtensionContext["sessionManager"]>).getEntries?.() ?? [];
   for (const entry of entries) {
     if (entry.type === "custom" && entry.customType === "remote-pi:mesh-spool" && _isPersistedMeshSpoolEvent(entry.data, sessionId)) {
-      states.set(entry.data.envelope.id, entry.data);
+      persistedEvents.push(entry.data);
     }
     if (entry.type === "custom_message" && entry.customType === "remote-pi:mesh-batch" && _isMeshBatchProof(entry.details, sessionId)) {
-      for (const id of entry.details.envelopeIds) submittedEnvelopeGenerations.set(id, entry.details.generationId);
+      proofs.push(entry.details);
     }
   }
-  for (const event of states.values()) {
-    if (event.state === "held" || (event.state === "submitting" && submittedEnvelopeGenerations.get(event.envelope.id) !== event.generationId)) {
-      spool.restore(event.lane, event.envelope, event.generationId);
-    }
+  for (const event of recoverableMeshSpoolEvents(persistedEvents, proofs)) {
+    spool.restore(event.lane, event.envelope, event.generationId);
   }
   spool.reconcile();
   _meshSpool = spool;
@@ -4041,10 +4064,28 @@ function _admitMeshEnvelope(env: Envelope): MeshAcceptance {
   return _meshSpool?.accept(env) ?? { status: "denied", code: "mesh-spool-unavailable" };
 }
 
-function _isMeshBatchProof(value: unknown, sessionId: string): value is { sessionId: string; generationId: string; envelopeIds: string[]; submissionId: string } {
+function _isMeshBatchProof(value: unknown, sessionId: string): value is MeshBatchProof {
   if (!value || typeof value !== "object" || Array.isArray(value)) return false;
   const proof = value as { sessionId?: unknown; generationId?: unknown; envelopeIds?: unknown; submissionId?: unknown };
-  return proof.sessionId === sessionId && typeof proof.generationId === "string" && typeof proof.submissionId === "string" && Array.isArray(proof.envelopeIds) && proof.envelopeIds.every((id) => typeof id === "string");
+  return proof.sessionId === sessionId
+    && typeof proof.generationId === "string" && proof.generationId.length > 0
+    && typeof proof.submissionId === "string" && proof.submissionId.length > 0
+    && Array.isArray(proof.envelopeIds) && proof.envelopeIds.length > 0
+    && proof.envelopeIds.every((id) => typeof id === "string" && id.length > 0)
+    && new Set(proof.envelopeIds).size === proof.envelopeIds.length;
+}
+
+function _reconcileMeshSpoolProofs(
+  sessionId: string,
+  ctx: Pick<ExtensionContext, "sessionManager">,
+  spool = _meshSpool,
+): void {
+  if (!spool || _runtimeSessionId !== sessionId || spool !== _meshSpool) return;
+  const entries = (ctx.sessionManager as Partial<ExtensionContext["sessionManager"]>).getEntries?.() ?? [];
+  for (const entry of entries) {
+    if (entry.type !== "custom_message" || entry.customType !== "remote-pi:mesh-batch" || !_isMeshBatchProof(entry.details, sessionId)) continue;
+    spool.confirmSubmission(entry.details);
+  }
 }
 
 /** Test-only seam for the production mesh submission boundary. */
@@ -4053,7 +4094,7 @@ export function _submitMeshSpoolBatchForTest(sessionId: string, lane: MeshLane, 
 }
 
 function _submitMeshSpoolBatch(sessionId: string, lane: MeshLane, envelopes: readonly import("./session/envelope.js").Envelope[], submissionId: string, generationId: string): boolean {
-  if (_runtimeSessionId !== sessionId || !_pi || envelopes.length === 0) return false;
+  if (_runtimeSessionId !== sessionId || !_pi || envelopes.length === 0 || _lastEventCtx?.isIdle() !== true) return false;
   const notices = envelopes.map((env) => {
     const bodyText = typeof env.body === "string" ? env.body : JSON.stringify(env.body);
     const toolCallId = `mesh_${env.id}`;
@@ -4073,11 +4114,10 @@ function _submitMeshSpoolBatch(sessionId: string, lane: MeshLane, envelopes: rea
     _pi.sendMessage({
       customType: "remote-pi:mesh-batch", content: notices.join("\n\n---\n\n"), display: true,
       details: { sessionId, generationId, submissionId, envelopeIds: envelopes.map((env) => env.id) },
-    // Pi 0.80.6 handles `nextTurn` before `triggerTurn`, so that mode only
-    // waits for unrelated future input. Release follows its `agent_settled`
-    // barrier; documented `followUp` avoids that special branch, allowing this
-    // explicit wake to start the released batch's follow-up turn.
-    }, { triggerTurn: true, deliverAs: "followUp" });
+    // This boundary is called only while the public runtime reports idle, so
+    // the custom message starts its own turn rather than entering Pi's volatile
+    // active-turn follow-up queue.
+    }, { triggerTurn: true });
     // Only a successful SDK submission owns a mesh turn correlation. Existing
     // app-originated turn correlation is never replaced by a held mesh receipt.
     if (_currentTurnId === null) _currentTurnId = `mesh_${envelopes[0]!.id}`;

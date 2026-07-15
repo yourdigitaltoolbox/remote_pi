@@ -1,7 +1,16 @@
 import { describe, expect, test } from "vitest";
 import type { DrainAck, LifecycleEvent, ReleasePermit, Snapshot } from "@yourdigitaltoolbox/pi-context-lifecycle";
 import { envelope, serialize } from "./envelope.js";
-import { MAX_MESH_ENVELOPE_BYTES, MAX_MESH_ENVELOPES, MAX_MESH_TOTAL_BYTES, MeshSpool, type MeshSpoolAuthority } from "./mesh_spool.js";
+import {
+  MAX_MESH_ENVELOPE_BYTES,
+  MAX_MESH_ENVELOPES,
+  MAX_MESH_TOTAL_BYTES,
+  MeshSpool,
+  recoverableMeshSpoolEvents,
+  type MeshBatchProof,
+  type MeshSpoolAuthority,
+  type PersistedMeshSpoolEvent,
+} from "./mesh_spool.js";
 
 function snapshot(overrides: Partial<Snapshot> = {}): Snapshot {
   return { protocolVersion: 1, registryState: "ready", sequence: 1, sessionId: "session-a", generationId: "generation-a", phase: "compacting", ...overrides };
@@ -54,17 +63,15 @@ function retainedMessageAtSerializedBytes(bytes: number) {
 }
 
 describe("MeshSpool", () => {
-  test("holds work until settlement, then releases reply before unsolicited follow-up submissions", () => {
+  test("holds through dispatch and releases reply before unsolicited only after exact proofs", () => {
     const controlled = fakeAuthority();
-    const submitted: Array<{ lane: string; ids: string[] }> = [];
-    const followUps: string[] = [];
+    const submitted: Array<{ lane: string; ids: string[]; submissionId: string; generationId: string }> = [];
     const spool = new MeshSpool({
       mode: "managed",
       getSessionId: () => "session-a",
       authority: controlled.authority,
-      submit: (lane, values) => {
-        submitted.push({ lane, ids: values.map((value) => value.id) });
-        followUps.push(...values.map((value) => value.id));
+      submit: (lane, values, submissionId, generationId) => {
+        submitted.push({ lane, ids: values.map((value) => value.id), submissionId, generationId });
         return true;
       },
     });
@@ -72,17 +79,21 @@ describe("MeshSpool", () => {
     const reply = message({ type: "reply" }, "00000000-0000-7000-8000-000000000001");
     expect(spool.accept(unsolicited)).toEqual({ status: "received" });
     expect(spool.accept(reply)).toEqual({ status: "received" });
-    // No model follow-up is submitted while lifecycle settlement still holds it.
     expect(submitted).toEqual([]);
-    expect(followUps).toEqual([]);
     expect(spool.counts()).toMatchObject({ replies: 1, unsolicited: 1 });
 
     controlled.set(snapshot({ sequence: 2, phase: "idle" }));
-    expect(submitted).toEqual([
+    expect(submitted.map(({ lane, ids }) => ({ lane, ids }))).toEqual([
       { lane: "mesh-reply", ids: [reply.id] },
       { lane: "mesh-unsolicited", ids: [unsolicited.id] },
     ]);
-    expect(followUps).toEqual([reply.id, unsolicited.id]);
+    // A non-throwing SDK call is not release proof.
+    expect(spool.counts()).toMatchObject({ replies: 1, unsolicited: 1 });
+    const [replyAttempt, unsolicitedAttempt] = submitted;
+    expect(spool.confirmSubmission({ ...replyAttempt!, envelopeIds: ["wrong-id"] })).toBe(false);
+    expect(spool.confirmSubmission({ ...replyAttempt!, envelopeIds: replyAttempt!.ids })).toBe(true);
+    expect(spool.counts()).toMatchObject({ replies: 0, unsolicited: 1 });
+    expect(spool.confirmSubmission({ ...unsolicitedAttempt!, envelopeIds: unsolicitedAttempt!.ids })).toBe(true);
     expect(spool.counts()).toMatchObject({ replies: 0, unsolicited: 0 });
   });
 
@@ -112,14 +123,17 @@ describe("MeshSpool", () => {
     expect(total.accept(message({ overflow: true }))).toMatchObject({ status: "denied", code: "spool-byte-capacity" });
   });
 
-  test("release cut cannot let post-cut same-lane work overtake retained FIFO work", () => {
+  test("release cut cannot let post-cut same-lane work overtake a proof-pending batch", () => {
     const controlled = fakeAuthority();
-    const submitted: string[] = [];
+    const submitted: Array<{ ids: string[]; submissionId: string; generationId: string }> = [];
     const spool = new MeshSpool({
       mode: "managed",
       getSessionId: () => "session-a",
       authority: controlled.authority,
-      submit: (_lane, values) => { submitted.push(...values.map((value) => value.id)); return true; },
+      submit: (_lane, values, submissionId, generationId) => {
+        submitted.push({ ids: values.map((value) => value.id), submissionId, generationId });
+        return true;
+      },
     });
     const older = message({ order: "older" });
     const later = message({ order: "later" });
@@ -133,9 +147,13 @@ describe("MeshSpool", () => {
       laneId: "mesh-unsolicited", cut,
     });
     expect(ack).toMatchObject({ disposition: "submitted", handledCount: 1 });
-    expect(submitted).toEqual([older.id]);
+    expect(submitted.map((attempt) => attempt.ids)).toEqual([[older.id]]);
     controlled.set(snapshot({ phase: "idle" }));
-    expect(submitted).toEqual([older.id, later.id]);
+    expect(submitted.map((attempt) => attempt.ids)).toEqual([[older.id]]);
+    const first = submitted[0]!;
+    expect(spool.confirmSubmission({ ...first, envelopeIds: first.ids })).toBe(true);
+    spool.reconcile();
+    expect(submitted.map((attempt) => attempt.ids)).toEqual([[older.id], [later.id]]);
   });
 
   test("fails closed without a matching lifecycle owner/session and never submits", () => {
@@ -144,6 +162,44 @@ describe("MeshSpool", () => {
     const spool = new MeshSpool({ mode: "managed", getSessionId: () => "session-a", authority: controlled.authority, submit: () => { submits += 1; return true; } });
     expect(spool.accept(message({ blocked: true }))).toMatchObject({ status: "denied", code: "lifecycle-authority-unavailable" });
     expect(submits).toBe(0);
+  });
+
+  test("denies new work honestly while lifecycle is blocked-unknown", () => {
+    const controlled = fakeAuthority(snapshot({ phase: "blocked-unknown" }));
+    const persisted: string[] = [];
+    const spool = new MeshSpool({
+      mode: "managed",
+      getSessionId: () => "session-a",
+      authority: controlled.authority,
+      submit: () => true,
+      persist: (event) => persisted.push(event.state),
+    });
+    expect(spool.accept(message({ blocked: true }))).toEqual({ status: "denied", code: "lifecycle-blocked" });
+    expect(persisted).toEqual([]);
+    expect(spool.counts()).toMatchObject({ replies: 0, unsolicited: 0, bytes: 0 });
+  });
+
+  test("retains while Pi is active and dispatches only at a genuine idle boundary", () => {
+    const controlled = fakeAuthority(snapshot({ phase: "idle" }));
+    let runtimeIdle = false;
+    const states: string[] = [];
+    let submits = 0;
+    const spool = new MeshSpool({
+      mode: "managed",
+      getSessionId: () => "session-a",
+      isRuntimeIdle: () => runtimeIdle,
+      authority: controlled.authority,
+      submit: () => { submits += 1; return true; },
+      persist: (event) => states.push(event.state),
+    });
+    expect(spool.accept(message({ during: "active-turn" }))).toEqual({ status: "received" });
+    expect(states).toEqual(["held"]);
+    expect(submits).toBe(0);
+    runtimeIdle = true;
+    spool.reconcile();
+    expect(states).toEqual(["held", "submitting"]);
+    expect(submits).toBe(1);
+    expect(spool.counts().unsolicited).toBe(1);
   });
 
   test("restored records bind to the current session and drain only after current idle admission", () => {
@@ -162,41 +218,113 @@ describe("MeshSpool", () => {
     expect(submitted).toEqual([restored.id]);
   });
 
-  test("persists submission intent before SDK submit and never retries after a terminal-marker failure", () => {
-    const controlled = fakeAuthority();
+  test("a proofless attempt returns to held and retries only when settlement is reconciled", () => {
+    const controlled = fakeAuthority(snapshot({ phase: "idle" }));
     const events: string[] = [];
-    let submits = 0;
+    const attempts: Array<{ submissionId: string; generationId: string; ids: string[] }> = [];
     const spool = new MeshSpool({
       mode: "managed", getSessionId: () => "session-a", authority: controlled.authority,
-      submit: () => { events.push("sdk-submit"); submits += 1; return true; },
-      persist: (event) => {
-        events.push(event.state);
-        if (event.state === "submitted") throw new Error("marker storage interrupted");
+      submit: (_lane, values, submissionId, generationId) => {
+        events.push("sdk-submit");
+        attempts.push({ submissionId, generationId, ids: values.map((value) => value.id) });
+        return true;
       },
+      persist: (event) => events.push(event.state),
     });
     expect(spool.accept(message({ recoverable: true }))).toEqual({ status: "received" });
-    controlled.set(snapshot({ phase: "idle" }));
-    expect(events).toEqual(["held", "submitting", "sdk-submit", "submitted"]);
-    expect(submits).toBe(1);
-    // A later idle notification cannot duplicate a submission which already
-    // has a durable custom-message proof even if its terminal marker failed.
-    controlled.set(snapshot({ sequence: 3, phase: "idle" }));
-    expect(submits).toBe(1);
+    expect(events).toEqual(["held", "submitting", "sdk-submit"]);
+    expect(attempts).toHaveLength(1);
+    spool.retryUnproved();
+    expect(events).toEqual(["held", "submitting", "sdk-submit", "held"]);
+    expect(spool.counts().unsolicited).toBe(1);
+    // Returning to held does not itself resubmit; the caller supplies the next
+    // genuine agent_settled boundary by reconciling once.
+    expect(attempts).toHaveLength(1);
+    spool.reconcile();
+    expect(attempts).toHaveLength(2);
+    expect(attempts[1]!.submissionId).not.toBe(attempts[0]!.submissionId);
   });
 
-  test("same-session records from a prior generation are quarantined instead of flushed", () => {
-    const controlled = fakeAuthority(snapshot({ generationId: "generation-b" }));
-    const submitted: string[] = [];
+  test("durable proof prevents duplicate delivery even if the advisory terminal marker fails", () => {
+    const controlled = fakeAuthority(snapshot({ phase: "idle" }));
+    let attempt!: { submissionId: string; generationId: string; ids: string[] };
     const blocked: string[] = [];
     const spool = new MeshSpool({
       mode: "managed", getSessionId: () => "session-a", authority: controlled.authority,
-      submit: (_lane, values) => { submitted.push(...values.map((value) => value.id)); return true; },
+      submit: (_lane, values, submissionId, generationId) => {
+        attempt = { submissionId, generationId, ids: values.map((value) => value.id) };
+        return true;
+      },
+      persist: (event) => {
+        if (event.state === "submitted") throw new Error("marker storage interrupted");
+      },
       onBlocked: (code) => blocked.push(code),
     });
-    expect(spool.restore("mesh-unsolicited", message({ stale: true }), "generation-a")).toBe(true);
+    expect(spool.accept(message({ recoverable: true }))).toEqual({ status: "received" });
+    expect(spool.confirmSubmission({ ...attempt, envelopeIds: attempt.ids })).toBe(true);
+    expect(spool.counts().unsolicited).toBe(0);
+    expect(blocked).toContain("mesh-submitted-marker-failed");
+    spool.retryUnproved();
+    spool.reconcile();
+    expect(spool.counts().unsolicited).toBe(0);
+  });
+
+  test("same-session records rebind across a lifecycle generation replacement", () => {
+    const controlled = fakeAuthority(snapshot({ generationId: "generation-b" }));
+    const submitted: Array<{ ids: string[]; generationId: string }> = [];
+    const blocked: string[] = [];
+    const spool = new MeshSpool({
+      mode: "managed", getSessionId: () => "session-a", authority: controlled.authority,
+      submit: (_lane, values, _submissionId, generationId) => {
+        submitted.push({ ids: values.map((value) => value.id), generationId });
+        return true;
+      },
+      onBlocked: (code) => blocked.push(code),
+    });
+    const restored = message({ stale: true });
+    expect(spool.restore("mesh-unsolicited", restored, "generation-a")).toBe(true);
     controlled.set(snapshot({ generationId: "generation-b", phase: "idle" }));
-    expect(submitted).toEqual([]);
-    expect(blocked).toContain("stale-mesh-spool-generation");
+    expect(submitted).toEqual([{ ids: [restored.id], generationId: "generation-b" }]);
+    expect(blocked).toContain("rebound-mesh-spool-generation");
+  });
+
+  test("startup restores submitted-without-proof and suppresses only an exact batch proof", () => {
+    const one = message({ id: "one" });
+    const two = message({ id: "two" });
+    const event = (
+      envelopeValue: typeof one,
+      state: PersistedMeshSpoolEvent["state"],
+      submissionId?: string,
+    ): PersistedMeshSpoolEvent => ({
+      schemaVersion: 1,
+      sessionId: "session-a",
+      state,
+      lane: "mesh-unsolicited",
+      generationId: "generation-a",
+      envelope: envelopeValue,
+      ...(submissionId ? { submissionId } : {}),
+    });
+    const events = [
+      event(one, "held"),
+      event(two, "held"),
+      event(one, "submitting", "submission-a"),
+      event(two, "submitting", "submission-a"),
+      event(one, "submitted", "submission-a"),
+      event(two, "submitted", "submission-a"),
+    ];
+    expect(recoverableMeshSpoolEvents(events, []).map((value) => value.envelope.id)).toEqual([one.id, two.id]);
+
+    const exact: MeshBatchProof = {
+      sessionId: "session-a",
+      generationId: "generation-a",
+      submissionId: "submission-a",
+      envelopeIds: [one.id, two.id],
+    };
+    expect(recoverableMeshSpoolEvents(events, [exact])).toEqual([]);
+    expect(recoverableMeshSpoolEvents(events, [{ ...exact, envelopeIds: [two.id, one.id] }])
+      .map((value) => value.envelope.id)).toEqual([one.id, two.id]);
+    expect(recoverableMeshSpoolEvents(events, [{ ...exact, sessionId: "other-session" }])
+      .map((value) => value.envelope.id)).toEqual([one.id, two.id]);
   });
 
   test("a stale/disposed spool cannot flush or accept a new target receipt", () => {
