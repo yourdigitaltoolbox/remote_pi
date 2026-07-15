@@ -172,6 +172,7 @@ const {
   _hasMeshNodeForTest,
   _getLockedNameForTest,
   _getRuntimeIdentityForTest,
+  _getRuntimeProcessEpochForTest,
   _getRuntimePresentationForTest,
   _getRoomMetaForTest,
   _getRelayExposureLeaseForTest,
@@ -187,7 +188,8 @@ const {
   CTRL_PREFIX,
 } = await import("./index.js");
 const { acquireIdentityLock } = await import("./session/cwd_lock.js");
-const { agentIdFromSessionId } = await import("./session/runtime_identity.js");
+const { roomIdForIdentity } = await import("./rooms.js");
+const { agentIdFromSessionId, rollRuntimeIdentity } = await import("./session/runtime_identity.js");
 
 // ── Helpers ───────────────────────────────────────────────────────────────────
 
@@ -3581,6 +3583,33 @@ describe("child-safe legacy exposure", () => {
     expect(ctx.ui.notify).toHaveBeenCalledWith(expect.stringMatching(/capability|required|denied/i), expect.any(String));
   });
 
+  test("an exact descriptor-backed child identity remains fail-closed on a live collision", async () => {
+    const descriptor = await currentRelayDescriptor("local");
+    process.env["PI_SUBAGENT_CHILD"] = "1";
+    process.env["PI_SUBAGENT_DESCRIPTOR"] = JSON.stringify(descriptor);
+    const held = await acquireIdentityLock({ workspaceId: descriptor.workspaceId, agentId: descriptor.agentId });
+    expect(held.ok).toBe(true);
+    try {
+      const root = captureHandler("remote-pi");
+      const ctx = makeMockCtx(childCwd);
+      await root("", ctx);
+
+      expect(_getRuntimeIdentityForTest()).toEqual({
+        workspaceId: descriptor.workspaceId,
+        agentId: descriptor.agentId,
+        processEpoch: descriptor.processEpoch,
+      });
+      expect(_hasMeshNodeForTest()).toBe(false);
+      expect(ctx.ui.notify).toHaveBeenCalledWith(
+        expect.stringContaining("runtime identity"),
+        "warning",
+      );
+      expect(ctx.ui.notify).not.toHaveBeenCalledWith(expect.stringMatching(/rolled/i), expect.any(String));
+    } finally {
+      if (held.ok) held.release();
+    }
+  });
+
   test("a forged process-bound capability is consumed from env but cannot construct a relay", async () => {
     const descriptor = await currentRelayDescriptor();
     process.env["PI_SUBAGENT_CHILD"] = "1";
@@ -4612,28 +4641,148 @@ describe("runtime identity lock ownership", () => {
     }
   });
 
-  test("a duplicate workspaceId+agentId is refused regardless of display name or epoch", async () => {
+  test("a normal session rolls to a fresh process-local agentId when its preferred live identity collides", async () => {
     const cwd = mkdtempSync(join(tmpdir(), "remote-pi-identity-lock-"));
     const workspaceId = writeProtectedLocalConfig(cwd, "Backoffice");
     process.env["REMOTE_PI_DIRECT_CONFIG"] = JSON.stringify({ agent_name: "Backoffice", auto_start_relay: false });
-    const held = await acquireIdentityLock({
-      workspaceId,
-      agentId: agentIdFromSessionId(testSessionId(cwd)),
-    });
+    const preferredAgentId = agentIdFromSessionId(testSessionId(cwd));
+    const held = await acquireIdentityLock({ workspaceId, agentId: preferredAgentId });
     expect(held.ok).toBe(true);
     try {
       const root = captureHandler("remote-pi");
       const ctx = makeMockCtx(cwd);
       await root("", ctx);
 
-      expect(_getLockedNameForTest()).toBeNull();
-      expect(_hasMeshNodeForTest()).toBe(false);
+      const rolled = _getRuntimeIdentityForTest();
+      expect(_getLockedNameForTest()).toBe("Backoffice");
+      expect(_hasMeshNodeForTest()).toBe(true);
+      expect(rolled).toMatchObject({ workspaceId });
+      expect(rolled?.agentId).not.toBe(preferredAgentId);
       expect(ctx.ui.notify).toHaveBeenCalledWith(
-        expect.stringContaining("runtime identity"),
+        expect.stringMatching(/identity.*active.*rolled/i),
         "warning",
       );
     } finally {
+      const stop = captureHandler("remote-pi stop");
+      await stop("", makeMockCtx(cwd));
       if (held.ok) held.release();
+      delete process.env["REMOTE_PI_DIRECT_CONFIG"];
+      _resetCwdLockForTest();
+      rmSync(cwd, { recursive: true, force: true });
+    }
+  });
+
+  test("a refused rolled lock remains unpublished and the retry claims the same alternate", async () => {
+    const cwd = mkdtempSync(join(tmpdir(), "remote-pi-rolled-lock-refused-"));
+    const workspaceId = writeProtectedLocalConfig(cwd, "Backoffice");
+    process.env["REMOTE_PI_DIRECT_CONFIG"] = JSON.stringify({ agent_name: "Backoffice", auto_start_relay: false });
+    const preferredIdentity = {
+      workspaceId,
+      agentId: agentIdFromSessionId(testSessionId(cwd)),
+      processEpoch: _getRuntimeProcessEpochForTest(),
+    };
+    const rolledIdentity = rollRuntimeIdentity(preferredIdentity);
+    const preferredLock = await acquireIdentityLock(preferredIdentity);
+    const rolledLock = await acquireIdentityLock(rolledIdentity);
+    expect(preferredLock.ok).toBe(true);
+    expect(rolledLock.ok).toBe(true);
+    try {
+      const root = captureHandler("remote-pi");
+      const ctx = makeMockCtx(cwd);
+      await root("", ctx);
+
+      expect(_hasMeshNodeForTest()).toBe(false);
+      expect(_getRuntimeIdentityForTest()).toEqual(preferredIdentity);
+      expect(ctx.ui.notify).not.toHaveBeenCalledWith(expect.stringMatching(/rolled this process/i), expect.any(String));
+
+      if (rolledLock.ok) rolledLock.release();
+      await root("", ctx);
+
+      expect(_hasMeshNodeForTest()).toBe(true);
+      expect(_getRuntimeIdentityForTest()).toEqual(rolledIdentity);
+      expect(ctx.ui.notify).toHaveBeenCalledWith(expect.stringMatching(/rolled this process/i), "warning");
+    } finally {
+      const stop = captureHandler("remote-pi stop");
+      await stop("", makeMockCtx(cwd));
+      if (rolledLock.ok) rolledLock.release();
+      if (preferredLock.ok) preferredLock.release();
+      delete process.env["REMOTE_PI_DIRECT_CONFIG"];
+      _resetCwdLockForTest();
+      rmSync(cwd, { recursive: true, force: true });
+    }
+  });
+
+  test("a rolled normal identity owns and reconnects the same distinct relay room", async () => {
+    vi.useFakeTimers();
+    const cwd = mkdtempSync(join(tmpdir(), "remote-pi-rolled-relay-room-"));
+    const workspaceId = writeProtectedLocalConfig(cwd, "Backoffice", true);
+    process.env["REMOTE_PI_DIRECT_CONFIG"] = JSON.stringify({ agent_name: "Backoffice", auto_start_relay: true });
+    const preferredAgentId = agentIdFromSessionId(testSessionId(cwd));
+    const preferredLock = await acquireIdentityLock({ workspaceId, agentId: preferredAgentId });
+    const captured: Array<{ roomId?: string }> = [];
+    _defaultConnectImpl = async (options?: unknown) => { captured.push(options as { roomId?: string }); };
+    expect(preferredLock.ok).toBe(true);
+    try {
+      const root = captureHandler("remote-pi");
+      const ctx = makeMockCtx(cwd);
+      await root("", ctx);
+
+      const rolledIdentity = _getRuntimeIdentityForTest();
+      expect(rolledIdentity).toMatchObject({ workspaceId });
+      expect(rolledIdentity?.agentId).not.toBe(preferredAgentId);
+      expect(captured).toHaveLength(1);
+      expect(captured[0]?.roomId).toBe(roomIdForIdentity(rolledIdentity!));
+
+      relayInstances[0]!.emit("close");
+      await vi.advanceTimersByTimeAsync(1_000);
+
+      expect(_getRuntimeIdentityForTest()).toEqual(rolledIdentity);
+      expect(captured).toHaveLength(2);
+      expect(captured[1]?.roomId).toBe(captured[0]?.roomId);
+    } finally {
+      vi.useRealTimers();
+      const stop = captureHandler("remote-pi stop");
+      await stop("", makeMockCtx(cwd));
+      if (preferredLock.ok) preferredLock.release();
+      delete process.env["REMOTE_PI_DIRECT_CONFIG"];
+      _resetCwdLockForTest();
+      rmSync(cwd, { recursive: true, force: true });
+    }
+  });
+
+  test("concurrent joins in one session action share one attempt instead of rolling against themselves", async () => {
+    const cwd = mkdtempSync(join(tmpdir(), "remote-pi-concurrent-join-"));
+    const workspaceId = writeProtectedLocalConfig(cwd, "Backoffice");
+    process.env["REMOTE_PI_DIRECT_CONFIG"] = JSON.stringify({ agent_name: "Backoffice", auto_start_relay: false });
+    const preferredAgentId = agentIdFromSessionId(testSessionId(cwd));
+    const { MeshNode } = await import("./session/mesh_node.js");
+    const originalConnect = MeshNode.prototype.connect;
+    let releaseConnect!: () => void;
+    const connect = vi.spyOn(MeshNode.prototype, "connect").mockImplementationOnce(async function (
+      this: InstanceType<typeof MeshNode>,
+    ) {
+      await new Promise<void>((resolve) => { releaseConnect = resolve; });
+      return originalConnect.call(this);
+    });
+    try {
+      const root = captureHandler("remote-pi");
+      const ctx = makeMockCtx(cwd);
+      const first = root("", ctx);
+      await vi.waitFor(() => expect(connect).toHaveBeenCalledTimes(1));
+      const second = root("", ctx);
+      await new Promise((resolve) => setTimeout(resolve, 25));
+
+      expect(connect).toHaveBeenCalledTimes(1);
+      expect(_getRuntimeIdentityForTest()).toMatchObject({ workspaceId, agentId: preferredAgentId });
+
+      releaseConnect();
+      await Promise.all([first, second]);
+      expect(connect).toHaveBeenCalledTimes(1);
+      expect(_hasMeshNodeForTest()).toBe(true);
+    } finally {
+      connect.mockRestore();
+      const stop = captureHandler("remote-pi stop");
+      await stop("", makeMockCtx(cwd));
       delete process.env["REMOTE_PI_DIRECT_CONFIG"];
       _resetCwdLockForTest();
       rmSync(cwd, { recursive: true, force: true });

@@ -1,7 +1,7 @@
 import { describe, expect, test } from "vitest";
 import type { SessionExposurePolicy } from "./child_policy.js";
 import type { LocalConfigInspection } from "./local_config.js";
-import { EpochFence, agentIdFromSessionId, resolveRuntimeIdentity } from "./runtime_identity.js";
+import { EpochFence, agentIdFromSessionId, resolveRuntimeIdentity, rollRuntimeIdentity } from "./runtime_identity.js";
 
 const WORKSPACE_ID = "11111111-1111-4111-8111-111111111111";
 const AGENT_ID = "22222222-2222-4222-8222-222222222222";
@@ -76,6 +76,19 @@ describe("runtime identity", () => {
     expect(second.identity.agentId).toBe(first.identity.agentId);
     expect(second.identity.processEpoch).not.toBe(first.identity.processEpoch);
     expect(second.presentation.displayName).toBe("after");
+  });
+
+  test("rolls only agentId from the preferred identity and current process epoch", () => {
+    const preferred = { workspaceId: WORKSPACE_ID, agentId: AGENT_ID, processEpoch: EPOCH_1 };
+    const first = rollRuntimeIdentity(preferred);
+    const repeat = rollRuntimeIdentity(preferred);
+    const nextProcess = rollRuntimeIdentity({ ...preferred, processEpoch: EPOCH_2 });
+
+    expect(first).toEqual(repeat);
+    expect(first).toMatchObject({ workspaceId: WORKSPACE_ID, processEpoch: EPOCH_1 });
+    expect(first.agentId).not.toBe(AGENT_ID);
+    expect(nextProcess.agentId).not.toBe(first.agentId);
+    expect(preferred).toEqual({ workspaceId: WORKSPACE_ID, agentId: AGENT_ID, processEpoch: EPOCH_1 });
   });
 
   test("supports a supervisor-injected workspace identity without durable cwd config", () => {
