@@ -18,11 +18,15 @@ import { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
 import { StdioServerTransport } from "@modelcontextprotocol/sdk/server/stdio.js";
 import { z } from "zod";
 import { MeshNode } from "../session/mesh_node.js";
-import { loadLocalConfig, defaultAgentName, localConfigExists } from "../session/local_config.js";
+import { localConfigExists } from "../session/local_config.js";
 import { sessionSockPath, sessionAuditPath, LOCAL_SESSION_NAME } from "../session/global_config.js";
 import { resolveRelayUrl } from "../config.js";
-import { acquireCwdLock, type AcquiredLock } from "../session/cwd_lock.js";
-import { realpathSync } from "node:fs";
+import { acquireIdentityLock, type AcquiredLock } from "../session/cwd_lock.js";
+import { uuidFromStableText, type RuntimeIdentity } from "../session/runtime_identity.js";
+import { realpathSync, readFileSync, writeFileSync } from "node:fs";
+import { randomUUID, createHash } from "node:crypto";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
 
 // ── Args / config ─────────────────────────────────────────────────────────────
 
@@ -44,8 +48,22 @@ for (let i = 0; i < _argv.length; i++) {
   else if (_argv[i] === "--no-bridge") { _bridgeEnabled = false; }
 }
 
-const _cfg = loadLocalConfig(_cwd);
-const AGENT_NAME = _nameOverride ?? _cfg.agent_name ?? defaultAgentName(_cwd);
+// Name resolution is deliberately NOT folder-derived. The old chain fell back
+// to config.json's `agent_name` or `basename(cwd)` — both SHARED by every agent
+// launched from the same directory, so running many agents from one root gave
+// them all the same name (and thus a colliding (cwd, name) lock). New chain,
+// always unique per session:
+//   1. explicit --name / REMOTE_PI_MCP_NAME  — meaningful, operator/launcher set
+//   2. agent-<CMUX_PANEL_ID[:8]>             — unique + stable per cmux tab
+//   3. agent-<random8>                       — last resort (non-cmux manual run)
+// The `remote-pi claude` launcher resolves (1)/(2)/(3) ONCE and exports it via
+// REMOTE_PI_MCP_NAME, so the name stays stable across /mcp reconnects; the
+// fallback here only fires for a direct/manual mesh_server launch.
+function autoAgentName(): string {
+  const panel = process.env["CMUX_PANEL_ID"]?.replace(/[^A-Za-z0-9]/g, "");
+  if (panel) return `agent-${panel.slice(0, 8)}`;
+  return `agent-${randomUUID().replace(/-/g, "").slice(0, 8)}`;
+}
 // Platform-aware (plan/40): POSIX → broker.sock file; Windows → named pipe.
 const BROKER_SOCK = sessionSockPath(LOCAL_SESSION_NAME);
 const AUDIT_PATH = sessionAuditPath(LOCAL_SESSION_NAME);
@@ -93,11 +111,51 @@ process.on("uncaughtException", (err) => {
 let _canonCwd = _cwd;
 try { _canonCwd = realpathSync(_cwd); } catch { /* cwd missing — use raw path */ }
 
+// ── Durable identity + renamable presentation ─────────────────────────────────
+// The `~identity/<workspaceId>/<agentId>` route is the stable "id under the
+// hood": peers address THAT, and it never moves. agentId is derived from a
+// stable per-session key (launcher-exported REMOTE_PI_SESSION_KEY → cmux tab id
+// → a per-process uuid), so a /mcp reconnect re-acquires the SAME identity and
+// the SAME identity lock. workspaceId groups agents by root folder. The display
+// name is separate presentation and can be renamed live (broker
+// `update_presentation`) WITHOUT changing the route.
+const _sessionKey =
+  process.env["REMOTE_PI_SESSION_KEY"] ?? process.env["CMUX_PANEL_ID"] ?? randomUUID();
+const _identity: RuntimeIdentity = {
+  workspaceId: uuidFromStableText("remote-pi-mesh-workspace-v1", _canonCwd),
+  agentId: uuidFromStableText("remote-pi-mesh-agent-v1", _sessionKey),
+  processEpoch: randomUUID(),
+};
+
+// Session-scoped display-name store. A rename lands here so it survives /mcp
+// reconnects WITHIN this session; it lives in tmpdir keyed by the session key
+// (NOT a durable ~/.pi config), so a genuine relaunch under a fresh key reverts
+// to the auto name — the "session-only" rename behaviour.
+function _nameStorePath(): string {
+  const h = createHash("sha256").update(_sessionKey).digest("hex").slice(0, 16);
+  return join(tmpdir(), `remote-pi-name-${h}.txt`);
+}
+function _readStoredName(): string | undefined {
+  try { const s = readFileSync(_nameStorePath(), "utf8").trim(); return s || undefined; }
+  catch { return undefined; }
+}
+function _writeStoredName(name: string): void {
+  try { writeFileSync(_nameStorePath(), name); } catch { /* best-effort */ }
+}
+
+// Display name precedence: a prior in-session rename → explicit --name /
+// REMOTE_PI_MCP_NAME → auto (cmux/random). Never folder-config derived.
+const AGENT_NAME = _readStoredName() ?? _nameOverride ?? autoAgentName();
+
 const mesh = new MeshNode({
   sockPath: BROKER_SOCK,
   name: AGENT_NAME,
   cwd: _canonCwd,
   auditPath: AUDIT_PATH,
+  // Immutable runtime identity → the node registers under a stable
+  // ~identity/<workspaceId>/<agentId> route (not the legacy cwd@name alias), so
+  // renames only move the display name and the durable route stays put.
+  identity: _identity,
   // Own Pi-key cross-PC bridge — active only when this node leads (no Pi /
   // daemon already hosting the broker for this cwd). As a follower the
   // bridge stays dormant and cross-PC rides the existing leader.
@@ -120,6 +178,7 @@ const mcp = new McpServer(
     capabilities: { experimental: { "claude/channel": {} } },
     instructions: [
       `You are connected to the remote-pi agent mesh as "${AGENT_NAME}".`,
+      `Your durable id (stable under renames) is ~identity/${_identity.workspaceId}/${_identity.agentId}. The display name "${AGENT_NAME}" is just a label; use the rename tool to change it without moving your id.`,
       "At the start of each turn call get_messages to check for incoming messages from other agents.",
       "Use list_peers to discover available agents.",
       "Use agent_send with the exact opaque route returned by list_peers. Current peers use ~identity routes, cross-PC adds <pc>:, and legacy aliases may appear. Never build a route by hand.",
@@ -142,8 +201,27 @@ mcp.registerTool("list_peers", {
 }, async () => {
   if (!meshReady) return notReady();
   try {
-    const peers = await mesh.listPeers();
-    return { content: [{ type: "text" as const, text: peers.length > 0 ? peers.join("\n") : "(no peers)" }] };
+    // Render the display-name label alongside each stable identity route so an
+    // operator can tell peers apart without a separate probe. The `route` stays
+    // the verbatim echo-safe key; `alias` is the diagnostic cwd/name route. A
+    // peer with no structured detail (legacy/mixed sibling) falls back to its
+    // bare route rather than being dropped.
+    const { routes, detailed } = await mesh.listPeersDetailed();
+    const text = routes.length === 0
+      ? "(no peers)"
+      : routes.map((route) => {
+          const info = detailed.find((c) => (c.identityAddress ?? c.address) === route);
+          return info
+            ? JSON.stringify({
+                route,
+                name: info.name,
+                cwd: info.cwd,
+                ...(info.pc ? { pc: info.pc } : {}),
+                ...(info.identityAddress ? { alias: info.address } : {}),
+              })
+            : route;
+        }).join("\n");
+    return { content: [{ type: "text" as const, text }] };
   } catch (e) {
     return { content: [{ type: "text" as const, text: `list_peers failed: ${String(e)}` }], isError: true };
   }
@@ -202,6 +280,28 @@ mcp.registerTool("get_messages", {
   return { content: [{ type: "text" as const, text: lines.join("\n\n") }] };
 });
 
+mcp.registerTool("rename", {
+  description:
+    "Change this agent's display name on the mesh. The durable identity route " +
+    "(~identity/<workspace>/<agentId>) stays fixed — only the label peers see " +
+    "changes. Persists across /mcp reconnects for this session; reverts to the " +
+    "auto name on a fresh relaunch.",
+  inputSchema: { name: z.string().describe("New display name") },
+}, async ({ name }) => {
+  if (!meshReady) return notReady();
+  const trimmed = String(name).trim();
+  if (!trimmed) {
+    return { content: [{ type: "text" as const, text: "name must be a non-empty string" }], isError: true };
+  }
+  try {
+    const assigned = await mesh.rename(trimmed);
+    _writeStoredName(assigned);
+    return { content: [{ type: "text" as const, text: `Renamed to "${assigned}" — identity route unchanged (${_identity.agentId}).` }] };
+  } catch (e) {
+    return { content: [{ type: "text" as const, text: `rename failed: ${String(e)}` }], isError: true };
+  }
+});
+
 // ── Main ──────────────────────────────────────────────────────────────────────
 
 function isoNow(): string {
@@ -247,6 +347,18 @@ async function main(): Promise<void> {
       at: isoNow(),
     };
     inbox.push(msg);
+    // Interop with the context-lifecycle broker (8886c66 lineage): it withholds
+    // the sender's `received` ACK until the target confirms retention with a
+    // `mesh_delivery_receipt`, and reports `denied` after its window otherwise.
+    // The MCP inbox buffers unconditionally, so retention is already true here —
+    // confirm it, or every send from a lifecycle peer to this agent false-denies.
+    if (env.deliveryReceipt?.required) {
+      void mesh.send("broker", {
+        type: "mesh_delivery_receipt",
+        envelopeId: env.id,
+        status: "received",
+      }).catch(() => { /* sender sees timeout/denied; never forge a receipt */ });
+    }
     // Push via claude/channel so Claude wakes immediately (when the session
     // was launched with --dangerously-load-development-channels server:remote-pi-mesh).
     void mcp.server.notification({
@@ -265,14 +377,26 @@ async function main(): Promise<void> {
   process.stdin.on("close", shutdown);
   await mcp.connect(transport);
 
-  // Only join the mesh if this folder is an actual remote-pi agent — i.e. it
-  // has a local config (written by the `remote-pi claude` wizard) or an
-  // explicit name override. `-s local` MCP registrations are inherited by
-  // EVERY claude session in the git repo, so without this gate a plain claude
-  // opened in any subfolder would auto-grab that folder's lock and join as a
-  // stray agent — colliding with the real agent. No config ⇒ stay connected
-  // but idle (tools report why); don't lock, don't join, don't retry.
-  if (localConfigExists(_cwd) || _nameOverride !== undefined) {
+  // Only join the mesh if this is a real remote-pi mesh session. `-s local` MCP
+  // registrations are inherited by EVERY claude session in the git repo, so
+  // without this gate a plain claude opened in any subfolder would auto-grab a
+  // lock and join as a stray agent. We now recognise a real session by ANY of:
+  //   - REMOTE_PI_MESH_SESSION — set by the `remote-pi claude` launcher; the
+  //     primary signal now that naming/joining no longer requires a folder
+  //     config (agents run from a shared root with no per-folder config).
+  //   - CMUX_PANEL_ID — a cmux-launched session. Also covers sessions started
+  //     by an OLDER launcher (no REMOTE_PI_MESH_SESSION), so rebuilding the
+  //     server mid-session doesn't strand an already-running agent.
+  //   - an explicit --name / REMOTE_PI_MCP_NAME override.
+  //   - a legacy local config in this folder (back-compat).
+  // A bare claude that merely inherited a stale MCP registration matches none of
+  // these → stays connected but idle (tools report why); no lock, no join.
+  if (
+    process.env["REMOTE_PI_MESH_SESSION"] !== undefined ||
+    process.env["CMUX_PANEL_ID"] !== undefined ||
+    _nameOverride !== undefined ||
+    localConfigExists(_cwd)
+  ) {
     // Kick off the lock+join in the background. Never awaited — the MCP is
     // already serving; mesh availability arrives (and recovers) asynchronously.
     void tryJoinMesh();
@@ -283,17 +407,23 @@ async function main(): Promise<void> {
   }
 }
 
-/** Acquire the per-cwd lock, then join the mesh. Retries briefly to absorb a
- *  restart race; if the lock or join still fails after MAX_JOIN_ATTEMPTS, FAIL
- *  LOUD (exit) so the failure is visible instead of silently degrading. */
+/** Acquire the per-identity lock, then join the mesh. Retries briefly to absorb
+ *  a restart race; if the lock or join still fails after MAX_JOIN_ATTEMPTS, FAIL
+ *  LOUD (exit) so the failure is visible instead of silently degrading.
+ *
+ *  The lock is keyed on the immutable runtime identity (workspaceId, agentId),
+ *  NOT on cwd or the display name. So many agents coexist in one folder (each has
+ *  a distinct agentId), a rename never disturbs the lock, and a /mcp reconnect —
+ *  which re-derives the SAME identity from the stable session key — re-acquires
+ *  the same lock (the dead prior socket self-heals). */
 async function tryJoinMesh(): Promise<void> {
   if (_joined || _shuttingDown) return;
 
-  const res = await acquireCwdLock(_cwd);
+  const res = await acquireIdentityLock(_identity);
   if (!res.ok) {
     _lockAttempt++;
     if (_lockAttempt >= MAX_JOIN_ATTEMPTS) {
-      _failLoud(`folder already served by another remote-pi agent (lock: ${res.lockPath})`);
+      _failLoud(`runtime identity ${_identity.agentId} is already active in workspace ${_identity.workspaceId} (lock: ${res.lockPath})`);
     }
     degradedReason = `folder busy (lock ${res.lockPath}); attempt ${_lockAttempt}/${MAX_JOIN_ATTEMPTS}`;
     _scheduleJoinRetry(JOIN_RETRY_MS);
