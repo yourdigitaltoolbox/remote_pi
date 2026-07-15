@@ -10,6 +10,14 @@ export interface Envelope {
   id: string;                   // UUID v7
   re: string | null;            // id of the message this replies to, or null
   body: unknown;
+  /**
+   * Interop with the context-lifecycle broker lineage (8886c66): that broker
+   * stamps `{ required: true }` on the final target hop and ACKs the sender
+   * `denied` unless the target answers `mesh_delivery_receipt` within its
+   * window. This build's broker never sets it; clients must still honor it so
+   * a mixed mesh doesn't report false `denied` on delivered envelopes.
+   */
+  deliveryReceipt?: { required: true };
 }
 
 const UUID_RE =
@@ -90,12 +98,20 @@ export function parse(line: string): Envelope {
   if (!("body" in o)) {
     throw new EnvelopeError("body required");
   }
+  // Same validation as the lifecycle lineage: present ⇒ exactly {required:true}.
+  const deliveryReceipt = o["deliveryReceipt"];
+  if (deliveryReceipt !== undefined
+    && (!deliveryReceipt || typeof deliveryReceipt !== "object" || Array.isArray(deliveryReceipt)
+      || (deliveryReceipt as Record<string, unknown>)["required"] !== true)) {
+    throw new EnvelopeError("deliveryReceipt must be { required: true }");
+  }
   return {
     from: o["from"] as string,
     to: to as string | string[],
     id: o["id"] as string,
     re: re as string | null,
     body: o["body"],
+    ...(deliveryReceipt === undefined ? {} : { deliveryReceipt: { required: true as const } }),
   };
 }
 

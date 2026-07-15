@@ -4038,6 +4038,18 @@ async function _cmdJoin(ctx: Pick<ExtensionContext, "ui" | "cwd">): Promise<void
     }
     if (env.from === "broker") return;  // other broker control messages — ignore
 
+    // Interop with the context-lifecycle broker (8886c66 lineage): confirm
+    // retention so the sender's ACK doesn't false-deny. This build delivers
+    // straight to the agent (no admission spool), so status is `received`
+    // whenever we got this far.
+    if (env.deliveryReceipt?.required) {
+      void peer.send("broker", {
+        type: "mesh_delivery_receipt",
+        envelopeId: env.id,
+        status: "received",
+      }).catch(() => { /* sender sees timeout/denied; never forge a receipt */ });
+    }
+
     // Real agent-to-agent message (SessionPeer already correlated replies via
     // env.re before this point). Show it in the app's TOOL timeline and wake
     // the agent as a CUSTOM message — never as the user's own message.
