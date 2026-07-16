@@ -111,7 +111,7 @@
     "@modelcontextprotocol/sdk": "^1.29.0",
     "@napi-rs/keyring": "^1.3.0",
     "@noble/ed25519": "^3.1.0",
-    "@yourdigitaltoolbox/pi-context-lifecycle": "github:yourdigitaltoolbox/pi-context-lifecycle#6ac4ef2dd119d082be0b61f583c62559a954fb2f",
+    "@yourdigitaltoolbox/pi-context-lifecycle": "github:yourdigitaltoolbox/pi-context-lifecycle#9ce620d46822652a55277eae37e1fbe856d9bc91",
     "croner": "^10.0.1",
     "qrcode-terminal": "^0.12.0",
     "typebox": "^1.1.38",
