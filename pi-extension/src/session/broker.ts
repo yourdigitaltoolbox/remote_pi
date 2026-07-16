@@ -89,19 +89,16 @@ export function sanitizeMeshName(raw: string): string {
  *
  * ## ACK protocol (plan/25 Wave 0; reliable delivery per plan/34)
  *
- * For **unicast non-broker** envelopes the broker synchronously emits an ACK
- * envelope back to the sender once it has delivered:
+ * For **unicast non-broker** envelopes the broker writes a broker-only
+ * `deliveryReceipt` marker to the target and waits for its bounded domain spool
+ * to confirm retention before ACKing the sender:
  *
- *   - target online → deliver envelope, ACK `received`
- *   - no such peer  → silent drop (sender times out)
+ *   - target retained body → ACK `received`
+ *   - target rejects capacity/lifecycle receipt → ACK `denied`
+ *   - target absent or no receipt → sender receives denial/timeout
  *
- * plan/34 removed the busy-drop: a message that arrives while the target is
- * mid-turn is **always delivered**, never dropped. The Pi harness
- * (`sendMessage(triggerTurn:true)`) enqueues mid-turn messages and processes
- * them in the upcoming turn, so the broker needs no busy gate or mailbox.
- * Consequently `busy` is no longer a possible ACK status for unicast new
- * work — the sender always gets `received`. (Turn-lifecycle / working
- * indicators live in `index.ts` via room_meta over the relay, not here.)
+ * A target's busy model never discards work: its Remote Pi spool owns the
+ * queued body and lifecycle admission decides when it can start a turn.
  *
  * Broadcast/multicast/broker-addressed envelopes are not ACKed (no single
  * authoritative recipient or no semantic match). The audit log carries the
@@ -191,6 +188,14 @@ interface AckBody {
   target: string;
 }
 
+interface PendingTargetReceipt {
+  target: PeerConn;
+  resolve(status: RemoteInjectStatus): void;
+  timer: ReturnType<typeof setTimeout>;
+}
+
+const TARGET_RECEIPT_TIMEOUT_MS = 4_000;
+
 interface RegisterMsg {
   type: "register";
   name: string;
@@ -242,6 +247,8 @@ export class Broker {
   private readonly relayExposureExpiryTimers = new Map<string, ReturnType<typeof setTimeout>>();
   /** Plan/25 Wave C: optional handoff for cross-PC routing. Null = local only. */
   private remoteRouter: RemoteRouter | null = null;
+  /** Awaited target-side retention receipts, keyed by original envelope id. */
+  private readonly pendingTargetReceipts = new Map<string, PendingTargetReceipt>();
 
   constructor(opts: BrokerOptions) {
     this.server = opts.server;
@@ -251,6 +258,11 @@ export class Broker {
     this.server.on("close", () => {
       for (const timer of this.relayExposureExpiryTimers.values()) clearTimeout(timer);
       this.relayExposureExpiryTimers.clear();
+      for (const pending of this.pendingTargetReceipts.values()) {
+        clearTimeout(pending.timer);
+        pending.resolve("denied");
+      }
+      this.pendingTargetReceipts.clear();
     });
   }
 
@@ -399,13 +411,11 @@ export class Broker {
    *
    * Returns the ACK status so the caller (broker_remote) can pack and
    * forward an ACK envelope back across the relay:
-   *   - `received` — target exists, envelope delivered (plan/34: always
-   *     delivered when the peer is online — the Pi harness enqueues mid-turn
-   *     messages, so there is no busy-drop)
-   *   - `denied` — no such local peer (or write failed) — caller maps to
-   *     transport_error or denied ACK as it sees fit
+   *   - `received` — target retained this exact envelope in its local spool
+   *   - `denied` — target absent, receipt rejected/timed out, or write failed;
+   *     caller maps it to a cross-PC negative ACK
    */
-  injectFromRemote(env: Envelope): RemoteInjectStatus {
+  async injectFromRemote(env: Envelope): Promise<RemoteInjectStatus> {
     if (typeof env.to !== "string" || env.to === "broadcast" || env.to === BROKER_NAME) {
       // Cross-PC is unicast-only at this protocol layer.
       return "denied";
@@ -413,16 +423,29 @@ export class Broker {
     const targetName = env.to;
     const peer = this._peerAt(targetName);
     if (!peer) return "denied";
-
-    const line = serialize(env);
-    try {
-      peer.socket.write(line);
-    } catch {
-      return "denied";
+    const controlType = env.body && typeof env.body === "object" && !Array.isArray(env.body)
+      ? (env.body as { type?: unknown }).type
+      : undefined;
+    // Broker ACKs and relay transport errors are control completions, not model
+    // work. They must reach the local SessionPeer immediately to settle its
+    // pending map; requiring a model-spool receipt here would deadlock ACKs.
+    if (controlType === "ack" || controlType === "transport_error") {
+      try {
+        peer.socket.write(serialize(env));
+        void this._appendAudit(env, [targetName], "received", "relay");
+        this.onRouted?.(env, [targetName]);
+        return "received";
+      } catch {
+        return "denied";
+      }
     }
-    void this._appendAudit(env, [targetName], "received", "relay");
-    this.onRouted?.(env, [targetName]);
-    return "received";
+
+    const status = await this._deliverAwaitingTargetReceipt(env, peer);
+    if (status === "received") {
+      void this._appendAudit(env, [targetName], "received", "relay");
+      this.onRouted?.(env, [targetName]);
+    }
+    return status;
   }
 
   /** Primary routes currently registered. Current peers are ID-first. */
@@ -773,6 +796,16 @@ export class Broker {
   }
 
   private _onClose(conn: PeerConn): void {
+    // Do not let an old target socket hold a source's delivery promise until
+    // the wall-clock receipt timeout. A reconnect gets a distinct PeerConn;
+    // receipt ownership is exact-object fenced, so it cannot settle this old
+    // delivery after the source has already observed denial.
+    for (const [envelopeId, pending] of this.pendingTargetReceipts) {
+      if (pending.target !== conn) continue;
+      clearTimeout(pending.timer);
+      this.pendingTargetReceipts.delete(envelopeId);
+      pending.resolve("denied");
+    }
     // A connection may be a delegated parent, an active child, or both. Revoke
     // and reconcile by exact object identity before roster ownership moves.
     this.relayExposureLeases.revokeParent(conn);
@@ -821,27 +854,35 @@ export class Broker {
 
     const targets = this._resolveTargets(env);
     const delivered: string[] = [];
-    const line = serialize(env);
     const isUnicast = typeof env.to === "string" && env.to !== "broadcast";
 
-    // plan/34: reliable delivery — always write to the target's socket. The
-    // Pi harness enqueues messages that arrive mid-turn, so there is no
-    // busy-drop and `busy` is no longer a possible ACK status. Unicast sends
-    // to an online peer always ACK `received`.
+    // A positive unicast ACK is an acceptance receipt, not a socket-write
+    // receipt. The target first retains the body in its bounded Remote Pi spool
+    // and sends broker control confirmation; capacity or lifecycle refusal is
+    // negative before the source can observe `received`.
     let ackStatus: AckStatus | "none" = "none";
     const sender = this._peerAt(env.from);
     for (const targetName of targets) {
       const peer = this._peerAt(targetName);
       if (!peer || peer === sender) continue;  // unknown/self target: silent drop
 
-      try {
-        peer.socket.write(line);
-        const deliveredRoute = primaryRoute(peer);
-        delivered.push(deliveredRoute);
-        if (isUnicast) {
+      if (isUnicast) {
+        const status = await this._deliverAwaitingTargetReceipt(env, peer);
+        if (status === "received") {
+          const deliveredRoute = primaryRoute(peer);
+          delivered.push(deliveredRoute);
           ackStatus = "received";
           this._sendAckToSender(env, "received", deliveredRoute);
+        } else {
+          ackStatus = "denied";
+          this._sendAckToSender(env, "denied", primaryRoute(peer));
         }
+        continue;
+      }
+
+      try {
+        peer.socket.write(serialize(env));
+        delivered.push(primaryRoute(peer));
       } catch {
         // peer dropped mid-write — close handler will fire; treat as silent
       }
@@ -849,6 +890,42 @@ export class Broker {
 
     if (this.auditPath) await this._appendAudit(env, delivered, ackStatus);
     this.onRouted?.(env, delivered);
+  }
+
+  private _deliverAwaitingTargetReceipt(env: Envelope, target: PeerConn): Promise<RemoteInjectStatus> {
+    // A sender cannot choose or forge this field: both local and cross-PC
+    // broker entry points overwrite it on the final target hop. A malicious or
+    // broken raw client must also not overwrite another in-flight UUID entry.
+    if (this.pendingTargetReceipts.has(env.id)) return Promise.resolve("denied");
+    const delivered: Envelope = { ...env, deliveryReceipt: { required: true } };
+    return new Promise<RemoteInjectStatus>((resolve) => {
+      const timer = setTimeout(() => {
+        const pending = this.pendingTargetReceipts.get(env.id);
+        if (pending?.target !== target) return;
+        this.pendingTargetReceipts.delete(env.id);
+        resolve("denied");
+      }, TARGET_RECEIPT_TIMEOUT_MS);
+      timer.unref?.();
+      this.pendingTargetReceipts.set(env.id, { target, resolve, timer });
+      try {
+        target.socket.write(serialize(delivered));
+      } catch {
+        clearTimeout(timer);
+        this.pendingTargetReceipts.delete(env.id);
+        resolve("denied");
+      }
+    });
+  }
+
+  private _resolveTargetReceipt(env: Envelope, peer: PeerConn): void {
+    const body = env.body as Record<string, unknown> | null;
+    if (!body || body.type !== "mesh_delivery_receipt" || typeof body.envelopeId !== "string") return;
+    const pending = this.pendingTargetReceipts.get(body.envelopeId);
+    if (!pending || pending.target !== peer) return;
+    const status: RemoteInjectStatus = body.status === "received" ? "received" : "denied";
+    clearTimeout(pending.timer);
+    this.pendingTargetReceipts.delete(body.envelopeId);
+    pending.resolve(status);
   }
 
   private _resolveTargets(env: Envelope): string[] {
@@ -875,8 +952,8 @@ export class Broker {
   }
 
   /**
-   * Writes an ACK envelope to the original sender's socket. Synchronous —
-   * the caller is inside `_route` and must keep busy-check/busy-set atomic.
+   * Writes an ACK envelope to the original sender's socket after target
+   * retention has settled.
    * Broker → sender: `from="broker"`, `to=env.from`, `re=env.id`,
    * `body={type:"ack", status, target}`.
    */
@@ -899,6 +976,10 @@ export class Broker {
   private _handleBrokerMessage(env: Envelope, peer: PeerConn): void {
     const body = env.body as Record<string, unknown> | null;
     if (!body || typeof body !== "object" || Array.isArray(body)) return;
+    if (body["type"] === "mesh_delivery_receipt") {
+      this._resolveTargetReceipt(env, peer);
+      return;
+    }
     if (body["type"] === "relay_parent_deauthorize") {
       if (Object.keys(body).length !== 1) {
         this._sendBrokerReply(peer, env, { type: "relay_parent_deauthorize_result", ok: false, reason: "invalid_request" });

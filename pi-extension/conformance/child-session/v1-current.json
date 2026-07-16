@@ -20,14 +20,14 @@
       "name": "pi-subagents",
       "version": "0.34.1",
       "protocolVersion": 1,
-      "manifestSha256": "addc080c5677eb301a0b03e28ca36ee70edfb05ab439e4a68a22111a5d6b6870"
+      "manifestSha256": "a2cfde4a690f9bc8ba550f01040dd0e2038e1fb91740c0723a47fb1113c36e4c"
     },
     "compatibility": {
       "remotePi": {
         "state": "compatible",
         "version": "0.5.5",
         "protocolVersion": 1,
-        "manifestSha256": "ead52f60e9338e71a39288165f20d3437e5fa1d93f542ed831983ab99d12cd5d"
+        "manifestSha256": "86cd135fe0e3379bc6ec83f3a5d44c017726370394aa9401f7c50f21092ebe4a"
       }
     }
   },

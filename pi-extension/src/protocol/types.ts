@@ -29,6 +29,23 @@ export type ClientMessage =
   // broadcasts, compaction notice) still flow through the normal channels.
   | { type: "session_new"; id: string }
   | { type: "session_compact"; id: string }
+  /** Paired-owner-only lifecycle metadata; contains no held consumer body. */
+  | { type: "lifecycle_status"; id: string }
+  /** Explicit operator repair. All CAS predicates are mandatory on the wire. */
+  | {
+      type: "lifecycle_repair";
+      id: string;
+      action: LifecycleRepairAction;
+      operation_id: string;
+      session_id: string;
+      generation_id: string;
+      expected_phase: "blocked-unknown";
+      expected_sequence: number;
+      evidence_class: LifecycleRepairEvidenceClass;
+      consumer_id?: string;
+      lane_id?: LifecycleLane;
+      evidence_entry_id?: string;
+    }
   | { type: "model_set"; id: string; provider: string; model_id: string }
   | { type: "thinking_set"; id: string; level: ThinkingLevel }
   | { type: "list_models"; id: string };
@@ -159,9 +176,20 @@ export type ServerMessage =
   // `models_list` is the response to a `list_models` request; the optional
   // `current` echoes the model the Pi is using right now so the app can
   // highlight the selected row without a second round-trip.
-  | { type: "action_ok"; in_reply_to: string; action: ActionName }
+  | {
+      type: "action_ok";
+      in_reply_to: string;
+      action: ActionName;
+      /** Present only for lifecycle-owned compaction admission. */
+      operation_id?: string;
+      generation_id?: string;
+      disposition?: "accepted" | "joined";
+    }
   | { type: "action_error"; in_reply_to: string; action: ActionName; error: string }
-  | { type: "models_list"; in_reply_to: string; models: WireModel[]; current?: WireModel };
+  | { type: "models_list"; in_reply_to: string; models: WireModel[]; current?: WireModel }
+  | { type: "lifecycle_status"; in_reply_to: string; snapshot: LifecycleStatusSnapshot; diagnostics: LifecycleDiagnostic[] }
+  | { type: "lifecycle_repair"; in_reply_to: string; disposition: "applied" | "rejected"; action?: LifecycleRepairAction; operation_id?: string; generation_id?: string; sequence?: number; code?: string }
+  | { type: "lifecycle_outcome"; operation_id: string; session_id: string; generation_id: string; outcome: LifecycleOutcome; code?: string };
 
 /**
  * Plan/28 — Stable names for the typed actions the app can request. Kept
@@ -186,6 +214,31 @@ export type ActionName =
  * surfaces all 6 buttons but can grey out unsupported ones using the
  * model's metadata if the picker fetches it later.
  */
+/** Public lifecycle protocol subset deliberately mirrored at the Remote wire. */
+export type LifecyclePhase = "idle" | "pending-settle" | "observed-preflight" | "compacting" | "resuming" | "releasing" | "blocked-unknown";
+export type LifecycleOutcome = "completed" | "failed" | "cancelled" | "blocked";
+export type LifecycleLane = "failure-attention-decision" | "mesh-reply" | "mesh-unsolicited" | "subagent-success" | "background-notify" | "loop-tick" | "cron-tick";
+export type LifecycleRepairAction = "recognize-resume-admitted" | "retry-resume-pending" | "abandon-ambiguous-resume" | "retry-blocked-drainer" | "abandon-interrupted-operation";
+export type LifecycleRepairEvidenceClass = "persisted-resume-message" | "persisted-resume-run-settled" | "no-admission-attempt" | "current-process-quiescent" | "owner-process-replaced" | "idempotent-drainer-state" | "branch-validated-owner-replaced";
+export type LifecycleStatusSnapshot = {
+  registry_state: "unavailable" | "ready" | "disposing" | "incompatible";
+  sequence: number;
+  session_id?: string;
+  generation_id?: string;
+  phase?: LifecyclePhase;
+  operation_id?: string;
+  reason?: "self" | "remote" | "builtin" | "threshold" | "overflow";
+  last_outcome?: "completed" | "failed" | "cancelled" | "timed-out";
+};
+export type LifecycleDiagnostic = {
+  sequence: number;
+  timestamp: number;
+  code: string;
+  operation_id?: string;
+  phase?: LifecyclePhase;
+  outcome?: "completed" | "failed" | "cancelled" | "timed-out";
+};
+
 export type ThinkingLevel =
   | "off" | "minimal" | "low" | "medium" | "high" | "xhigh";
 

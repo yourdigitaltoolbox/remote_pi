@@ -140,11 +140,10 @@ export class SessionPeer {
   }
 
   /**
-   * Unicast send + await broker ACK. Returns the ACK status:
-   *   - `received` — peer was idle, envelope delivered, will be processed soon
-   *   - `busy`     — peer mid-turn, envelope dropped; sender is owner of retry
-   *   - `denied`   — peer explicitly refused (reserved; no producer in MVP)
-   *   - `timeout`  — no ACK within `timeoutMs`; treat as transport error
+   * Unicast send + await broker ACK. `received` means the target retained the
+   * exact envelope in its bounded Remote Pi spool; it is never a bare socket
+   * write. `denied` means target retention failed (capacity/lifecycle/etc.) and
+   * `timeout` means no receipt arrived within `timeoutMs`.
    *
    * Only meaningful for unicast non-broadcast addresses. The peer's body-level
    * reply (if any) is asynchronous and arrives as a normal inbound envelope

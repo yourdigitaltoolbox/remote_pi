@@ -25,9 +25,19 @@ async function makePeer(
   auditPath?: string,
   identity?: { workspaceId: string; agentId: string; processEpoch: string },
   cwd?: string,
+  autoRetain = true,
 ): Promise<SessionPeer> {
   const peer = new SessionPeer({ sockPath, name, auditPath, defaultTimeoutMs: 3000, identity, cwd });
   await peer.start();
+  // The production extension retains an inbound envelope before this control
+  // receipt. Most broker-focused tests model an accepting target by default;
+  // receipt-specific tests opt out to assert negative/timeout behavior.
+  if (autoRetain) {
+    peer.onMessage((env) => {
+      if (!env.deliveryReceipt?.required) return;
+      void peer.send("broker", { type: "mesh_delivery_receipt", envelopeId: env.id, status: "received" });
+    });
+  }
   return peer;
 }
 
@@ -229,6 +239,35 @@ describe("ACK protocol (plan/25 Wave 0)", () => {
     await orq.leave(); await backend.leave();
   });
 
+  test("target retention denial returns negative ACK before source observes received", async () => {
+    const sock = tmpSock();
+    const orq = await makePeer(sock, "orq");
+    const backend = await makePeer(sock, "backend", undefined, undefined, undefined, false);
+    backend.onMessage((env) => {
+      if (!env.deliveryReceipt?.required) return;
+      void backend.send("broker", { type: "mesh_delivery_receipt", envelopeId: env.id, status: "denied", code: "spool-byte-capacity" });
+    });
+
+    const ack = await orq.sendWithAck("backend", { task: "must-retain" });
+    expect(ack.status).toBe("denied");
+    await orq.leave(); await backend.leave();
+  });
+
+  test("target disconnect invalidates its pending receipt without a stale reconnect ACK", async () => {
+    const sock = tmpSock();
+    const orq = await makePeer(sock, "orq");
+    const backend = await makePeer(sock, "backend", undefined, undefined, undefined, false);
+    backend.onMessage((env) => {
+      if (env.deliveryReceipt?.required) void backend.leave();
+    });
+
+    const started = Date.now();
+    const ack = await orq.sendWithAck("backend", { task: "disconnect-before-retain" });
+    expect(ack.status).toBe("denied");
+    expect(Date.now() - started).toBeLessThan(1_000);
+    await orq.leave();
+  });
+
   test("plan/34: send to mid-turn peer is delivered, not dropped → status=received", async () => {
     const sock = tmpSock();
     const orq = await makePeer(sock, "orq");
@@ -357,7 +396,7 @@ describe("ACK protocol (plan/25 Wave 0)", () => {
       re: outboundId,
       body: { type: "ack", status: "received", target: "agent-1" },
     };
-    expect(broker.injectFromRemote(crossPcAck)).toBe("received");
+    expect(await broker.injectFromRemote(crossPcAck)).toBe("received");
 
     const result = await pendingAck;
     expect(result.status).toBe("received");
@@ -391,14 +430,14 @@ describe("ACK protocol (plan/25 Wave 0)", () => {
       from: "casa:sess-3", to: "backend", id: "01976000-0000-7000-8000-000000000001",
       re: null, body: { task: "do thing" },
     };
-    expect(broker.injectFromRemote(newWork)).toBe("received");
+    expect(await broker.injectFromRemote(newWork)).toBe("received");
 
     // A reply (re set) — same outcome.
     const reply = {
       from: "casa:sess-3", to: "backend", id: "01976000-0000-7000-8000-000000000002",
       re: "01976000-0000-7000-8000-000000000003", body: { answer: 42 },
     };
-    expect(broker.injectFromRemote(reply)).toBe("received");
+    expect(await broker.injectFromRemote(reply)).toBe("received");
 
     await new Promise((r) => setTimeout(r, 50));
     expect(backendInbox.length).toBe(2);
@@ -415,7 +454,7 @@ describe("ACK protocol (plan/25 Wave 0)", () => {
       from: "casa:sess-3", to: "no-such-peer", id: "01976000-0000-7000-8000-000000000004",
       re: null, body: { x: 1 },
     };
-    expect(broker.injectFromRemote(env)).toBe("denied");
+    expect(await broker.injectFromRemote(env)).toBe("denied");
 
     await orq.leave();
   });
@@ -525,7 +564,7 @@ describe("ACK protocol (plan/25 Wave 0)", () => {
       from: "casa:sess-3", to: "orq", id: "01976000-0000-7000-8000-aaaaaaaaaaac",
       re: null, body: { task: "remote ping" },
     };
-    expect(broker.injectFromRemote(env)).toBe("received");
+    expect(await broker.injectFromRemote(env)).toBe("received");
     await wait(40);
 
     const lines = readFileSync(audit, "utf8").trim().split("\n").filter(Boolean).map((l) => JSON.parse(l));

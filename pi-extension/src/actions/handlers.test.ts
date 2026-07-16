@@ -23,6 +23,7 @@ import {
   type ActionModelRegistry,
   type SdkModelLike,
 } from "./handlers.js";
+import type { CompactDisposition } from "@yourdigitaltoolbox/pi-context-lifecycle";
 import type { ServerMessage } from "../protocol/types.js";
 
 function makeSender() {
@@ -66,39 +67,37 @@ function fakeRegistry(catalog: SdkModelLike[]): ActionModelRegistry {
 // ── session_compact ────────────────────────────────────────────────────────
 
 describe("handleSessionCompact", () => {
-  test("calls ctx.compact() with an English-summary instruction and replies action_ok", () => {
-    const compactArgs: unknown[] = [];
-    const ctx: ActionCtx = { compact: (opts) => { compactArgs.push(opts); } };
+  function lifecycle(result: CompactDisposition | Error) {
+    return { request: (id: string): CompactDisposition => {
+      expect(id).toBe("r1");
+      if (result instanceof Error) throw result;
+      return result;
+    } };
+  }
+
+  test("returns a correlated lifecycle admission instead of calling ctx.compact directly", () => {
     const sender = makeSender();
-    handleSessionCompact(ctx, sender, { type: "session_compact", id: "r1" });
-    expect(compactArgs).toHaveLength(1);
-    // The summary must be forced to English (surfaced via the `compaction` msg).
-    expect(JSON.stringify(compactArgs[0])).toMatch(/English/i);
+    handleSessionCompact(lifecycle({ disposition: "accepted", operationId: "op-1", generationId: "generation-1" }), sender, { type: "session_compact", id: "r1" });
     expect(sender.sent).toEqual([
-      { type: "action_ok", in_reply_to: "r1", action: "session_compact" },
+      { type: "action_ok", in_reply_to: "r1", action: "session_compact", operation_id: "op-1", generation_id: "generation-1", disposition: "accepted" },
     ]);
   });
 
-  test("returns action_error when ctx is null", () => {
+  test("reports a fail-closed lifecycle rejection", () => {
     const sender = makeSender();
-    handleSessionCompact(null, sender, { type: "session_compact", id: "r1" });
-    expect(sender.sent).toHaveLength(1);
+    handleSessionCompact(lifecycle({ disposition: "rejected", code: "lifecycle-authority-unavailable" }), sender, { type: "session_compact", id: "r1" });
     expect(sender.sent[0]).toMatchObject({
       type: "action_error",
       in_reply_to: "r1",
       action: "session_compact",
-      error: expect.stringContaining("compact unavailable"),
+      error: "lifecycle-authority-unavailable",
     });
   });
 
-  test("returns action_error when ctx.compact throws", () => {
-    const ctx: ActionCtx = { compact: () => { throw new Error("boom"); } };
+  test("reports a lifecycle requester exception", () => {
     const sender = makeSender();
-    handleSessionCompact(ctx, sender, { type: "session_compact", id: "r1" });
-    expect(sender.sent[0]).toMatchObject({
-      type: "action_error",
-      error: "boom",
-    });
+    handleSessionCompact(lifecycle(new Error("boom")), sender, { type: "session_compact", id: "r1" });
+    expect(sender.sent[0]).toMatchObject({ type: "action_error", error: "boom" });
   });
 });
 

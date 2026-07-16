@@ -73,6 +73,8 @@ export interface RemotePeerEntry {
   infos: WirePeerInfo[];
   pcPubkey: string;
   ts: number;
+  /** Only receipt-v1 siblings may receive new-work envelopes. */
+  receiptProtocol: 1 | undefined;
 }
 
 interface SiblingInfo {
@@ -103,6 +105,8 @@ interface PeersUpdateBody {
    *  it, and the receiver synthesizes `{cwd:"", name:addr, address:addr}` from
    *  `peers`. A new sibling sends both. */
   peers_detailed?: WirePeerInfo[];
+  /** Slice 6 capability: target ACKs only after bounded spool retention. */
+  receipt_protocol?: 1;
 }
 
 interface PeersRequestBody {
@@ -155,7 +159,7 @@ export class BrokerRemote implements RemoteRouter {
 
     for (const s of opts.siblings ?? []) this._addSibling(s);
 
-    this.onIncoming = (env, fromPc) => this.handleIncoming(env, fromPc);
+    this.onIncoming = (env, fromPc) => { void this.handleIncoming(env, fromPc); };
     this.pi.on("envelope", this.onIncoming);
 
     this.broker.setRemoteRouter(this);
@@ -205,6 +209,7 @@ export class BrokerRemote implements RemoteRouter {
     return {
       type: "peers_update",
       peers: detailed.map((p) => p.identityAddress ?? p.address),
+      receipt_protocol: 1,
       peers_detailed: detailed.map((p) => ({
         cwd: p.cwd,
         name: p.name,
@@ -370,7 +375,17 @@ export class BrokerRemote implements RemoteRouter {
     const siblingPk = this.siblingByLabel.get(pcLabel);
     if (!siblingPk) return false;  // unknown prefix → fall through
 
-    // We have a destination PC. Rewrite `from` with our own pc_label.
+    // A legacy sibling reports the old socket-write ACK semantics. Refuse its
+    // new-work route until the roster control plane proves receipt-v1 support;
+    // waiting/timeout is visible, whereas a false `received` is not.
+    const remote = this.remotePeers.get(pcLabel);
+    if (remote?.receiptProtocol !== 1) {
+      this._sendControlEnvelope(siblingPk, { type: "peers_request" } satisfies PeersRequestBody);
+      void this._awaitPeersFill(pcLabel, PEERS_REQUEST_TIMEOUT_MS);
+      return false;
+    }
+
+    // We have a receipt-compatible destination PC. Rewrite `from` with our own pc_label.
     const rewritten: Envelope = {
       ...env,
       from: `${this.selfPcLabel}:${env.from}`,
@@ -381,10 +396,6 @@ export class BrokerRemote implements RemoteRouter {
     // received/busy/denied on actual local UDS state). A simultaneous
     // `peers_request` warms the cache for next time.
     this.pi.sendEnvelopeToPi(siblingPk, rewritten);
-    if (this.remotePeers.get(pcLabel) === undefined) {
-      this._sendControlEnvelope(siblingPk, { type: "peers_request" } satisfies PeersRequestBody);
-      void this._awaitPeersFill(pcLabel, PEERS_REQUEST_TIMEOUT_MS);
-    }
     return true;
   }
 
@@ -395,7 +406,7 @@ export class BrokerRemote implements RemoteRouter {
    * envelope verbatim plus the verified `from_pc` (Pi-pubkey of the
    * sender, authoritative — relay-checked).
    */
-  handleIncoming(env: Envelope, fromPc: string): void {
+  async handleIncoming(env: Envelope, fromPc: string): Promise<void> {
     // ── transport_error from relay ─────────────────────────────────────────
     // The relay synthesises these with `from_pc = "_relay"` and
     // `envelope.from = "_relay"`. Inject locally as a system envelope
@@ -430,7 +441,8 @@ export class BrokerRemote implements RemoteRouter {
 
     // ── control: peers_update ──────────────────────────────────────────────
     if (bodyType === "peers_update") {
-      this._setRemoteCache(claimedLabel, fromPc, _parsePeersUpdate(body as PeersUpdateBody));
+      const update = body as PeersUpdateBody;
+      this._setRemoteCache(claimedLabel, fromPc, _parsePeersUpdate(update), update.receipt_protocol === 1 ? 1 : undefined);
       return;
     }
 
@@ -473,7 +485,7 @@ export class BrokerRemote implements RemoteRouter {
       return;
     }
 
-    const status = this.broker.injectFromRemote(injectedEnv);
+    const status = await this.broker.injectFromRemote(injectedEnv);
     // Only generate an ACK for non-ACK envelopes — otherwise we'd loop
     // ACKing the ACK. Detect by body shape.
     if (bodyType === "ack") return;
@@ -497,8 +509,9 @@ export class BrokerRemote implements RemoteRouter {
     pcLabel: string,
     pcPubkey: string,
     infos: WirePeerInfo[],
+    receiptProtocol: 1 | undefined,
   ): void {
-    this.remotePeers.set(pcLabel, { infos, pcPubkey, ts: Date.now() });
+    this.remotePeers.set(pcLabel, { infos, pcPubkey, ts: Date.now(), receiptProtocol });
     // Resolve any pending `peers_request` waiters for this label.
     const pending = this.pendingFills.get(pcLabel);
     if (pending) {

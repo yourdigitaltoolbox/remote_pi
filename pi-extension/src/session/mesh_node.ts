@@ -406,11 +406,11 @@ export class MeshNode {
    * cwd/name compatibility `address` alongside its stable identity route. Lets a
    * client show a label next to the immutable id without parsing route strings.
    *
-   * Returns both the flat `routes` (the authoritative echo-safe list, self
-   * excluded) and the `detailed` records aligned to them. A route with no
-   * matching detail — a legacy/mixed-version sibling that sent only flat
-   * `peers` — is still present in `routes`, so callers fall back to the bare
-   * route for it rather than dropping the peer.
+   * Returns both the flat `routes` (self excluded) and every broker-supplied
+   * `detailed` record (self excluded). Detail records are not synthesized from
+   * or filtered through flat routes: authority consumers must be able to see a
+   * current-protocol record whose `identityAddress` is missing and fail closed,
+   * rather than silently degrading it to a legacy address.
    */
   async listPeersDetailed(
     timeoutMs = 2_000,
@@ -421,7 +421,7 @@ export class MeshNode {
     const routes = (body?.peers ?? []).filter((p) => p !== self);
     const detailed = (body?.peers_detailed ?? []).filter((info) => {
       const route = info.identityAddress ?? info.address;
-      return route !== self && routes.includes(route);
+      return route !== self;
     });
     return { routes, detailed };
   }
