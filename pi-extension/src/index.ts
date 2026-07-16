@@ -74,7 +74,7 @@ import {
   type ActionCtx,
 } from "./actions/handlers.js";
 import { ensureModelRegistry } from "./actions/registry.js";
-import { RemoteLifecycleController } from "./lifecycle/remote_lifecycle.js";
+import { RemoteLifecycleController, remoteLifecycleControllerOverrideForTest } from "./lifecycle/remote_lifecycle.js";
 import {
   MeshSpool,
   recoverableMeshSpoolEvents,
@@ -297,6 +297,9 @@ const _remoteLifecycle = new RemoteLifecycleController((event) => {
     ...(event.code ? { code: event.code } : {}),
   });
 });
+function _currentRemoteLifecycle(): RemoteLifecycleController {
+  return remoteLifecycleControllerOverrideForTest() ?? _remoteLifecycle;
+}
 let _runtimeCwd: string | null = null;
 let _runtimeProcessEpoch = randomUUID();
 const _runtimeEpochFence = new EpochFence();
@@ -876,6 +879,76 @@ function _persistModelDefault(provider: string, modelId: string): void {
 // Per-turn messaging state
 let _currentTurnId: string | null = null;
 
+/**
+ * Remote-owned cancellation is deliberately narrower than the display/stream
+ * turn id.  A cancel may only address an app submission that is still the
+ * current turn in this exact session generation.  `agent_settled` has no turn
+ * id, so the single pending record is its terminal receipt; replacing/resetting
+ * a turn fences that receipt before it can acknowledge an older abort.
+ */
+type RemoteTurn = {
+  runtimeSessionId: string;
+  lifecycleGenerationId: string;
+  sessionActionEpoch: number;
+  epoch: number;
+  targetId: string;
+  phase: "active" | "cancelling";
+  cancelRequestId?: string;
+  cancelSender?: PlainPeerChannel;
+  abortContext: Pick<ExtensionContext, "abort">;
+};
+let _remoteTurnEpoch = 0;
+let _activeRemoteTurn: RemoteTurn | null = null;
+
+function _clearRemoteTurn(): void {
+  _activeRemoteTurn = null;
+}
+
+function _beginRemoteTurn(
+  targetId: string,
+  routeCtx: Pick<ExtensionContext, "abort">,
+): void {
+  // A newly submitted normal turn is a hard fence for an earlier active or
+  // cancelling turn, including its eventual agent_settled receipt.
+  _clearRemoteTurn();
+  const runtimeSessionId = _runtimeSessionId ?? _sessionIdFromContext(_lastEventCtx);
+  const lifecycleSnapshot = _currentRemoteLifecycle().status().snapshot;
+  const lifecycleGenerationId = lifecycleSnapshot.generationId;
+  // Prefer the current session_start context. The route context is only a
+  // fallback when no current event context exists; preserving the selected
+  // object also preserves abort's receiver binding at invocation time.
+  const eventCtxSessionId = _sessionIdFromContext(_lastEventCtx);
+  const abortContext = _lastEventCtx && (!eventCtxSessionId || eventCtxSessionId === runtimeSessionId)
+    ? _lastEventCtx
+    : routeCtx;
+  if (lifecycleSnapshot.registryState !== "ready"
+    || lifecycleSnapshot.sessionId !== runtimeSessionId
+    || !runtimeSessionId
+    || !lifecycleGenerationId
+    || !abortContext
+    || typeof abortContext.abort !== "function") return;
+  _activeRemoteTurn = {
+    runtimeSessionId,
+    lifecycleGenerationId,
+    sessionActionEpoch: _sessionActionEpoch,
+    epoch: ++_remoteTurnEpoch,
+    targetId,
+    phase: "active",
+    abortContext,
+  };
+}
+
+function _isCurrentRemoteTurn(turn: RemoteTurn): boolean {
+  const lifecycleSnapshot = _currentRemoteLifecycle().status().snapshot;
+  return _activeRemoteTurn === turn
+    && _remoteTurnEpoch === turn.epoch
+    && _runtimeSessionId === turn.runtimeSessionId
+    && _sessionActionEpoch === turn.sessionActionEpoch
+    && lifecycleSnapshot.registryState === "ready"
+    && lifecycleSnapshot.sessionId === turn.runtimeSessionId
+    && lifecycleSnapshot.generationId === turn.lifecycleGenerationId;
+}
+
 // Module-level pi reference
 let _pi: ExtensionAPI | null = null;
 
@@ -1105,6 +1178,7 @@ function _goIdle(byeReason?: import("./protocol/types.js").ByeReason): void {
   _activePeers.clear();
   _peerShort = "";
   _currentTurnId = null;
+  _clearRemoteTurn();
 
   _relay?.close();
   _relay = null;
@@ -1162,6 +1236,7 @@ function _onRelayClose(identity: RuntimeIdentity, closedRelay: RelayClient): voi
   _activePeers.clear();
   _peerShort = "";
   _currentTurnId = null;
+  _clearRemoteTurn();
 
   _relay = null;  // _relayUrl preserved for retry
 
@@ -1472,6 +1547,7 @@ export function _onPeerDisconnect(appPeerId?: string): void {
   // No owner left. Conservatively clear the turn so the next pair_request
   // starts cleanly.
   _currentTurnId = null;
+  _clearRemoteTurn();
   _refreshFooter();
   _lastCtx?.ui.notify("[remote-pi] All app peers disconnected, listening for reconnect", "info");
   // Auto-listener stays up — same listener catches the reconnect on any peer.
@@ -1946,6 +2022,8 @@ const extension: ExtensionFactory = (pi: ExtensionAPI): void => {
     if (event.source === "extension") return;
     const turnId = `local_${randomUUID()}`;
     _currentTurnId = turnId;
+    // A terminal/RPC turn supersedes any remote-owned cancellation receipt.
+    _clearRemoteTurn();
     _broadcastToActive({ type: "user_input", id: turnId, text: event.text });
     return undefined;
   });
@@ -2064,6 +2142,22 @@ const extension: ExtensionFactory = (pi: ExtensionAPI): void => {
 
   pi.on("agent_settled", (_event, ctx) => {
     const sessionId = _sessionIdFromContext(ctx) ?? _runtimeSessionId;
+    const pending = _activeRemoteTurn;
+    // `agent_settled` is the only genuine terminal receipt available through
+    // public Pi hooks.  It may arrive after agent_end, so retain a cancelling
+    // record until here, but fence it by runtime session + generation first.
+    if (pending?.phase === "cancelling" && sessionId === pending.runtimeSessionId) {
+      const isCurrent = _isCurrentRemoteTurn(pending);
+      _clearRemoteTurn();
+      if (isCurrent) {
+        try {
+          if (pending.cancelRequestId && pending.cancelSender) {
+            pending.cancelSender.send({ type: "cancelled", in_reply_to: pending.cancelRequestId, target_id: pending.targetId });
+          }
+        } catch { /* sender may have disconnected after abort */ }
+      }
+    }
+
     const spool = _meshSpool;
     if (!sessionId || !spool || _runtimeSessionId !== sessionId) return;
     // Proof always wins. Only proofless attempts return to held, and only at
@@ -2076,9 +2170,15 @@ const extension: ExtensionFactory = (pi: ExtensionAPI): void => {
   pi.on("agent_end", () => {
     // Buffer is fed by `message_end`; here we only finalize the outbound
     // turn signal to every connected owner. No buffer mutation.
-    if (!_anyPeerActive() || !_currentTurnId) return;
+    if (!_anyPeerActive() || !_currentTurnId) {
+      if (_activeRemoteTurn?.phase !== "cancelling") _clearRemoteTurn();
+      return;
+    }
     _broadcastToActive({ type: "agent_done", in_reply_to: _currentTurnId });
     _currentTurnId = null;
+    // A cancellation waits for the subsequent genuine agent_settled receipt;
+    // ordinary completed turns have no pending acknowledgement to retain.
+    if (_activeRemoteTurn?.phase !== "cancelling") _clearRemoteTurn();
   });
 
   // plan/34: the broker no longer gates delivery on busy state, so we no
@@ -2146,6 +2246,8 @@ const extension: ExtensionFactory = (pi: ExtensionAPI): void => {
     // ctx. A reused module clears `_disposed` below, so `_disposed` alone is
     // not sufficient to distinguish the old continuation from this fresh ctx.
     _sessionActionEpoch += 1;
+    _currentTurnId = null;
+    _clearRemoteTurn();
     _lastEventCtx = ctx;
     if ("cwd" in ctx && typeof ctx.cwd === "string") _sessionCwd = ctx.cwd;
     const sessionId = _sessionIdFromContext(ctx);
@@ -2156,7 +2258,7 @@ const extension: ExtensionFactory = (pi: ExtensionAPI): void => {
       _runtimeProcessEpoch = randomUUID();
     }
     if (sessionId) _runtimeSessionId = sessionId;
-    _remoteLifecycle.bind(sessionId);
+    _currentRemoteLifecycle().bind(sessionId);
     _replaceMeshSpool(sessionId, ctx);
     // Pi → remote-pi name sync is presentation-only. Before the mesh exists it
     // updates only runtime presentation so the first join uses the Pi session
@@ -2254,7 +2356,9 @@ const extension: ExtensionFactory = (pi: ExtensionAPI): void => {
     // down — the race that left a mute `Backoffice` behind when the Cockpit
     // fired switch_session right after boot.
     _disposed = true;
-    _remoteLifecycle.dispose();
+    _currentTurnId = null;
+    _clearRemoteTurn();
+    _currentRemoteLifecycle().dispose();
     _meshProbeBinding?.dispose();
     _meshProbeBinding = null;
     _meshSpool?.dispose();
@@ -4415,25 +4519,6 @@ async function _cmdJoinOnce(
  * `_broadcastToActive` from the SDK event handlers; this router only
  * handles incoming app→pi requests.
  */
-function _abortCurrentTurn(
-  fallbackCtx?: Pick<ExtensionContext, "abort">,
-): boolean {
-  const candidates: Array<Pick<ExtensionContext, "abort"> | null | undefined> = [
-    _lastEventCtx,
-    _lastCtx,
-    fallbackCtx,
-  ];
-
-  for (const candidate of candidates) {
-    if (!candidate || candidate === _noopCtx) continue;
-    if (typeof candidate.abort !== "function") continue;
-    candidate.abort();
-    return true;
-  }
-
-  return false;
-}
-
 export function _routeClientMessageFrom(
   sender: PlainPeerChannel,
   msg: ClientMessage,
@@ -4446,25 +4531,22 @@ export function _routeClientMessageFrom(
     return;
   }
   if (msg.type === "cancel") {
+    const turn = _activeRemoteTurn;
+    if (!turn || turn.phase !== "active" || _currentTurnId !== msg.target_id
+      || turn.targetId !== msg.target_id || !_isCurrentRemoteTurn(turn)) {
+      sender.send({ type: "error", code: "internal_error", in_reply_to: msg.id, message: "No matching active remote turn to cancel" });
+      return;
+    }
+    // Transition before invoking the host so duplicate cancels cannot abort
+    // twice, including when abort throws synchronously.
+    turn.phase = "cancelling";
+    turn.cancelRequestId = msg.id;
+    turn.cancelSender = sender;
     try {
-      const aborted = _abortCurrentTurn(ctx);
-      if (!aborted) {
-        sender.send({
-          type: "error",
-          code: "internal_error",
-          in_reply_to: msg.id,
-          message: "No active Pi context to abort",
-        });
-        return;
-      }
-      sender.send({ type: "cancelled", in_reply_to: msg.id, target_id: msg.target_id });
+      turn.abortContext.abort();
     } catch (err) {
-      sender.send({
-        type: "error",
-        code: "internal_error",
-        in_reply_to: msg.id,
-        message: `Abort failed: ${String(err)}`,
-      });
+      _clearRemoteTurn();
+      sender.send({ type: "error", code: "internal_error", in_reply_to: msg.id, message: `Abort failed: ${String(err)}` });
     }
     return;
   }
@@ -4472,11 +4554,11 @@ export function _routeClientMessageFrom(
   // generic Pi-binding guard so an owner can diagnose an unavailable registry
   // rather than having its authenticated request silently dropped.
   if (msg.type === "session_compact") {
-    handleSessionCompact(_remoteLifecycle, sender, msg);
+    handleSessionCompact(_currentRemoteLifecycle(), sender, msg);
     return;
   }
   if (msg.type === "lifecycle_status") {
-    const status = _remoteLifecycle.status();
+    const status = _currentRemoteLifecycle().status();
     sender.send({
       type: "lifecycle_status",
       in_reply_to: msg.id,
@@ -4510,7 +4592,7 @@ export function _routeClientMessageFrom(
       return;
     }
     try {
-      const result = _remoteLifecycle.repair({
+      const result = _currentRemoteLifecycle().repair({
         action: msg.action,
         operationId: msg.operation_id,
         sessionId: msg.session_id,
@@ -4562,9 +4644,12 @@ export function _routeClientMessageFrom(
       // rejects the message as a normal busy prompt. Seed a fallback id so
       // later chunks/done have a target instead of being dropped.
       const previousTurnId = _currentTurnId;
+      const previousRemoteTurn = _activeRemoteTurn;
+      const previousRemoteTurnEpoch = _remoteTurnEpoch;
       const seededTurnId = !shouldSteer || _currentTurnId === null;
       if (seededTurnId) {
         _currentTurnId = msg.id;
+        _beginRemoteTurn(msg.id, ctx);
       }
       const content: Parameters<ExtensionAPI["sendUserMessage"]>[0] =
         msg.images && msg.images.length > 0
@@ -4585,7 +4670,11 @@ export function _routeClientMessageFrom(
         "steer",
       );
       if (!wake.ok) {
-        if (seededTurnId) _currentTurnId = previousTurnId;
+        if (seededTurnId) {
+          _currentTurnId = previousTurnId;
+          _activeRemoteTurn = previousRemoteTurn;
+          _remoteTurnEpoch = previousRemoteTurnEpoch;
+        }
         sender.send({
           type: "error",
           code: "internal_error",
@@ -4750,6 +4839,8 @@ function _handleSessionSync(
  * a new session is global state, so every owner must see the reset.
  */
 function _resetSessionForNew(inReplyTo: string): void {
+  _clearRemoteTurn();
+  _currentTurnId = null;
   _messageBuffer = [];
   _sessionStartedAt = Date.now();
   _broadcastToActive({

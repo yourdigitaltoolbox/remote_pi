@@ -11,6 +11,7 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { fileURLToPath } from "node:url";
 import type { ExtensionAPI, ExtensionFactory } from "@earendil-works/pi-coding-agent";
+import { RemoteLifecycleController, setRemoteLifecycleControllerForTest, type LifecycleAuthority } from "./lifecycle/remote_lifecycle.js";
 
 // Keep integration brokers/locks away from the operator's live remote-pi mesh.
 const extensionTestHome = mkdtempSync("/tmp/remote-pi-extension-test-");
@@ -185,6 +186,7 @@ const {
   _setBeforePersistentRenameWriteForTest,
   _syncNameFromPiForTest,
   _submitMeshSpoolBatchForTest,
+  _routeClientMessageFrom,
   CTRL_PREFIX,
 } = await import("./index.js");
 const { acquireIdentityLock } = await import("./session/cwd_lock.js");
@@ -2079,7 +2081,78 @@ describe("/remote-pi set-relay + config", () => {
   });
 });
 
-describe("routeClientMessage cancel handling", () => {
+describe("turn-correlated remote cancellation", () => {
+  function lifecycleFor(sessionId: string, initialGeneration = "generation-A") {
+    let generationId = initialGeneration;
+    const authority: LifecycleAuthority = {
+      snapshot: () => ({ registryState: "ready", sequence: 1, sessionId, generationId, phase: "idle" }) as never,
+      observe: () => ({ snapshot: authority.snapshot(), unsubscribe: () => undefined }),
+      request: () => ({ disposition: "rejected", code: "unused" }) as never,
+      repair: () => ({ disposition: "rejected", code: "unused" }) as never,
+      diagnostics: () => [],
+    };
+    return {
+      controller: new RemoteLifecycleController(() => undefined, authority),
+      replaceGeneration(next: string) { generationId = next; },
+    };
+  }
+
+  function sessionContext(sessionId: string, abort?: () => void, extra: Record<string, unknown> = {}) {
+    return {
+      ...extra,
+      ...(abort ? { abort } : {}),
+      compact: vi.fn(),
+      isIdle: vi.fn(() => true),
+      sessionManager: { getSessionId: () => sessionId, getEntries: () => [] },
+    };
+  }
+
+  function bindSession(sessionId: string, context: Record<string, unknown>, lifecycle = lifecycleFor(sessionId)) {
+    setRemoteLifecycleControllerForTest(lifecycle.controller);
+    captureEventHandler("session_start")({ type: "session_start" }, context);
+    return lifecycle;
+  }
+
+  function sender() {
+    return { send: vi.fn() } as unknown as { send: ReturnType<typeof vi.fn> };
+  }
+
+  function startDirectTurn(targetId: string, options: {
+    sessionId?: string;
+    context?: Record<string, unknown>;
+    lifecycle?: ReturnType<typeof lifecycleFor>;
+    initiatingSender?: ReturnType<typeof sender>;
+  } = {}) {
+    const sessionId = options.sessionId ?? `cancel-session-${targetId}`;
+    const abort = vi.fn();
+    const context = options.context ?? sessionContext(sessionId, abort);
+    const lifecycle = bindSession(sessionId, context, options.lifecycle);
+    _setPiForTest({ sendUserMessage: vi.fn() } as unknown as ExtensionAPI);
+    const initiatingSender = options.initiatingSender ?? sender();
+    _routeClientMessageFrom(initiatingSender as never, { type: "user_message", id: targetId, text: "turn" }, context as never);
+    return { abort, context, initiatingSender, lifecycle, sessionId };
+  }
+
+  function settle(sessionId: string) {
+    captureEventHandler("agent_settled")({ type: "agent_settled" }, sessionContext(sessionId));
+  }
+
+  function emitOwnerMessage(peer: string, inner: Record<string, unknown>) {
+    relayRef.current!.emit("message", JSON.stringify({
+      peer,
+      ct: Buffer.from(JSON.stringify(inner)).toString("base64"),
+    }));
+  }
+
+  function sentTo(peer: string, since: number) {
+    return relayRef.current!.send.mock.calls
+      .slice(since)
+      .map((call) => call[0] as string)
+      .map(decodeSentCt)
+      .filter((entry) => entry.peer === peer)
+      .map((entry) => entry.inner);
+  }
+
   beforeEach(async () => {
     vi.clearAllMocks();
     _knownPeers.length = 0;
@@ -2093,191 +2166,187 @@ describe("routeClientMessage cancel handling", () => {
     relayInstances.length = 0;
     _defaultConnectImpl = async () => undefined;
     const qr = await import("./pairing/qr.js");
-    (qr.qrSession.consumeToken as unknown as ReturnType<typeof vi.fn>).mockImplementation(
-      (token: string) => {
-        _consumeCalls.push(token);
-        return _tokenStatus;
-      },
-    );
+    (qr.qrSession.consumeToken as unknown as ReturnType<typeof vi.fn>).mockImplementation((token: string) => {
+      _consumeCalls.push(token);
+      return _tokenStatus;
+    });
     const stop = captureHandler("remote-pi stop");
     await stop("", { ui: { notify: vi.fn() }, cwd: "/tmp/remote-pi-cancel-reset" } as ReturnType<typeof makeMockCtx>);
+    setRemoteLifecycleControllerForTest(null);
   });
 
-  test("cancel uses freshest session_start ctx and ignores stale _lastCtx abort", async () => {
+  afterEach(() => {
+    setRemoteLifecycleControllerForTest(null);
+  });
+
+  test("cancel uses freshest session_start ctx, waits for settlement, and ignores stale _lastCtx abort", async () => {
+    const peer = "owner-cancel-1";
     const staleAbort = vi.fn();
     const freshAbort = vi.fn();
+    const sessionId = "cancel-fresh-session";
+    await _pairForTestWithCtx(peer, { ui: { notify: vi.fn() }, cwd: "/tmp/remote-pi-cancel-stale" });
+    await captureHandler("remote-pi status")("", { ui: { notify: vi.fn() }, cwd: "/tmp/remote-pi-cancel-stale", abort: staleAbort });
+    const context = sessionContext(sessionId, freshAbort);
+    bindSession(sessionId, context);
+    _setPiForTest({ sendUserMessage: vi.fn() } as unknown as ExtensionAPI);
 
-    await _pairForTestWithCtx("owner-cancel-1", {
-      ui: { notify: vi.fn() },
-      cwd: "/tmp/remote-pi-cancel-stale",
-    });
-
-    const status = captureHandler("remote-pi status");
-    await status("", {
-      ui: { notify: vi.fn() },
-      cwd: "/tmp/remote-pi-cancel-stale",
-      abort: staleAbort,
-    });
-
-    const onSessionStart = captureEventHandler("session_start");
-    onSessionStart({ type: "session_start" }, { abort: freshAbort, compact: vi.fn() } as unknown as {
-      abort: ReturnType<typeof vi.fn>;
-      compact: ReturnType<typeof vi.fn>;
-    });
-
+    emitOwnerMessage(peer, { type: "user_message", id: "msg-fresh", text: "turn" });
+    await new Promise<void>((resolve) => setImmediate(resolve));
     const sendsBefore = relayRef.current!.send.mock.calls.length;
-    relayRef.current!.emit("message", JSON.stringify({
-      peer: "owner-cancel-1",
-      ct: Buffer.from(JSON.stringify({
-        type: "cancel", id: "cancel-stale", target_id: "msg-stale",
-      })).toString("base64"),
-    }));
+    emitOwnerMessage(peer, { type: "cancel", id: "cancel-fresh", target_id: "msg-fresh" });
+    await new Promise<void>((resolve) => setImmediate(resolve));
 
-    await new Promise<void>((r) => setImmediate(r));
-
-    const sent = relayRef.current!.send.mock.calls
-      .slice(sendsBefore)
-      .map((c) => c[0] as string)
-      .map(decodeSentCt)
-      .filter((d) => d.peer === "owner-cancel-1");
-    const cancelled = sent.filter((d) => d.inner.type === "cancelled");
-    expect(cancelled).toHaveLength(1);
-    expect(cancelled[0]!.inner).toMatchObject({
-      type: "cancelled",
-      in_reply_to: "cancel-stale",
-      target_id: "msg-stale",
-    });
+    expect(freshAbort).toHaveBeenCalledTimes(1);
     expect(staleAbort).not.toHaveBeenCalled();
-    expect(freshAbort).toHaveBeenCalledTimes(1);
+    expect(sentTo(peer, sendsBefore)).not.toContainEqual(expect.objectContaining({ type: "cancelled" }));
+    settle(sessionId);
+    expect(sentTo(peer, sendsBefore)).toContainEqual({ type: "cancelled", in_reply_to: "cancel-fresh", target_id: "msg-fresh" });
   });
 
-  test("cancel is handled before the strict pi binding guard", async () => {
-    const freshAbort = vi.fn();
-
-    await _pairForTestWithCtx("owner-cancel-nopi", {
-      ui: { notify: vi.fn() },
-      cwd: "/tmp/remote-pi-cancel-nopi",
-    });
-
-    const onSessionStart = captureEventHandler("session_start");
-    onSessionStart({ type: "session_start" }, { abort: freshAbort, compact: vi.fn() } as unknown as {
-      abort: ReturnType<typeof vi.fn>;
-      compact: ReturnType<typeof vi.fn>;
-    });
+  test("cancel remains handled after the strict Pi binding is cleared", async () => {
+    const peer = "owner-cancel-nopi";
+    const abort = vi.fn();
+    const sessionId = "cancel-nopi-session";
+    await _pairForTestWithCtx(peer, { ui: { notify: vi.fn() }, cwd: "/tmp/remote-pi-cancel-nopi" });
+    const context = sessionContext(sessionId, abort);
+    bindSession(sessionId, context);
+    _setPiForTest({ sendUserMessage: vi.fn() } as unknown as ExtensionAPI);
+    emitOwnerMessage(peer, { type: "user_message", id: "msg-nopi", text: "turn" });
+    await new Promise<void>((resolve) => setImmediate(resolve));
     _setPiForTest(null);
-
     const sendsBefore = relayRef.current!.send.mock.calls.length;
-    relayRef.current!.emit("message", JSON.stringify({
-      peer: "owner-cancel-nopi",
-      ct: Buffer.from(JSON.stringify({
-        type: "cancel", id: "cancel-nopi", target_id: "msg-nopi",
-      })).toString("base64"),
-    }));
 
-    await new Promise<void>((r) => setImmediate(r));
-
-    const sent = relayRef.current!.send.mock.calls
-      .slice(sendsBefore)
-      .map((c) => c[0] as string)
-      .map(decodeSentCt)
-      .filter((d) => d.peer === "owner-cancel-nopi");
-    const cancelled = sent.filter((d) => d.inner.type === "cancelled");
-    expect(cancelled).toHaveLength(1);
-    expect(cancelled[0]!.inner).toMatchObject({
-      type: "cancelled",
-      in_reply_to: "cancel-nopi",
-      target_id: "msg-nopi",
-    });
-    expect(freshAbort).toHaveBeenCalledTimes(1);
+    emitOwnerMessage(peer, { type: "cancel", id: "cancel-nopi", target_id: "msg-nopi" });
+    await new Promise<void>((resolve) => setImmediate(resolve));
+    expect(abort).toHaveBeenCalledTimes(1);
+    settle(sessionId);
+    expect(sentTo(peer, sendsBefore)).toContainEqual({ type: "cancelled", in_reply_to: "cancel-nopi", target_id: "msg-nopi" });
   });
 
-  test("cancel with no real abort context returns error and does not send cancelled", async () => {
-    await _pairForTestWithCtx("owner-cancel-2", {
-      ui: { notify: vi.fn() },
-      cwd: "/tmp/remote-pi-cancel-nonreal",
-      // Intentionally omit abort: the router must not claim success.
-    } as unknown as { ui: { notify: ReturnType<typeof vi.fn> }; cwd: string });
-
-    const onSessionStart = captureEventHandler("session_start");
-    onSessionStart({ type: "session_start" }, { compact: vi.fn() } as unknown as {
-      compact: ReturnType<typeof vi.fn>;
-    });
-
+  test("cancel with no real abort context returns an error and no false acknowledgement", async () => {
+    const peer = "owner-cancel-no-context";
+    const sessionId = "cancel-no-context-session";
+    await _pairForTestWithCtx(peer, { ui: { notify: vi.fn() }, cwd: "/tmp/remote-pi-cancel-no-context" });
+    const context = sessionContext(sessionId);
+    bindSession(sessionId, context);
+    _setPiForTest({ sendUserMessage: vi.fn() } as unknown as ExtensionAPI);
+    emitOwnerMessage(peer, { type: "user_message", id: "msg-no-context", text: "turn" });
+    await new Promise<void>((resolve) => setImmediate(resolve));
     const sendsBefore = relayRef.current!.send.mock.calls.length;
-    relayRef.current!.emit("message", JSON.stringify({
-      peer: "owner-cancel-2",
-      ct: Buffer.from(JSON.stringify({
-        type: "cancel", id: "cancel-nonreal", target_id: "msg-nonreal",
-      })).toString("base64"),
-    }));
+    emitOwnerMessage(peer, { type: "cancel", id: "cancel-no-context", target_id: "msg-no-context" });
+    await new Promise<void>((resolve) => setImmediate(resolve));
 
-    await new Promise<void>((r) => setImmediate(r));
-
-    const sent = relayRef.current!.send.mock.calls
-      .slice(sendsBefore)
-      .map((c) => c[0] as string)
-      .map(decodeSentCt)
-      .filter((d) => d.peer === "owner-cancel-2");
-    const errors = sent.filter((d) => d.inner.type === "error");
-    const cancelled = sent.filter((d) => d.inner.type === "cancelled");
-    expect(errors).toHaveLength(1);
-    expect(errors[0]!.inner).toMatchObject({
-      type: "error",
-      in_reply_to: "cancel-nonreal",
-      code: "internal_error",
-    });
-    expect(cancelled).toHaveLength(0);
+    expect(sentTo(peer, sendsBefore)).toContainEqual(expect.objectContaining({ type: "error", code: "internal_error", in_reply_to: "cancel-no-context" }));
+    settle(sessionId);
+    expect(sentTo(peer, sendsBefore)).not.toContainEqual(expect.objectContaining({ type: "cancelled" }));
   });
 
-  test("abort throw sends error, and the router still handles a later ping", async () => {
-    const aborting = vi.fn(() => { throw new Error("abort boom"); });
-
-    await _pairForTestWithCtx("owner-cancel-3", {
-      ui: { notify: vi.fn() },
-      cwd: "/tmp/remote-pi-cancel-throw",
-      abort: aborting,
-    });
-
-    const onSessionStart = captureEventHandler("session_start");
-    onSessionStart({ type: "session_start" }, { abort: aborting, compact: vi.fn() } as unknown as {
-      abort: ReturnType<typeof vi.fn>;
-      compact: ReturnType<typeof vi.fn>;
-    });
-
+  test("abort throw sends an error and the production router still handles a later ping", async () => {
+    const peer = "owner-cancel-throw";
+    const abort = vi.fn(() => { throw new Error("abort boom"); });
+    const sessionId = "cancel-throw-session";
+    await _pairForTestWithCtx(peer, { ui: { notify: vi.fn() }, cwd: "/tmp/remote-pi-cancel-throw" });
+    const context = sessionContext(sessionId, abort);
+    bindSession(sessionId, context);
+    _setPiForTest({ sendUserMessage: vi.fn() } as unknown as ExtensionAPI);
+    emitOwnerMessage(peer, { type: "user_message", id: "msg-throw", text: "turn" });
+    await new Promise<void>((resolve) => setImmediate(resolve));
     const sendsBefore = relayRef.current!.send.mock.calls.length;
-    relayRef.current!.emit("message", JSON.stringify({
-      peer: "owner-cancel-3",
-      ct: Buffer.from(JSON.stringify({
-        type: "cancel", id: "cancel-throw", target_id: "msg-throw",
-      })).toString("base64"),
-    }));
+    emitOwnerMessage(peer, { type: "cancel", id: "cancel-throw", target_id: "msg-throw" });
+    emitOwnerMessage(peer, { type: "ping", id: "ping-after-cancel" });
+    await new Promise<void>((resolve) => setImmediate(resolve));
 
-    await new Promise<void>((r) => setImmediate(r));
+    expect(abort).toHaveBeenCalledTimes(1);
+    expect(sentTo(peer, sendsBefore)).toContainEqual(expect.objectContaining({ type: "error", in_reply_to: "cancel-throw" }));
+    expect(sentTo(peer, sendsBefore)).toContainEqual({ type: "pong", in_reply_to: "ping-after-cancel" });
+    settle(sessionId);
+    expect(sentTo(peer, sendsBefore)).not.toContainEqual(expect.objectContaining({ type: "cancelled" }));
+  });
 
-    relayRef.current!.emit("message", JSON.stringify({
-      peer: "owner-cancel-3",
-      ct: Buffer.from(JSON.stringify({ type: "ping", id: "ping-after-cancel" })).toString("base64"),
-    }));
-    await new Promise<void>((r) => setImmediate(r));
+  test("valid cancellation aborts once and acknowledges only the cancelling sender after settlement", () => {
+    const receiver = { marker: "current", abort: vi.fn(function (this: { marker: string }) { expect(this.marker).toBe("current"); }) };
+    const context = sessionContext("sender-session", receiver.abort, { marker: receiver.marker });
+    const initiatingSender = sender();
+    const turn = startDirectTurn("sender-turn", { sessionId: "sender-session", context, initiatingSender });
+    const cancellingSender = sender();
 
-    const sent = relayRef.current!.send.mock.calls
-      .slice(sendsBefore)
-      .map((c) => c[0] as string)
-      .map(decodeSentCt)
-      .filter((d) => d.peer === "owner-cancel-3");
+    _routeClientMessageFrom(cancellingSender as never, { type: "cancel", id: "cancel-from-b", target_id: "sender-turn" }, {} as never);
+    _routeClientMessageFrom(cancellingSender as never, { type: "cancel", id: "cancel-duplicate", target_id: "sender-turn" }, {} as never);
+    expect(receiver.abort).toHaveBeenCalledTimes(1);
+    expect(cancellingSender.send).toHaveBeenCalledWith(expect.objectContaining({ type: "error", in_reply_to: "cancel-duplicate" }));
+    expect(cancellingSender.send).not.toHaveBeenCalledWith(expect.objectContaining({ type: "cancelled" }));
 
-    const errors = sent.filter((d) => d.inner.type === "error");
-    const pongs = sent.filter((d) => d.inner.type === "pong");
+    settle(turn.sessionId);
+    expect(initiatingSender.send).not.toHaveBeenCalledWith(expect.objectContaining({ type: "cancelled" }));
+    expect(cancellingSender.send).toHaveBeenCalledWith({ type: "cancelled", in_reply_to: "cancel-from-b", target_id: "sender-turn" });
+  });
 
-    expect(aborting).toHaveBeenCalledTimes(1);
-    expect(errors).toHaveLength(1);
-    expect(errors[0]!.inner).toMatchObject({
-      type: "error",
-      in_reply_to: "cancel-throw",
-      code: "internal_error",
-    });
-    expect(pongs).toHaveLength(1);
-    expect(pongs[0]!.inner).toMatchObject({ type: "pong", in_reply_to: "ping-after-cancel" });
+  test("stale target A cannot abort active target B", () => {
+    const turn = startDirectTurn("turn-b");
+    const cancellingSender = sender();
+    _routeClientMessageFrom(cancellingSender as never, { type: "cancel", id: "cancel-a", target_id: "turn-a" }, {} as never);
+    expect(turn.abort).not.toHaveBeenCalled();
+    expect(cancellingSender.send).toHaveBeenCalledWith(expect.objectContaining({ type: "error", in_reply_to: "cancel-a" }));
+  });
+
+  test("lifecycle snapshot session mismatch prevents cancel admission", () => {
+    const lifecycle = lifecycleFor("different-session", "generation-A");
+    const turn = startDirectTurn("session-mismatch-turn", { sessionId: "runtime-session", lifecycle });
+    const cancellingSender = sender();
+    _routeClientMessageFrom(cancellingSender as never, { type: "cancel", id: "session-mismatch-cancel", target_id: "session-mismatch-turn" }, {} as never);
+    expect(turn.abort).not.toHaveBeenCalled();
+    expect(cancellingSender.send).toHaveBeenCalledWith(expect.objectContaining({ type: "error", in_reply_to: "session-mismatch-cancel" }));
+  });
+
+  test("failed seeded replacement restores the prior cancellable turn", () => {
+    const a = startDirectTurn("rollback-turn-a", { sessionId: "rollback-session" });
+    _setPiForTest({ sendUserMessage: vi.fn(() => { throw new Error("reject B"); }) } as unknown as ExtensionAPI);
+    const bSender = sender();
+    _routeClientMessageFrom(bSender as never, { type: "user_message", id: "rollback-turn-b", text: "rejected" }, a.context as never);
+    expect(bSender.send).toHaveBeenCalledWith(expect.objectContaining({ type: "error", in_reply_to: "rollback-turn-b" }));
+
+    const aCanceller = sender();
+    _routeClientMessageFrom(aCanceller as never, { type: "cancel", id: "rollback-cancel-a", target_id: "rollback-turn-a" }, {} as never);
+    expect(a.abort).toHaveBeenCalledTimes(1);
+    settle(a.sessionId);
+    expect(aCanceller.send).toHaveBeenCalledWith({ type: "cancelled", in_reply_to: "rollback-cancel-a", target_id: "rollback-turn-a" });
+  });
+
+  test("settlement from another session cannot erase the current pending cancellation", () => {
+    const b = startDirectTurn("current-turn-b", { sessionId: "current-session-b" });
+    const bCanceller = sender();
+    _routeClientMessageFrom(bCanceller as never, { type: "cancel", id: "current-cancel-b", target_id: "current-turn-b" }, {} as never);
+    settle("stale-session-a");
+    expect(bCanceller.send).not.toHaveBeenCalledWith(expect.objectContaining({ type: "cancelled" }));
+    settle(b.sessionId);
+    expect(bCanceller.send).toHaveBeenCalledWith({ type: "cancelled", in_reply_to: "current-cancel-b", target_id: "current-turn-b" });
+  });
+
+  test("lifecycle generation replacement fences a delayed acknowledgement", () => {
+    const sessionId = "generation-fence-session";
+    const lifecycle = lifecycleFor(sessionId, "generation-A");
+    const turn = startDirectTurn("generation-turn", { sessionId, lifecycle });
+    const cancellingSender = sender();
+    _routeClientMessageFrom(cancellingSender as never, { type: "cancel", id: "generation-cancel", target_id: "generation-turn" }, {} as never);
+    lifecycle.replaceGeneration("generation-B");
+    settle(sessionId);
+    expect(cancellingSender.send).not.toHaveBeenCalledWith(expect.objectContaining({ type: "cancelled" }));
+  });
+
+  test("session replacement fences A and a later B turn can cancel normally", () => {
+    const a = startDirectTurn("turn-a", { sessionId: "session-a" });
+    const aCanceller = sender();
+    _routeClientMessageFrom(aCanceller as never, { type: "cancel", id: "cancel-a", target_id: "turn-a" }, {} as never);
+    expect(a.abort).toHaveBeenCalledTimes(1);
+
+    const b = startDirectTurn("turn-b", { sessionId: "session-b" });
+    settle("session-a");
+    expect(aCanceller.send).not.toHaveBeenCalledWith(expect.objectContaining({ type: "cancelled" }));
+    const bCanceller = sender();
+    _routeClientMessageFrom(bCanceller as never, { type: "cancel", id: "cancel-b", target_id: "turn-b" }, {} as never);
+    expect(b.abort).toHaveBeenCalledTimes(1);
+    settle("session-b");
+    expect(bCanceller.send).toHaveBeenCalledWith({ type: "cancelled", in_reply_to: "cancel-b", target_id: "turn-b" });
   });
 });
 

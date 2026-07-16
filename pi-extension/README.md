@@ -466,6 +466,10 @@ Useful commands:
 Legacy alias collisions may receive numeric suffixes (`backend#2`, …).
 Current peers can share a display name because immutable IDs own their routes.
 
+### Turn-correlated cancellation
+
+An app `cancel` request is accepted only when its `target_id` exactly matches the active app-originated turn in the current Pi session and lifecycle generation. Remote Pi calls the current session context's `abort()` at most once and sends the existing sender-only `cancelled` response only after Pi emits the matching same-generation `agent_settled` boundary. Idle, stale, duplicate, mismatched, reloaded, or replaced targets receive an `error` and cannot abort a newer turn. The wire shapes remain unchanged.
+
 ---
 
 ## Command reference

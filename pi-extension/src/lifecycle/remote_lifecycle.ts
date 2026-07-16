@@ -176,3 +176,24 @@ export class RemoteLifecycleController {
     this.activeOperationId = undefined;
   }
 }
+
+const REMOTE_LIFECYCLE_TEST_OVERRIDE = Symbol.for("remote-pi.test.remote-lifecycle-controller");
+type RemoteLifecycleTestGlobal = typeof globalThis & {
+  [REMOTE_LIFECYCLE_TEST_OVERRIDE]?: RemoteLifecycleController;
+};
+
+/** Internal test boundary; production callers cannot replace lifecycle authority. */
+export function remoteLifecycleControllerOverrideForTest(): RemoteLifecycleController | undefined {
+  if (process.env["NODE_ENV"] !== "test") return undefined;
+  return (globalThis as RemoteLifecycleTestGlobal)[REMOTE_LIFECYCLE_TEST_OVERRIDE];
+}
+
+/** Internal test boundary used by the packaged extension integration suite. */
+export function setRemoteLifecycleControllerForTest(controller: RemoteLifecycleController | null): void {
+  if (process.env["NODE_ENV"] !== "test") throw new Error("Remote lifecycle override is test-only");
+  const target = globalThis as RemoteLifecycleTestGlobal;
+  const previous = target[REMOTE_LIFECYCLE_TEST_OVERRIDE];
+  if (previous && previous !== controller) previous.dispose();
+  if (controller) target[REMOTE_LIFECYCLE_TEST_OVERRIDE] = controller;
+  else delete target[REMOTE_LIFECYCLE_TEST_OVERRIDE];
+}
