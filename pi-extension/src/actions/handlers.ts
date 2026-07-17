@@ -21,6 +21,7 @@
  *   - `ModelRegistry.{refresh,getAvailable,find}` — see `registry.ts`
  */
 
+import type { CompactDisposition } from "@yourdigitaltoolbox/pi-context-lifecycle";
 import type {
   ClientMessage,
   ServerMessage,
@@ -177,27 +178,38 @@ async function runAsync(
 // ── individual handlers ───────────────────────────────────────────────────
 
 type SessionCompactMsg = Extract<ClientMessage, { type: "session_compact" }>;
+
+/** Narrow lifecycle action surface owned by the Remote Pi adapter. */
+export interface CompactLifecycleRequester {
+  request(requestId: string): CompactDisposition;
+}
 type SessionNewMsg = Extract<ClientMessage, { type: "session_new" }>;
 type ModelSetMsg = Extract<ClientMessage, { type: "model_set" }>;
 type ThinkingSetMsg = Extract<ClientMessage, { type: "thinking_set" }>;
 type ListModelsMsg = Extract<ClientMessage, { type: "list_models" }>;
 
 export function handleSessionCompact(
-  ctx: ActionCtx | null,
+  lifecycle: CompactLifecycleRequester,
   sender: ActionReplySender,
   msg: SessionCompactMsg,
 ): void {
-  runSync(sender, msg, "session_compact", () => {
-    if (!ctx?.compact) throw new Error("compact unavailable (no active session ctx)");
-    // Force the summary to English regardless of the conversation language —
-    // the summary is surfaced to the app via the `compaction` message, which
-    // is an English-only surface. `customInstructions` is appended to the SDK's
-    // compaction prompt (best-effort: the model writes the summary).
-    ctx.compact({
-      customInstructions:
-        "Always write the compaction summary in English, even if the conversation is in another language.",
+  try {
+    const result = lifecycle.request(msg.id);
+    if (result.disposition === "rejected") {
+      fail(sender, msg, "session_compact", result.code);
+      return;
+    }
+    sender.send({
+      type: "action_ok",
+      in_reply_to: msg.id,
+      action: "session_compact",
+      operation_id: result.operationId,
+      generation_id: result.generationId,
+      disposition: result.disposition,
     });
-  });
+  } catch (error) {
+    fail(sender, msg, "session_compact", error);
+  }
 }
 
 export async function handleSessionNew(

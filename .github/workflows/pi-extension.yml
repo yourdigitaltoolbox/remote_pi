@@ -1,0 +1,42 @@
+name: Remote Pi extension
+
+on:
+  pull_request:
+    paths:
+      - "package.json"
+      - "scripts/prepare-pi-extension.mjs"
+      - "pi-extension/**"
+      - ".github/workflows/pi-extension.yml"
+  push:
+    branches: [main, "feat/**"]
+    paths:
+      - "package.json"
+      - "scripts/prepare-pi-extension.mjs"
+      - "pi-extension/**"
+      - ".github/workflows/pi-extension.yml"
+
+permissions:
+  contents: read
+
+jobs:
+  pi-extension:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+      - name: Install the supported Pi CLI for the disposable package smoke
+        run: npm install --global @earendil-works/pi-coding-agent@0.80.6
+      # This invokes the same root Git-install bridge Pi runs after cloning a
+      # package. The nested pnpm lock is authoritative; dist is generated only.
+      - run: npm run prepare
+      - run: npm run check:pi-extension
+      - name: Disposable Pi 0.80.6 full-SHA Git-install smoke
+        env:
+          REMOTE_PI_GIT_SOURCE: github.com/${{ github.repository }}
+          # PR `github.sha` is an ephemeral merge ref that a fresh Git clone
+          # cannot resolve; install the immutable published head instead.
+          REMOTE_PI_GIT_SHA: ${{ github.event.pull_request.head.sha || github.sha }}
+        run: npm run smoke:pi-git-install

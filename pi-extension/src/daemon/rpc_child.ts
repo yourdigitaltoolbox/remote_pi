@@ -305,6 +305,17 @@ export class RpcChild extends EventEmitter {
       );
       this.emit("exit", { code: null, signal: null, isCrash: true });
     });
+    // stdin `'error'` is delivered asynchronously and cannot be caught by the
+    // synchronous try/catch around the `stdin.write()` sites below. Without a
+    // listener a broken-pipe (EPIPE) — e.g. a write racing the child's death —
+    // becomes an uncaught exception that kills the whole supervisor and every
+    // daemon it owns (#9). Absorb it: log and let the `exit` handler own
+    // lifecycle. Guarded because stdin may be null under some stdio configs.
+    child.stdin?.on("error", (err) => {
+      process.stderr.write(
+        `[remote-pi-supervisord] stdin error for ${this.opts.cwd} (child likely exiting): ${String(err)}\n`,
+      );
+    });
 
     this.emit("spawn", { pid: child.pid });
   }

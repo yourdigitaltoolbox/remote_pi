@@ -92,5 +92,7 @@ describe("deliveryReceipt interop marker (context-lifecycle lineage)", () => {
     expect(() => parse(JSON.stringify({ ...base, deliveryReceipt: "yes" }))).toThrow(/deliveryReceipt/);
     expect(() => parse(JSON.stringify({ ...base, deliveryReceipt: [] }))).toThrow(/deliveryReceipt/);
     expect(() => parse(JSON.stringify({ ...base, deliveryReceipt: null }))).toThrow(/deliveryReceipt/);
+    expect(() => parse(JSON.stringify({ ...base, deliveryReceipt: { required: true, extra: "ignored" } })))
+      .toThrow(/exactly/);
   });
 });

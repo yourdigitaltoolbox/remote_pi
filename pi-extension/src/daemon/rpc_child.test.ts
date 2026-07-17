@@ -66,6 +66,47 @@ describe("RpcChild — deliberate stop is not a crash", () => {
   });
 });
 
+/**
+ * Regression for #9: the child's `stdin` had no `'error'` handler, so a
+ * broken-pipe (EPIPE) — delivered asynchronously, uncatchable by the sync
+ * try/catch around the write — became an uncaught exception that killed the
+ * whole supervisor. Here a stub destroys its stdin read-end and stays alive;
+ * a subsequent write EPIPEs. Before the fix this crashed the test runner via
+ * an unhandled 'error' event; after it, the event is absorbed and the process
+ * survives.
+ */
+describe("RpcChild — async stdin EPIPE must not crash the supervisor (#9)", () => {
+  let dir: string;
+  afterEach(() => {
+    try { rmSync(dir, { recursive: true, force: true }); } catch { /* best-effort */ }
+  });
+
+  test.skipIf(process.platform === "win32")("an async stdin 'error' event is handled, not thrown", async () => {
+    dir = mkdtempSync(join(tmpdir(), "pi-stdin-epipe-"));
+    // A stub that just stays alive so the child's stdin stream is real and open.
+    const stub = join(dir, "stub.sh");
+    writeFileSync(stub, "#!/bin/sh\nexec sleep 30\n");
+    chmodSync(stub, 0o755);
+
+    const child = new RpcChild({ piBin: stub, extensionPath: "/x", cwd: dir });
+    child.spawn();
+    await new Promise((r) => setTimeout(r, 60)); // let it exec
+
+    // The real failure mechanism from #9: a broken pipe is delivered as an
+    // 'error' event on child.stdin. Node's EventEmitter THROWS when 'error'
+    // is emitted with no listener → uncaught exception → the whole supervisor
+    // dies. spawn() must have attached a listener so the event is absorbed.
+    // (Reaching into the private child stream is deliberate: this asserts the
+    // exact wiring the fix adds.)
+    const stdin = (child as unknown as { child: { stdin: import("node:stream").Writable } }).child.stdin;
+    expect(stdin.listenerCount("error")).toBeGreaterThan(0);
+    expect(() => stdin.emit("error", Object.assign(new Error("write EPIPE"), { code: "EPIPE" }))).not.toThrow();
+
+    expect(child.state).toBe("running"); // absorbing the error must not tear the child down
+    await child.stop();
+  });
+});
+
 describe("resolvePiBin (plan/40 — Windows pi.cmd)", () => {
   test("POSIX → returns the bin name unchanged", () => {
     expect(resolvePiBin("pi", "darwin")).toBe("pi");

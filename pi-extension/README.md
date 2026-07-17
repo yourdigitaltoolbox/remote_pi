@@ -17,7 +17,7 @@ first time it asks a couple of questions and you are done.
 
 For wire format, identity model, ACK protocol, cross-PC routing, mesh
 membership, and the trust model (what the relay sees and doesn't see),
-read [`PROTOCOL.md`](../PROTOCOL.md) at the repo root. It is the canonical
+read the package-visible [`docs/PROTOCOL.md`](./docs/PROTOCOL.md). The repository root copy is canonical
 document — this README only covers user-facing setup.
 
 ---
@@ -143,7 +143,7 @@ Pairing is one-time and per device, via QR code.
 
 Communication: WebSocket over TLS to the relay (ciphertext in transit).
 The relay sees plaintext envelopes at rest and in forwarding — see
-[`PROTOCOL.md`](../PROTOCOL.md) for the trust model.
+[`docs/PROTOCOL.md`](./docs/PROTOCOL.md) for the paired-client protocol and trust model.
 
 **Get the app** — all current download options (Google Play, App Store, and
 direct builds while public releases roll out):
@@ -168,14 +168,87 @@ when the input is empty) to open the Quick Actions sheet:
 Each action gets a structured `action_ok` / `action_error` reply so the app
 can show a SnackBar on failure. Visible side-effects (chat output, model
 change broadcasts, compaction notice) still flow through the normal chat
-channels. The wire schema is documented in [`PROTOCOL.md`](../PROTOCOL.md)
-under "App actions".
+channels. The wire schema is documented in [`docs/PROTOCOL.md`](./docs/PROTOCOL.md)
+under "Lifecycle wire schema".
 
 It is **not** a generic slash-command picker. The Pi SDK does not expose
 programmatic invocation for most builtins (those live in the TUI's
 interactive loop), so the app exposes only the actions that have a clean
 SDK call. The [`pi-telegram`](https://github.com/llblab/pi-telegram) adapter
 follows the same pattern.
+
+### Public paired Node client
+
+Automation that must traverse the real paired relay boundary can import only
+`remote-pi/client` (never `dist/**`, the root router, or `remote-pi/testing`):
+
+```ts
+import { PairedClient } from "remote-pi/client";
+const client = await PairedClient.connect({ relayUrl, pairingUri, deviceName: "ephemeral client" });
+if ((await client.pair()).type !== "pair_ok") throw new Error("pairing rejected");
+const status = await client.lifecycleStatus();
+```
+
+The client uses an ephemeral Ed25519 identity, authenticates to the relay, and
+requires correlated `pair_ok` before owner actions. It exposes typed
+`lifecycleStatus`, `compact`, `lifecycleRepair`, and `onLifecycleOutcome` only;
+it does not read profiles or expose router, singleton, or test seams. See
+[`docs/PROTOCOL.md`](./docs/PROTOCOL.md) for lifecycle schemas, CAS/rejection,
+pairing authorization, and redaction requirements.
+
+### Public outbound mesh client
+
+A non-Pi Node service can submit an authority-bearing message through the real
+local/cross-PC mesh without importing private `dist/session/**` files through
+the supported `remote-pi/mesh` subpath:
+
+```ts
+import { MeshClient } from "remote-pi/mesh";
+
+const mesh = new MeshClient({
+  sockPath,
+  name: "orchestration-dashboard",
+  cwd,
+  identity: { workspaceId, agentId, processEpoch },
+  bridge: { relayUrl, cwd },
+});
+await mesh.connect();
+const orchestrator = await mesh.resolveIdentityTarget({
+  workspaceId: orchestratorWorkspaceId,
+  agentId: orchestratorAgentId,
+});
+const result = await mesh.agentSend(orchestrator, { decisionId, response });
+if (result.status !== "received") throw new Error(`decision not delivered: ${result.status}`);
+```
+
+`resolveIdentityTarget` requires exactly one broker record matching both stable
+identity fields and a non-empty broker-returned `identityAddress`. It returns an
+opaque, non-serializable handle with no route/address getter. The module keeps
+the address private and `agentSend` accepts only a handle created by that exact
+client and connection generation, so address/name/alias fallback and route
+construction are structurally unavailable. Resolution fails with a typed
+`MeshIdentityResolutionError` code: `zero-match`, `multiple-match`,
+`missing-identity-address`, `disconnected`, or `timeout`.
+
+Only `received` is a positive target-retention ACK; `busy`, `denied`, and
+`timeout` are non-delivery. The public ACK contains only `status` and envelope
+`id`, never the private target route.
+
+The v1 facade is intentionally outbound-only. It exposes no peer list, routes,
+addresses, `Broker`, `SessionPeer`, inbound callback, or reconnect callback,
+and honestly denies inbound acknowledged agent envelopes rather than accepting
+them without an application inbox. Transport reconnect remains internal and
+invalidates previously resolved handles. The repository-root Git bridge mirrors
+the same `./mesh` export so an exact-SHA dependency resolves the supported
+facade after its prepare build.
+
+### Archive candidate testing
+
+Reviewed lifecycle candidates can import the package-only `remote-pi/testing`
+subpath and call `createExactCandidateProbe({ session, seed, packageDirectory })`.
+The seam accepts only opaque compact-action and mesh-arrival identifiers, drives
+the production action/admission paths, and returns immutable opaque receipts.
+It neither opens a relay nor reads or changes a live Pi profile.
 
 ### Images
 
@@ -392,6 +465,10 @@ Useful commands:
 
 Legacy alias collisions may receive numeric suffixes (`backend#2`, …).
 Current peers can share a display name because immutable IDs own their routes.
+
+### Turn-correlated cancellation
+
+An app `cancel` request is accepted only when its `target_id` exactly matches the active app-originated turn in the current Pi session and lifecycle generation. Remote Pi calls the current session context's `abort()` at most once and sends the existing sender-only `cancelled` response only after Pi emits the matching same-generation `agent_settled` boundary. Idle, stale, duplicate, mismatched, reloaded, or replaced targets receive an `error` and cannot abort a newer turn. The wire shapes remain unchanged.
 
 ---
 

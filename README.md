@@ -92,6 +92,26 @@ Install the Pi extension in any project where Pi runs:
 pi install npm:remote-pi
 ```
 
+### Exact Git installs
+
+The repository root is also a deliberately small Pi package bridge for reviewed
+Git commits. Pi invokes `npm install` at a Git package root; the root `prepare`
+hook then uses pinned `pnpm@10.26.1` with `pi-extension/pnpm-lock.yaml` to
+install and build `pi-extension/dist` before Pi discovers it. `dist` remains
+ignored and is never committed. This is the only exception to the root's usual
+planning/documentation convention.
+
+```bash
+pi install git:git@github.com:yourdigitaltoolbox/remote_pi@<full-40-character-sha>
+```
+
+Use only a reviewed full commit SHA. The bridge is not a global install and does
+not alter an existing live Pi profile outside the package target selected by the
+operator. Exact-SHA Node consumers may also alias this Git dependency as
+`remote-pi` and import its supported `remote-pi/mesh` subpath; the root bridge
+maps that public export to the same prepared nested build documented in
+[`pi-extension/README.md`](./pi-extension/README.md).
+
 Then in the Pi chat, run:
 
 ```

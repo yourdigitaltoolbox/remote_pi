@@ -11,6 +11,7 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { fileURLToPath } from "node:url";
 import type { ExtensionAPI, ExtensionFactory } from "@earendil-works/pi-coding-agent";
+import { RemoteLifecycleController, setRemoteLifecycleControllerForTest, type LifecycleAuthority } from "./lifecycle/remote_lifecycle.js";
 
 // Keep integration brokers/locks away from the operator's live remote-pi mesh.
 const extensionTestHome = mkdtempSync("/tmp/remote-pi-extension-test-");
@@ -172,6 +173,7 @@ const {
   _hasMeshNodeForTest,
   _getLockedNameForTest,
   _getRuntimeIdentityForTest,
+  _getRuntimeProcessEpochForTest,
   _getRuntimePresentationForTest,
   _getRoomMetaForTest,
   _getRelayExposureLeaseForTest,
@@ -183,10 +185,13 @@ const {
   _handleControl,
   _setBeforePersistentRenameWriteForTest,
   _syncNameFromPiForTest,
+  _submitMeshSpoolBatchForTest,
+  _routeClientMessageFrom,
   CTRL_PREFIX,
 } = await import("./index.js");
 const { acquireIdentityLock } = await import("./session/cwd_lock.js");
-const { agentIdFromSessionId } = await import("./session/runtime_identity.js");
+const { roomIdForIdentity } = await import("./rooms.js");
+const { agentIdFromSessionId, rollRuntimeIdentity } = await import("./session/runtime_identity.js");
 
 // ── Helpers ───────────────────────────────────────────────────────────────────
 
@@ -228,7 +233,8 @@ function makeMockCtx(cwd = "/home/user/projects/remote_pi") {
     ui: { notify: vi.fn() },
     cwd,
     abort: vi.fn(),
-    sessionManager: { getSessionId: () => testSessionId(cwd) },
+    isIdle: vi.fn(() => true),
+    sessionManager: { getSessionId: () => testSessionId(cwd), getEntries: () => [] },
   };
 }
 
@@ -912,6 +918,52 @@ function captureEventHandler(eventName: string): EventHandler {
   if (!captured) throw new Error(`event "${eventName}" handler not registered`);
   return captured;
 }
+
+describe("released mesh spool submission", () => {
+  afterEach(() => {
+    _setPiForTest(null);
+    _resetCwdLockForTest();
+  });
+
+  test("starts an idle mesh batch as its own turn without the active follow-up queue", () => {
+    const sessionId = "mesh-followup-session";
+    const onSessionStart = captureEventHandler("session_start");
+    onSessionStart({ type: "session_start" }, {
+      ...makeMockCtx("/tmp/remote-pi-mesh-followup"),
+      sessionManager: { getSessionId: () => sessionId },
+    });
+    const sendMessage = vi.fn();
+    _setPiForTest({ sendMessage } as unknown as ExtensionAPI);
+
+    expect(_submitMeshSpoolBatchForTest(sessionId, "mesh-unsolicited", [{
+      id: "released-mesh-message", from: "mesh-peer", to: "local", re: null, body: "released body",
+    }], "submission-a", "generation-a")).toBe(true);
+
+    expect(sendMessage).toHaveBeenCalledOnce();
+    expect(sendMessage).toHaveBeenCalledWith(expect.objectContaining({
+      customType: "remote-pi:mesh-batch",
+      details: expect.objectContaining({ sessionId, submissionId: "submission-a", generationId: "generation-a" }),
+    }), { triggerTurn: true });
+  });
+
+  test("refuses the SDK submission boundary while Pi is active", () => {
+    const sessionId = "mesh-active-session";
+    const ctx = makeMockCtx("/tmp/remote-pi-mesh-active");
+    ctx.isIdle.mockReturnValue(false);
+    const onSessionStart = captureEventHandler("session_start");
+    onSessionStart({ type: "session_start" }, {
+      ...ctx,
+      sessionManager: { getSessionId: () => sessionId, getEntries: () => [] },
+    });
+    const sendMessage = vi.fn();
+    _setPiForTest({ sendMessage } as unknown as ExtensionAPI);
+
+    expect(_submitMeshSpoolBatchForTest(sessionId, "mesh-unsolicited", [{
+      id: "held-during-active", from: "mesh-peer", to: "local", re: null, body: "held body",
+    }], "submission-active", "generation-a")).toBe(false);
+    expect(sendMessage).not.toHaveBeenCalled();
+  });
+});
 
 async function _pairForTest(appPeerId: string): Promise<void> {
   captureHandler("remote-pi");
@@ -2029,7 +2081,78 @@ describe("/remote-pi set-relay + config", () => {
   });
 });
 
-describe("routeClientMessage cancel handling", () => {
+describe("turn-correlated remote cancellation", () => {
+  function lifecycleFor(sessionId: string, initialGeneration = "generation-A") {
+    let generationId = initialGeneration;
+    const authority: LifecycleAuthority = {
+      snapshot: () => ({ registryState: "ready", sequence: 1, sessionId, generationId, phase: "idle" }) as never,
+      observe: () => ({ snapshot: authority.snapshot(), unsubscribe: () => undefined }),
+      request: () => ({ disposition: "rejected", code: "unused" }) as never,
+      repair: () => ({ disposition: "rejected", code: "unused" }) as never,
+      diagnostics: () => [],
+    };
+    return {
+      controller: new RemoteLifecycleController(() => undefined, authority),
+      replaceGeneration(next: string) { generationId = next; },
+    };
+  }
+
+  function sessionContext(sessionId: string, abort?: () => void, extra: Record<string, unknown> = {}) {
+    return {
+      ...extra,
+      ...(abort ? { abort } : {}),
+      compact: vi.fn(),
+      isIdle: vi.fn(() => true),
+      sessionManager: { getSessionId: () => sessionId, getEntries: () => [] },
+    };
+  }
+
+  function bindSession(sessionId: string, context: Record<string, unknown>, lifecycle = lifecycleFor(sessionId)) {
+    setRemoteLifecycleControllerForTest(lifecycle.controller);
+    captureEventHandler("session_start")({ type: "session_start" }, context);
+    return lifecycle;
+  }
+
+  function sender() {
+    return { send: vi.fn() } as unknown as { send: ReturnType<typeof vi.fn> };
+  }
+
+  function startDirectTurn(targetId: string, options: {
+    sessionId?: string;
+    context?: Record<string, unknown>;
+    lifecycle?: ReturnType<typeof lifecycleFor>;
+    initiatingSender?: ReturnType<typeof sender>;
+  } = {}) {
+    const sessionId = options.sessionId ?? `cancel-session-${targetId}`;
+    const abort = vi.fn();
+    const context = options.context ?? sessionContext(sessionId, abort);
+    const lifecycle = bindSession(sessionId, context, options.lifecycle);
+    _setPiForTest({ sendUserMessage: vi.fn() } as unknown as ExtensionAPI);
+    const initiatingSender = options.initiatingSender ?? sender();
+    _routeClientMessageFrom(initiatingSender as never, { type: "user_message", id: targetId, text: "turn" }, context as never);
+    return { abort, context, initiatingSender, lifecycle, sessionId };
+  }
+
+  function settle(sessionId: string) {
+    captureEventHandler("agent_settled")({ type: "agent_settled" }, sessionContext(sessionId));
+  }
+
+  function emitOwnerMessage(peer: string, inner: Record<string, unknown>) {
+    relayRef.current!.emit("message", JSON.stringify({
+      peer,
+      ct: Buffer.from(JSON.stringify(inner)).toString("base64"),
+    }));
+  }
+
+  function sentTo(peer: string, since: number) {
+    return relayRef.current!.send.mock.calls
+      .slice(since)
+      .map((call) => call[0] as string)
+      .map(decodeSentCt)
+      .filter((entry) => entry.peer === peer)
+      .map((entry) => entry.inner);
+  }
+
   beforeEach(async () => {
     vi.clearAllMocks();
     _knownPeers.length = 0;
@@ -2043,191 +2166,187 @@ describe("routeClientMessage cancel handling", () => {
     relayInstances.length = 0;
     _defaultConnectImpl = async () => undefined;
     const qr = await import("./pairing/qr.js");
-    (qr.qrSession.consumeToken as unknown as ReturnType<typeof vi.fn>).mockImplementation(
-      (token: string) => {
-        _consumeCalls.push(token);
-        return _tokenStatus;
-      },
-    );
+    (qr.qrSession.consumeToken as unknown as ReturnType<typeof vi.fn>).mockImplementation((token: string) => {
+      _consumeCalls.push(token);
+      return _tokenStatus;
+    });
     const stop = captureHandler("remote-pi stop");
     await stop("", { ui: { notify: vi.fn() }, cwd: "/tmp/remote-pi-cancel-reset" } as ReturnType<typeof makeMockCtx>);
+    setRemoteLifecycleControllerForTest(null);
   });
 
-  test("cancel uses freshest session_start ctx and ignores stale _lastCtx abort", async () => {
+  afterEach(() => {
+    setRemoteLifecycleControllerForTest(null);
+  });
+
+  test("cancel uses freshest session_start ctx, waits for settlement, and ignores stale _lastCtx abort", async () => {
+    const peer = "owner-cancel-1";
     const staleAbort = vi.fn();
     const freshAbort = vi.fn();
+    const sessionId = "cancel-fresh-session";
+    await _pairForTestWithCtx(peer, { ui: { notify: vi.fn() }, cwd: "/tmp/remote-pi-cancel-stale" });
+    await captureHandler("remote-pi status")("", { ui: { notify: vi.fn() }, cwd: "/tmp/remote-pi-cancel-stale", abort: staleAbort });
+    const context = sessionContext(sessionId, freshAbort);
+    bindSession(sessionId, context);
+    _setPiForTest({ sendUserMessage: vi.fn() } as unknown as ExtensionAPI);
 
-    await _pairForTestWithCtx("owner-cancel-1", {
-      ui: { notify: vi.fn() },
-      cwd: "/tmp/remote-pi-cancel-stale",
-    });
-
-    const status = captureHandler("remote-pi status");
-    await status("", {
-      ui: { notify: vi.fn() },
-      cwd: "/tmp/remote-pi-cancel-stale",
-      abort: staleAbort,
-    });
-
-    const onSessionStart = captureEventHandler("session_start");
-    onSessionStart({ type: "session_start" }, { abort: freshAbort, compact: vi.fn() } as unknown as {
-      abort: ReturnType<typeof vi.fn>;
-      compact: ReturnType<typeof vi.fn>;
-    });
-
+    emitOwnerMessage(peer, { type: "user_message", id: "msg-fresh", text: "turn" });
+    await new Promise<void>((resolve) => setImmediate(resolve));
     const sendsBefore = relayRef.current!.send.mock.calls.length;
-    relayRef.current!.emit("message", JSON.stringify({
-      peer: "owner-cancel-1",
-      ct: Buffer.from(JSON.stringify({
-        type: "cancel", id: "cancel-stale", target_id: "msg-stale",
-      })).toString("base64"),
-    }));
+    emitOwnerMessage(peer, { type: "cancel", id: "cancel-fresh", target_id: "msg-fresh" });
+    await new Promise<void>((resolve) => setImmediate(resolve));
 
-    await new Promise<void>((r) => setImmediate(r));
-
-    const sent = relayRef.current!.send.mock.calls
-      .slice(sendsBefore)
-      .map((c) => c[0] as string)
-      .map(decodeSentCt)
-      .filter((d) => d.peer === "owner-cancel-1");
-    const cancelled = sent.filter((d) => d.inner.type === "cancelled");
-    expect(cancelled).toHaveLength(1);
-    expect(cancelled[0]!.inner).toMatchObject({
-      type: "cancelled",
-      in_reply_to: "cancel-stale",
-      target_id: "msg-stale",
-    });
+    expect(freshAbort).toHaveBeenCalledTimes(1);
     expect(staleAbort).not.toHaveBeenCalled();
-    expect(freshAbort).toHaveBeenCalledTimes(1);
+    expect(sentTo(peer, sendsBefore)).not.toContainEqual(expect.objectContaining({ type: "cancelled" }));
+    settle(sessionId);
+    expect(sentTo(peer, sendsBefore)).toContainEqual({ type: "cancelled", in_reply_to: "cancel-fresh", target_id: "msg-fresh" });
   });
 
-  test("cancel is handled before the strict pi binding guard", async () => {
-    const freshAbort = vi.fn();
-
-    await _pairForTestWithCtx("owner-cancel-nopi", {
-      ui: { notify: vi.fn() },
-      cwd: "/tmp/remote-pi-cancel-nopi",
-    });
-
-    const onSessionStart = captureEventHandler("session_start");
-    onSessionStart({ type: "session_start" }, { abort: freshAbort, compact: vi.fn() } as unknown as {
-      abort: ReturnType<typeof vi.fn>;
-      compact: ReturnType<typeof vi.fn>;
-    });
+  test("cancel remains handled after the strict Pi binding is cleared", async () => {
+    const peer = "owner-cancel-nopi";
+    const abort = vi.fn();
+    const sessionId = "cancel-nopi-session";
+    await _pairForTestWithCtx(peer, { ui: { notify: vi.fn() }, cwd: "/tmp/remote-pi-cancel-nopi" });
+    const context = sessionContext(sessionId, abort);
+    bindSession(sessionId, context);
+    _setPiForTest({ sendUserMessage: vi.fn() } as unknown as ExtensionAPI);
+    emitOwnerMessage(peer, { type: "user_message", id: "msg-nopi", text: "turn" });
+    await new Promise<void>((resolve) => setImmediate(resolve));
     _setPiForTest(null);
-
     const sendsBefore = relayRef.current!.send.mock.calls.length;
-    relayRef.current!.emit("message", JSON.stringify({
-      peer: "owner-cancel-nopi",
-      ct: Buffer.from(JSON.stringify({
-        type: "cancel", id: "cancel-nopi", target_id: "msg-nopi",
-      })).toString("base64"),
-    }));
 
-    await new Promise<void>((r) => setImmediate(r));
-
-    const sent = relayRef.current!.send.mock.calls
-      .slice(sendsBefore)
-      .map((c) => c[0] as string)
-      .map(decodeSentCt)
-      .filter((d) => d.peer === "owner-cancel-nopi");
-    const cancelled = sent.filter((d) => d.inner.type === "cancelled");
-    expect(cancelled).toHaveLength(1);
-    expect(cancelled[0]!.inner).toMatchObject({
-      type: "cancelled",
-      in_reply_to: "cancel-nopi",
-      target_id: "msg-nopi",
-    });
-    expect(freshAbort).toHaveBeenCalledTimes(1);
+    emitOwnerMessage(peer, { type: "cancel", id: "cancel-nopi", target_id: "msg-nopi" });
+    await new Promise<void>((resolve) => setImmediate(resolve));
+    expect(abort).toHaveBeenCalledTimes(1);
+    settle(sessionId);
+    expect(sentTo(peer, sendsBefore)).toContainEqual({ type: "cancelled", in_reply_to: "cancel-nopi", target_id: "msg-nopi" });
   });
 
-  test("cancel with no real abort context returns error and does not send cancelled", async () => {
-    await _pairForTestWithCtx("owner-cancel-2", {
-      ui: { notify: vi.fn() },
-      cwd: "/tmp/remote-pi-cancel-nonreal",
-      // Intentionally omit abort: the router must not claim success.
-    } as unknown as { ui: { notify: ReturnType<typeof vi.fn> }; cwd: string });
-
-    const onSessionStart = captureEventHandler("session_start");
-    onSessionStart({ type: "session_start" }, { compact: vi.fn() } as unknown as {
-      compact: ReturnType<typeof vi.fn>;
-    });
-
+  test("cancel with no real abort context returns an error and no false acknowledgement", async () => {
+    const peer = "owner-cancel-no-context";
+    const sessionId = "cancel-no-context-session";
+    await _pairForTestWithCtx(peer, { ui: { notify: vi.fn() }, cwd: "/tmp/remote-pi-cancel-no-context" });
+    const context = sessionContext(sessionId);
+    bindSession(sessionId, context);
+    _setPiForTest({ sendUserMessage: vi.fn() } as unknown as ExtensionAPI);
+    emitOwnerMessage(peer, { type: "user_message", id: "msg-no-context", text: "turn" });
+    await new Promise<void>((resolve) => setImmediate(resolve));
     const sendsBefore = relayRef.current!.send.mock.calls.length;
-    relayRef.current!.emit("message", JSON.stringify({
-      peer: "owner-cancel-2",
-      ct: Buffer.from(JSON.stringify({
-        type: "cancel", id: "cancel-nonreal", target_id: "msg-nonreal",
-      })).toString("base64"),
-    }));
+    emitOwnerMessage(peer, { type: "cancel", id: "cancel-no-context", target_id: "msg-no-context" });
+    await new Promise<void>((resolve) => setImmediate(resolve));
 
-    await new Promise<void>((r) => setImmediate(r));
-
-    const sent = relayRef.current!.send.mock.calls
-      .slice(sendsBefore)
-      .map((c) => c[0] as string)
-      .map(decodeSentCt)
-      .filter((d) => d.peer === "owner-cancel-2");
-    const errors = sent.filter((d) => d.inner.type === "error");
-    const cancelled = sent.filter((d) => d.inner.type === "cancelled");
-    expect(errors).toHaveLength(1);
-    expect(errors[0]!.inner).toMatchObject({
-      type: "error",
-      in_reply_to: "cancel-nonreal",
-      code: "internal_error",
-    });
-    expect(cancelled).toHaveLength(0);
+    expect(sentTo(peer, sendsBefore)).toContainEqual(expect.objectContaining({ type: "error", code: "internal_error", in_reply_to: "cancel-no-context" }));
+    settle(sessionId);
+    expect(sentTo(peer, sendsBefore)).not.toContainEqual(expect.objectContaining({ type: "cancelled" }));
   });
 
-  test("abort throw sends error, and the router still handles a later ping", async () => {
-    const aborting = vi.fn(() => { throw new Error("abort boom"); });
-
-    await _pairForTestWithCtx("owner-cancel-3", {
-      ui: { notify: vi.fn() },
-      cwd: "/tmp/remote-pi-cancel-throw",
-      abort: aborting,
-    });
-
-    const onSessionStart = captureEventHandler("session_start");
-    onSessionStart({ type: "session_start" }, { abort: aborting, compact: vi.fn() } as unknown as {
-      abort: ReturnType<typeof vi.fn>;
-      compact: ReturnType<typeof vi.fn>;
-    });
-
+  test("abort throw sends an error and the production router still handles a later ping", async () => {
+    const peer = "owner-cancel-throw";
+    const abort = vi.fn(() => { throw new Error("abort boom"); });
+    const sessionId = "cancel-throw-session";
+    await _pairForTestWithCtx(peer, { ui: { notify: vi.fn() }, cwd: "/tmp/remote-pi-cancel-throw" });
+    const context = sessionContext(sessionId, abort);
+    bindSession(sessionId, context);
+    _setPiForTest({ sendUserMessage: vi.fn() } as unknown as ExtensionAPI);
+    emitOwnerMessage(peer, { type: "user_message", id: "msg-throw", text: "turn" });
+    await new Promise<void>((resolve) => setImmediate(resolve));
     const sendsBefore = relayRef.current!.send.mock.calls.length;
-    relayRef.current!.emit("message", JSON.stringify({
-      peer: "owner-cancel-3",
-      ct: Buffer.from(JSON.stringify({
-        type: "cancel", id: "cancel-throw", target_id: "msg-throw",
-      })).toString("base64"),
-    }));
+    emitOwnerMessage(peer, { type: "cancel", id: "cancel-throw", target_id: "msg-throw" });
+    emitOwnerMessage(peer, { type: "ping", id: "ping-after-cancel" });
+    await new Promise<void>((resolve) => setImmediate(resolve));
 
-    await new Promise<void>((r) => setImmediate(r));
+    expect(abort).toHaveBeenCalledTimes(1);
+    expect(sentTo(peer, sendsBefore)).toContainEqual(expect.objectContaining({ type: "error", in_reply_to: "cancel-throw" }));
+    expect(sentTo(peer, sendsBefore)).toContainEqual({ type: "pong", in_reply_to: "ping-after-cancel" });
+    settle(sessionId);
+    expect(sentTo(peer, sendsBefore)).not.toContainEqual(expect.objectContaining({ type: "cancelled" }));
+  });
 
-    relayRef.current!.emit("message", JSON.stringify({
-      peer: "owner-cancel-3",
-      ct: Buffer.from(JSON.stringify({ type: "ping", id: "ping-after-cancel" })).toString("base64"),
-    }));
-    await new Promise<void>((r) => setImmediate(r));
+  test("valid cancellation aborts once and acknowledges only the cancelling sender after settlement", () => {
+    const receiver = { marker: "current", abort: vi.fn(function (this: { marker: string }) { expect(this.marker).toBe("current"); }) };
+    const context = sessionContext("sender-session", receiver.abort, { marker: receiver.marker });
+    const initiatingSender = sender();
+    const turn = startDirectTurn("sender-turn", { sessionId: "sender-session", context, initiatingSender });
+    const cancellingSender = sender();
 
-    const sent = relayRef.current!.send.mock.calls
-      .slice(sendsBefore)
-      .map((c) => c[0] as string)
-      .map(decodeSentCt)
-      .filter((d) => d.peer === "owner-cancel-3");
+    _routeClientMessageFrom(cancellingSender as never, { type: "cancel", id: "cancel-from-b", target_id: "sender-turn" }, {} as never);
+    _routeClientMessageFrom(cancellingSender as never, { type: "cancel", id: "cancel-duplicate", target_id: "sender-turn" }, {} as never);
+    expect(receiver.abort).toHaveBeenCalledTimes(1);
+    expect(cancellingSender.send).toHaveBeenCalledWith(expect.objectContaining({ type: "error", in_reply_to: "cancel-duplicate" }));
+    expect(cancellingSender.send).not.toHaveBeenCalledWith(expect.objectContaining({ type: "cancelled" }));
 
-    const errors = sent.filter((d) => d.inner.type === "error");
-    const pongs = sent.filter((d) => d.inner.type === "pong");
+    settle(turn.sessionId);
+    expect(initiatingSender.send).not.toHaveBeenCalledWith(expect.objectContaining({ type: "cancelled" }));
+    expect(cancellingSender.send).toHaveBeenCalledWith({ type: "cancelled", in_reply_to: "cancel-from-b", target_id: "sender-turn" });
+  });
 
-    expect(aborting).toHaveBeenCalledTimes(1);
-    expect(errors).toHaveLength(1);
-    expect(errors[0]!.inner).toMatchObject({
-      type: "error",
-      in_reply_to: "cancel-throw",
-      code: "internal_error",
-    });
-    expect(pongs).toHaveLength(1);
-    expect(pongs[0]!.inner).toMatchObject({ type: "pong", in_reply_to: "ping-after-cancel" });
+  test("stale target A cannot abort active target B", () => {
+    const turn = startDirectTurn("turn-b");
+    const cancellingSender = sender();
+    _routeClientMessageFrom(cancellingSender as never, { type: "cancel", id: "cancel-a", target_id: "turn-a" }, {} as never);
+    expect(turn.abort).not.toHaveBeenCalled();
+    expect(cancellingSender.send).toHaveBeenCalledWith(expect.objectContaining({ type: "error", in_reply_to: "cancel-a" }));
+  });
+
+  test("lifecycle snapshot session mismatch prevents cancel admission", () => {
+    const lifecycle = lifecycleFor("different-session", "generation-A");
+    const turn = startDirectTurn("session-mismatch-turn", { sessionId: "runtime-session", lifecycle });
+    const cancellingSender = sender();
+    _routeClientMessageFrom(cancellingSender as never, { type: "cancel", id: "session-mismatch-cancel", target_id: "session-mismatch-turn" }, {} as never);
+    expect(turn.abort).not.toHaveBeenCalled();
+    expect(cancellingSender.send).toHaveBeenCalledWith(expect.objectContaining({ type: "error", in_reply_to: "session-mismatch-cancel" }));
+  });
+
+  test("failed seeded replacement restores the prior cancellable turn", () => {
+    const a = startDirectTurn("rollback-turn-a", { sessionId: "rollback-session" });
+    _setPiForTest({ sendUserMessage: vi.fn(() => { throw new Error("reject B"); }) } as unknown as ExtensionAPI);
+    const bSender = sender();
+    _routeClientMessageFrom(bSender as never, { type: "user_message", id: "rollback-turn-b", text: "rejected" }, a.context as never);
+    expect(bSender.send).toHaveBeenCalledWith(expect.objectContaining({ type: "error", in_reply_to: "rollback-turn-b" }));
+
+    const aCanceller = sender();
+    _routeClientMessageFrom(aCanceller as never, { type: "cancel", id: "rollback-cancel-a", target_id: "rollback-turn-a" }, {} as never);
+    expect(a.abort).toHaveBeenCalledTimes(1);
+    settle(a.sessionId);
+    expect(aCanceller.send).toHaveBeenCalledWith({ type: "cancelled", in_reply_to: "rollback-cancel-a", target_id: "rollback-turn-a" });
+  });
+
+  test("settlement from another session cannot erase the current pending cancellation", () => {
+    const b = startDirectTurn("current-turn-b", { sessionId: "current-session-b" });
+    const bCanceller = sender();
+    _routeClientMessageFrom(bCanceller as never, { type: "cancel", id: "current-cancel-b", target_id: "current-turn-b" }, {} as never);
+    settle("stale-session-a");
+    expect(bCanceller.send).not.toHaveBeenCalledWith(expect.objectContaining({ type: "cancelled" }));
+    settle(b.sessionId);
+    expect(bCanceller.send).toHaveBeenCalledWith({ type: "cancelled", in_reply_to: "current-cancel-b", target_id: "current-turn-b" });
+  });
+
+  test("lifecycle generation replacement fences a delayed acknowledgement", () => {
+    const sessionId = "generation-fence-session";
+    const lifecycle = lifecycleFor(sessionId, "generation-A");
+    const turn = startDirectTurn("generation-turn", { sessionId, lifecycle });
+    const cancellingSender = sender();
+    _routeClientMessageFrom(cancellingSender as never, { type: "cancel", id: "generation-cancel", target_id: "generation-turn" }, {} as never);
+    lifecycle.replaceGeneration("generation-B");
+    settle(sessionId);
+    expect(cancellingSender.send).not.toHaveBeenCalledWith(expect.objectContaining({ type: "cancelled" }));
+  });
+
+  test("session replacement fences A and a later B turn can cancel normally", () => {
+    const a = startDirectTurn("turn-a", { sessionId: "session-a" });
+    const aCanceller = sender();
+    _routeClientMessageFrom(aCanceller as never, { type: "cancel", id: "cancel-a", target_id: "turn-a" }, {} as never);
+    expect(a.abort).toHaveBeenCalledTimes(1);
+
+    const b = startDirectTurn("turn-b", { sessionId: "session-b" });
+    settle("session-a");
+    expect(aCanceller.send).not.toHaveBeenCalledWith(expect.objectContaining({ type: "cancelled" }));
+    const bCanceller = sender();
+    _routeClientMessageFrom(bCanceller as never, { type: "cancel", id: "cancel-b", target_id: "turn-b" }, {} as never);
+    expect(b.abort).toHaveBeenCalledTimes(1);
+    settle("session-b");
+    expect(bCanceller.send).toHaveBeenCalledWith({ type: "cancelled", in_reply_to: "cancel-b", target_id: "turn-b" });
   });
 });
 
@@ -2801,6 +2920,7 @@ describe("session_shutdown teardown", () => {
     relayInstances.length = 0;
     _defaultConnectImpl = async () => undefined;
     _setDisposedForTest(false); // shared module — clear the per-instance flag
+    _setAutoInitedForTest(false);
     const stop = captureHandler("remote-pi stop");
     await stop("", makeMockCtx());
   });
@@ -2845,15 +2965,13 @@ describe("session_shutdown teardown", () => {
     const shutdown = captureEventHandler("session_shutdown");
     await shutdown({ type: "session_shutdown", reason: "resume" });
 
-    // Now the deferred connect runs AFTER shutdown. Both halves must bail:
-    // _cmdJoin connects-then-leaves (no lingering mesh node) AND _cmdStart's
-    // post-connect `_disposed` guard closes the relay instead of promoting it
-    // to a ghost that holds the room.
+    // Now the deferred connect runs AFTER shutdown. It must bail before either
+    // transport is constructed; no stale action may touch a command context.
     captureHandler("remote-pi");
     await _connectForTest(makeMockCtx());
     expect(_hasMeshNodeForTest()).toBe(false);
-    expect(_getState()).toBe("idle");                 // relay never became "started"
-    expect(relayRef.current?.close).toHaveBeenCalled(); // ghost WS closed → room freed
+    expect(_getState()).toBe("idle");
+    expect(relayRef.current).toBeNull();
   });
 
   // The precise Cockpit race: switch_session → session_shutdown lands WHILE
@@ -2888,6 +3006,382 @@ describe("session_shutdown teardown", () => {
 
     expect(relay.close).toHaveBeenCalled();  // ghost WS closed → room available
     expect(_getState()).toBe("idle");         // never transitioned to "started"
+  });
+
+  test("all-producers compaction/reload interleaving leaves an old root action inert (no stale status ctx or second relay start)", async () => {
+    // This models the archive race: Remote Pi is still awaiting relay setup
+    // while lifecycle compaction triggers a session replacement/reload. A host
+    // that reuses the module clears `_disposed` at session_start, so the old
+    // root action must additionally be fenced by its captured session epoch.
+    const cwd = mkdtempSync(join(tmpdir(), "remote-pi-stale-root-"));
+    const previousDirectConfig = process.env["REMOTE_PI_DIRECT_CONFIG"];
+    process.env["REMOTE_PI_DIRECT_CONFIG"] = JSON.stringify({
+      agent_name: "archive-race", auto_start_relay: true,
+    });
+    const replacementCwd = mkdtempSync(join(tmpdir(), "remote-pi-fresh-root-"));
+    writeProtectedLocalConfig(replacementCwd, "archive-race", true);
+    let releaseConnect!: () => void;
+    _defaultConnectImpl = () => new Promise<void>((resolve) => { releaseConnect = resolve; });
+    let stale = false;
+    const ui = { notify: vi.fn() };
+    const oldCtx = {
+      get ui() {
+        if (stale) throw new Error("stale command context dereferenced");
+        return ui;
+      },
+      cwd,
+      abort: vi.fn(),
+      sessionManager: { getSessionId: () => testSessionId(cwd) },
+    } as ReturnType<typeof makeMockCtx>;
+
+    try {
+      // The regular archive runtime obtains this from its session_start ctx;
+      // seed the same stable identity for this isolated command-handler test.
+      _seedRuntimeIdentityForTest(oldCtx);
+      const root = captureHandler("remote-pi");
+      const oldRoot = root("", oldCtx);
+      await vi.waitFor(() => expect(relayRef.current).not.toBeNull());
+      const oldRelay = relayRef.current!;
+
+      // A compaction is in progress when Pi replaces the session. The mesh
+      // producer is represented by the held relay-start action; replacement
+      // must not let it resume and publish status through the old ctx.
+      captureEventHandler("session_before_compact")({ type: "session_before_compact" });
+      stale = true;
+      await captureEventHandler("session_shutdown")({ type: "session_shutdown", reason: "reload" });
+      // The original command represents an already initialized session. Its
+      // replacement re-arms exactly once through the disposed-instance path.
+      _setAutoInitedForTest(true);
+      const replacementCtx = {
+        ui: { notify: vi.fn() },
+        cwd: replacementCwd,
+        abort: vi.fn(),
+        compact: vi.fn(),
+        sessionManager: { getSessionId: () => "replacement-session" },
+      };
+      captureEventHandler("session_start")({ type: "session_start" }, replacementCtx);
+
+      // Resolve the old action first. The replacement's relay connect is then
+      // deliberately held by the same mock, proving it is a distinct current
+      // action rather than a side effect of the stale continuation.
+      releaseConnect();
+      await expect(oldRoot).resolves.toBeUndefined();
+      expect(oldRelay.close).toHaveBeenCalledTimes(1);
+      await vi.waitFor(() => expect(relayInstances).toHaveLength(2));
+      const replacementRelay = relayRef.current!;
+      releaseConnect();
+      await vi.waitFor(() => expect(_getState()).toBe("started"));
+      expect(replacementRelay.close).not.toHaveBeenCalled();
+      expect(replacementCtx.ui.notify).toHaveBeenCalledWith(
+        expect.stringContaining("Joined local mesh"),
+        "info",
+      );
+    } finally {
+      if (previousDirectConfig === undefined) delete process.env["REMOTE_PI_DIRECT_CONFIG"];
+      else process.env["REMOTE_PI_DIRECT_CONFIG"] = previousDirectConfig;
+      rmSync(cwd, { recursive: true, force: true });
+      rmSync(replacementCwd, { recursive: true, force: true });
+    }
+  });
+
+  test("a stale relay rejection cannot notify its old context and the replacement connects", async () => {
+    _resetCwdLockForTest();
+    const cwd = mkdtempSync(join(tmpdir(), "remote-pi-stale-relay-rejection-"));
+    const replacementCwd = mkdtempSync(join(tmpdir(), "remote-pi-fresh-relay-rejection-"));
+    const previousDirectConfig = process.env["REMOTE_PI_DIRECT_CONFIG"];
+    process.env["REMOTE_PI_DIRECT_CONFIG"] = JSON.stringify({
+      agent_name: "relay-rejection-race", auto_start_relay: true,
+    });
+    writeProtectedLocalConfig(replacementCwd, "relay-rejection-race", true);
+    let rejectOldConnect!: (error: Error) => void;
+    let connectCalls = 0;
+    _defaultConnectImpl = () => {
+      if (connectCalls++ === 0) {
+        return new Promise<void>((_resolve, reject) => { rejectOldConnect = reject; });
+      }
+      return Promise.resolve();
+    };
+    let stale = false;
+    const oldUi = { notify: vi.fn() };
+    const oldCtx = {
+      get ui() {
+        if (stale) throw new Error("stale relay rejection context dereferenced");
+        return oldUi;
+      },
+      cwd,
+      abort: vi.fn(),
+      sessionManager: { getSessionId: () => testSessionId(cwd) },
+    } as ReturnType<typeof makeMockCtx>;
+
+    try {
+      _seedRuntimeIdentityForTest(oldCtx);
+      const root = captureHandler("remote-pi");
+      const oldRoot = root("", oldCtx);
+      await vi.waitFor(() => expect(relayInstances).toHaveLength(1));
+      const notificationsBeforeReplacement = oldUi.notify.mock.calls.length;
+
+      stale = true;
+      await captureEventHandler("session_shutdown")({ type: "session_shutdown", reason: "reload" });
+      _setAutoInitedForTest(true);
+      const replacementCtx = {
+        ui: { notify: vi.fn() }, cwd: replacementCwd, abort: vi.fn(), compact: vi.fn(),
+        sessionManager: { getSessionId: () => "relay-rejection-replacement" },
+      };
+      captureEventHandler("session_start")({ type: "session_start" }, replacementCtx);
+
+      rejectOldConnect(new Error("old relay rejected"));
+      await expect(oldRoot).resolves.toBeUndefined();
+      expect(oldUi.notify).toHaveBeenCalledTimes(notificationsBeforeReplacement);
+      await vi.waitFor(() => expect(_getState()).toBe("started"));
+      expect(relayInstances).toHaveLength(2);
+      expect(replacementCtx.ui.notify).toHaveBeenCalledWith(expect.stringContaining("Joined local mesh"), "info");
+    } finally {
+      if (previousDirectConfig === undefined) delete process.env["REMOTE_PI_DIRECT_CONFIG"];
+      else process.env["REMOTE_PI_DIRECT_CONFIG"] = previousDirectConfig;
+      _resetCwdLockForTest();
+      rmSync(cwd, { recursive: true, force: true });
+      rmSync(replacementCwd, { recursive: true, force: true });
+    }
+  });
+
+  test("a stale peer rejection cannot release the replacement lock or notify its old context", async () => {
+    _resetCwdLockForTest();
+    const cwd = mkdtempSync(join(tmpdir(), "remote-pi-stale-peer-rejection-"));
+    const replacementCwd = mkdtempSync(join(tmpdir(), "remote-pi-fresh-peer-rejection-"));
+    const previousDirectConfig = process.env["REMOTE_PI_DIRECT_CONFIG"];
+    process.env["REMOTE_PI_DIRECT_CONFIG"] = JSON.stringify({
+      agent_name: "peer-rejection-race", auto_start_relay: true,
+    });
+    writeProtectedLocalConfig(replacementCwd, "peer-rejection-race", true);
+    const { MeshNode } = await import("./session/mesh_node.js");
+    const originalConnect = MeshNode.prototype.connect;
+    let rejectOldConnect!: (error: Error) => void;
+    let connectCalls = 0;
+    const connect = vi.spyOn(MeshNode.prototype, "connect").mockImplementation(function (
+      this: InstanceType<typeof MeshNode>,
+    ) {
+      if (connectCalls++ === 0) {
+        return new Promise<string>((_resolve, reject) => { rejectOldConnect = reject; });
+      }
+      return originalConnect.call(this);
+    });
+    let stale = false;
+    const oldUi = { notify: vi.fn() };
+    const oldCtx = {
+      get ui() {
+        if (stale) throw new Error("stale peer rejection context dereferenced");
+        return oldUi;
+      },
+      cwd,
+      abort: vi.fn(),
+      sessionManager: { getSessionId: () => testSessionId(cwd) },
+    } as ReturnType<typeof makeMockCtx>;
+
+    try {
+      _seedRuntimeIdentityForTest(oldCtx);
+      const root = captureHandler("remote-pi");
+      const oldRoot = root("", oldCtx);
+      await vi.waitFor(() => expect(connect).toHaveBeenCalledTimes(1));
+      const notificationsBeforeReplacement = oldUi.notify.mock.calls.length;
+
+      stale = true;
+      await captureEventHandler("session_shutdown")({ type: "session_shutdown", reason: "reload" });
+      _setAutoInitedForTest(true);
+      const replacementCtx = {
+        ui: { notify: vi.fn() }, cwd: replacementCwd, abort: vi.fn(), compact: vi.fn(),
+        sessionManager: { getSessionId: () => "peer-rejection-replacement" },
+      };
+      captureEventHandler("session_start")({ type: "session_start" }, replacementCtx);
+      await vi.waitFor(() => expect(_hasMeshNodeForTest()).toBe(true));
+
+      rejectOldConnect(new Error("old peer rejected"));
+      await expect(oldRoot).resolves.toBeUndefined();
+      expect(oldUi.notify).toHaveBeenCalledTimes(notificationsBeforeReplacement);
+      await vi.waitFor(() => expect(_getState()).toBe("started"));
+      expect(_hasMeshNodeForTest()).toBe(true);
+      expect(_getLockedNameForTest()).not.toBeNull();
+    } finally {
+      connect.mockRestore();
+      if (previousDirectConfig === undefined) delete process.env["REMOTE_PI_DIRECT_CONFIG"];
+      else process.env["REMOTE_PI_DIRECT_CONFIG"] = previousDirectConfig;
+      _resetCwdLockForTest();
+      rmSync(cwd, { recursive: true, force: true });
+      rmSync(replacementCwd, { recursive: true, force: true });
+    }
+  });
+
+  test("a stale peer success cannot publish over the replacement mesh or notify its old context", async () => {
+    _resetCwdLockForTest();
+    const cwd = mkdtempSync(join(tmpdir(), "remote-pi-stale-peer-success-"));
+    const replacementCwd = mkdtempSync(join(tmpdir(), "remote-pi-fresh-peer-success-"));
+    const sessionId = "replacement-peer-session";
+    const previousDirectConfig = process.env["REMOTE_PI_DIRECT_CONFIG"];
+    process.env["REMOTE_PI_DIRECT_CONFIG"] = JSON.stringify({
+      agent_name: "peer-success-race", auto_start_relay: true,
+    });
+    writeProtectedLocalConfig(cwd, "peer-success-race", true);
+    writeProtectedLocalConfig(replacementCwd, "peer-success-race", true);
+    const { MeshNode } = await import("./session/mesh_node.js");
+    const originalConnect = MeshNode.prototype.connect;
+    let releaseOldConnect!: (name: string) => void;
+    let connectCalls = 0;
+    const connect = vi.spyOn(MeshNode.prototype, "connect").mockImplementation(function (
+      this: InstanceType<typeof MeshNode>,
+    ) {
+      if (connectCalls++ === 0) {
+        return new Promise<string>((resolve) => { releaseOldConnect = resolve; });
+      }
+      return originalConnect.call(this);
+    });
+    let stale = false;
+    const oldUi = { notify: vi.fn() };
+    const oldCtx = {
+      get ui() {
+        if (stale) throw new Error("stale peer success context dereferenced");
+        return oldUi;
+      },
+      cwd,
+      abort: vi.fn(),
+      sessionManager: { getSessionId: () => sessionId },
+    } as ReturnType<typeof makeMockCtx>;
+
+    try {
+      const root = captureHandler("remote-pi");
+      const oldRoot = root("", oldCtx);
+      await vi.waitFor(() => expect(connect).toHaveBeenCalledTimes(1));
+      const notificationsBeforeReplacement = oldUi.notify.mock.calls.length;
+
+      stale = true;
+      await captureEventHandler("session_shutdown")({ type: "session_shutdown", reason: "reload" });
+      _setAutoInitedForTest(true);
+      const replacementCtx = {
+        ui: { notify: vi.fn() }, cwd: replacementCwd, abort: vi.fn(), compact: vi.fn(),
+        sessionManager: { getSessionId: () => sessionId },
+      };
+      captureEventHandler("session_start")({ type: "session_start" }, replacementCtx);
+      await vi.waitFor(() => expect(_hasMeshNodeForTest()).toBe(true));
+
+      releaseOldConnect("stale-peer");
+      await expect(oldRoot).resolves.toBeUndefined();
+      expect(oldUi.notify).toHaveBeenCalledTimes(notificationsBeforeReplacement);
+      await vi.waitFor(() => expect(_getState()).toBe("started"));
+      expect(_hasMeshNodeForTest()).toBe(true);
+      expect(_getLockedNameForTest()).not.toBeNull();
+      expect(replacementCtx.ui.notify).toHaveBeenCalledWith(expect.stringContaining("Joined local mesh"), "info");
+    } finally {
+      connect.mockRestore();
+      if (previousDirectConfig === undefined) delete process.env["REMOTE_PI_DIRECT_CONFIG"];
+      else process.env["REMOTE_PI_DIRECT_CONFIG"] = previousDirectConfig;
+      _resetCwdLockForTest();
+      rmSync(cwd, { recursive: true, force: true });
+      rmSync(replacementCwd, { recursive: true, force: true });
+    }
+  });
+
+  test("a stale successful lock acquisition releases only its own lock before the replacement connects", async () => {
+    _resetCwdLockForTest();
+    const cwd = mkdtempSync(join(tmpdir(), "remote-pi-stale-lock-success-"));
+    const replacementCwd = mkdtempSync(join(tmpdir(), "remote-pi-fresh-lock-success-"));
+    const sessionId = "replacement-lock-session";
+    const previousDirectConfig = process.env["REMOTE_PI_DIRECT_CONFIG"];
+    process.env["REMOTE_PI_DIRECT_CONFIG"] = JSON.stringify({
+      agent_name: "lock-success-race", auto_start_relay: true,
+    });
+    // Matching protected identities make the replacement prove the stale
+    // continuation released its post-shutdown successful acquisition.
+    writeProtectedLocalConfig(cwd, "lock-success-race", true);
+    writeProtectedLocalConfig(replacementCwd, "lock-success-race", true);
+    let stale = false;
+    const oldUi = { notify: vi.fn() };
+    const oldCtx = {
+      get ui() {
+        if (stale) throw new Error("stale lock success context dereferenced");
+        return oldUi;
+      },
+      cwd,
+      abort: vi.fn(),
+      sessionManager: { getSessionId: () => sessionId },
+    } as ReturnType<typeof makeMockCtx>;
+
+    try {
+      const root = captureHandler("remote-pi");
+      // acquireIdentityLock has yielded to its async bind before this returns.
+      const oldRoot = root("", oldCtx);
+      stale = true;
+      await captureEventHandler("session_shutdown")({ type: "session_shutdown", reason: "reload" });
+      await expect(oldRoot).resolves.toBeUndefined();
+      expect(oldUi.notify).not.toHaveBeenCalled();
+
+      _setAutoInitedForTest(true);
+      const replacementCtx = {
+        ui: { notify: vi.fn() }, cwd: replacementCwd, abort: vi.fn(), compact: vi.fn(),
+        sessionManager: { getSessionId: () => sessionId },
+      };
+      captureEventHandler("session_start")({ type: "session_start" }, replacementCtx);
+      await vi.waitFor(() => expect(_getState()).toBe("started"));
+      expect(_hasMeshNodeForTest()).toBe(true);
+      expect(_getLockedNameForTest()).not.toBeNull();
+      expect(replacementCtx.ui.notify).toHaveBeenCalledWith(expect.stringContaining("Joined local mesh"), "info");
+    } finally {
+      if (previousDirectConfig === undefined) delete process.env["REMOTE_PI_DIRECT_CONFIG"];
+      else process.env["REMOTE_PI_DIRECT_CONFIG"] = previousDirectConfig;
+      _resetCwdLockForTest();
+      rmSync(cwd, { recursive: true, force: true });
+      rmSync(replacementCwd, { recursive: true, force: true });
+    }
+  });
+
+  test("a stale refused lock acquisition is silent and the replacement connects", async () => {
+    _resetCwdLockForTest();
+    const cwd = mkdtempSync(join(tmpdir(), "remote-pi-stale-lock-rejection-"));
+    const replacementCwd = mkdtempSync(join(tmpdir(), "remote-pi-fresh-lock-rejection-"));
+    const previousDirectConfig = process.env["REMOTE_PI_DIRECT_CONFIG"];
+    process.env["REMOTE_PI_DIRECT_CONFIG"] = JSON.stringify({
+      agent_name: "lock-rejection-race", auto_start_relay: true,
+    });
+    writeProtectedLocalConfig(replacementCwd, "lock-rejection-race", true);
+    const oldUi = { notify: vi.fn() };
+    let stale = false;
+    const oldCtx = {
+      get ui() {
+        if (stale) throw new Error("stale lock rejection context dereferenced");
+        return oldUi;
+      },
+      cwd,
+      abort: vi.fn(),
+      sessionManager: { getSessionId: () => testSessionId(cwd) },
+    } as ReturnType<typeof makeMockCtx>;
+    _seedRuntimeIdentityForTest(oldCtx);
+    const identity = _getRuntimeIdentityForTest()!;
+    const held = await acquireIdentityLock(identity);
+    expect(held.ok).toBe(true);
+
+    try {
+      const root = captureHandler("remote-pi");
+      const oldRoot = root("", oldCtx);
+      stale = true;
+      await captureEventHandler("session_shutdown")({ type: "session_shutdown", reason: "reload" });
+      await expect(oldRoot).resolves.toBeUndefined();
+      expect(oldUi.notify).not.toHaveBeenCalled();
+
+      if (held.ok) held.release();
+      _setAutoInitedForTest(true);
+      const replacementCtx = {
+        ui: { notify: vi.fn() }, cwd: replacementCwd, abort: vi.fn(), compact: vi.fn(),
+        sessionManager: { getSessionId: () => "lock-rejection-replacement" },
+      };
+      captureEventHandler("session_start")({ type: "session_start" }, replacementCtx);
+      await vi.waitFor(() => expect(_getState()).toBe("started"));
+      expect(_hasMeshNodeForTest()).toBe(true);
+      expect(replacementCtx.ui.notify).toHaveBeenCalledWith(expect.stringContaining("Joined local mesh"), "info");
+    } finally {
+      if (held.ok) held.release();
+      if (previousDirectConfig === undefined) delete process.env["REMOTE_PI_DIRECT_CONFIG"];
+      else process.env["REMOTE_PI_DIRECT_CONFIG"] = previousDirectConfig;
+      _resetCwdLockForTest();
+      rmSync(cwd, { recursive: true, force: true });
+      rmSync(replacementCwd, { recursive: true, force: true });
+    }
   });
 
   test("after a clean reset, connect works again (flag is per-instance, not sticky)", async () => {
@@ -3177,6 +3671,33 @@ describe("child-safe legacy exposure", () => {
     expect(ctx.ui.notify).toHaveBeenCalledWith(expect.stringMatching(/capability|required|denied/i), expect.any(String));
   });
 
+  test("an exact descriptor-backed child identity remains fail-closed on a live collision", async () => {
+    const descriptor = await currentRelayDescriptor("local");
+    process.env["PI_SUBAGENT_CHILD"] = "1";
+    process.env["PI_SUBAGENT_DESCRIPTOR"] = JSON.stringify(descriptor);
+    const held = await acquireIdentityLock({ workspaceId: descriptor.workspaceId, agentId: descriptor.agentId });
+    expect(held.ok).toBe(true);
+    try {
+      const root = captureHandler("remote-pi");
+      const ctx = makeMockCtx(childCwd);
+      await root("", ctx);
+
+      expect(_getRuntimeIdentityForTest()).toEqual({
+        workspaceId: descriptor.workspaceId,
+        agentId: descriptor.agentId,
+        processEpoch: descriptor.processEpoch,
+      });
+      expect(_hasMeshNodeForTest()).toBe(false);
+      expect(ctx.ui.notify).toHaveBeenCalledWith(
+        expect.stringContaining("runtime identity"),
+        "warning",
+      );
+      expect(ctx.ui.notify).not.toHaveBeenCalledWith(expect.stringMatching(/rolled/i), expect.any(String));
+    } finally {
+      if (held.ok) held.release();
+    }
+  });
+
   test("a forged process-bound capability is consumed from env but cannot construct a relay", async () => {
     const descriptor = await currentRelayDescriptor();
     process.env["PI_SUBAGENT_CHILD"] = "1";
@@ -3192,6 +3713,96 @@ describe("child-safe legacy exposure", () => {
     expect(_getState()).toBe("idle");
     expect(relayInstances).toHaveLength(0);
     expect(ctx.ui.notify).toHaveBeenCalledWith(expect.stringMatching(/forged_capability/), "warning");
+  });
+
+  test.each(["reply", "rejection"] as const)("a stale child relay activation %s cannot publish a lease or touch its old context", async (outcome) => {
+    const descriptor = await currentRelayDescriptor();
+    const capability = `rpel1.77777777-7777-4777-8777-777777777777.${"a".repeat(43)}`;
+    process.env["PI_SUBAGENT_CHILD"] = "1";
+    process.env["PI_SUBAGENT_DESCRIPTOR"] = JSON.stringify(descriptor);
+    process.env["PI_SUBAGENT_RELAY_EXPOSURE_CAPABILITY"] = capability;
+    const { MeshNode } = await import("./session/mesh_node.js");
+    const originalRequest = MeshNode.prototype.request;
+    let settleActivation!: () => void;
+    const request = vi.spyOn(MeshNode.prototype, "request").mockImplementation(function (
+      this: InstanceType<typeof MeshNode>,
+      to: string,
+      body: unknown,
+      timeoutMs?: number,
+    ) {
+      if (to === "broker" && (body as { type?: string } | null)?.type === "relay_lease_activate") {
+        return new Promise((resolve, reject) => {
+          settleActivation = () => {
+            if (outcome === "rejection") {
+              reject(new Error("stale child activation rejected"));
+              return;
+            }
+            const issuedAt = Date.now();
+            resolve({
+              from: "broker",
+              to: descriptor.agentId,
+              id: "88888888-8888-4888-8888-888888888888",
+              re: "99999999-9999-4999-9999-999999999999",
+              body: {
+                type: "relay_lease_activate_result",
+                ok: true,
+                state: "activated",
+                lease: {
+                  relayExposureLeaseId: "77777777-7777-4777-8777-777777777777",
+                  parent: {
+                    workspaceId: descriptor.workspaceId,
+                    agentId: descriptor.parentAgentId,
+                    processEpoch: "55555555-5555-4555-8555-555555555555",
+                  },
+                  binding: {
+                    runId: descriptor.runId,
+                    workspaceId: descriptor.workspaceId,
+                    agentId: descriptor.agentId,
+                    processEpoch: descriptor.processEpoch,
+                    mode: "relay",
+                  },
+                  issuedAt,
+                  expiresAt: issuedAt + 30_000,
+                },
+              },
+            });
+          };
+        });
+      }
+      return originalRequest.call(this, to, body, timeoutMs);
+    });
+    let stale = false;
+    const oldUi = { notify: vi.fn() };
+    const oldCtx = {
+      get ui() {
+        if (stale) throw new Error("stale child activation context dereferenced");
+        return oldUi;
+      },
+      cwd: childCwd,
+      abort: vi.fn(),
+      sessionManager: { getSessionId: () => "stale-child-activation" },
+    } as ReturnType<typeof makeMockCtx>;
+
+    try {
+      const root = captureHandler("remote-pi");
+      expect(process.env["PI_SUBAGENT_RELAY_EXPOSURE_CAPABILITY"]).toBeUndefined();
+      const oldRoot = root("", oldCtx);
+      await vi.waitFor(() => expect(request).toHaveBeenCalledWith("broker", expect.objectContaining({
+        type: "relay_lease_activate", capability, runId: descriptor.runId, mode: "relay",
+      }), 2000));
+      const notificationsBeforeShutdown = oldUi.notify.mock.calls.length;
+
+      stale = true;
+      await captureEventHandler("session_shutdown")({ type: "session_shutdown", reason: "reload" });
+      settleActivation();
+      await expect(oldRoot).resolves.toBeUndefined();
+      expect(oldUi.notify).toHaveBeenCalledTimes(notificationsBeforeShutdown);
+      expect(_getRelayExposureLeaseForTest()).toBeNull();
+      expect(relayInstances).toHaveLength(0);
+      expect(_getState()).toBe("idle");
+    } finally {
+      request.mockRestore();
+    }
   });
 
   test.each([false, true])("a broker-issued process-bound capability promotes one current child relay (protected config: %s)", async (withProtectedConfig) => {
@@ -4118,28 +4729,148 @@ describe("runtime identity lock ownership", () => {
     }
   });
 
-  test("a duplicate workspaceId+agentId is refused regardless of display name or epoch", async () => {
+  test("a normal session rolls to a fresh process-local agentId when its preferred live identity collides", async () => {
     const cwd = mkdtempSync(join(tmpdir(), "remote-pi-identity-lock-"));
     const workspaceId = writeProtectedLocalConfig(cwd, "Backoffice");
     process.env["REMOTE_PI_DIRECT_CONFIG"] = JSON.stringify({ agent_name: "Backoffice", auto_start_relay: false });
-    const held = await acquireIdentityLock({
-      workspaceId,
-      agentId: agentIdFromSessionId(testSessionId(cwd)),
-    });
+    const preferredAgentId = agentIdFromSessionId(testSessionId(cwd));
+    const held = await acquireIdentityLock({ workspaceId, agentId: preferredAgentId });
     expect(held.ok).toBe(true);
     try {
       const root = captureHandler("remote-pi");
       const ctx = makeMockCtx(cwd);
       await root("", ctx);
 
-      expect(_getLockedNameForTest()).toBeNull();
-      expect(_hasMeshNodeForTest()).toBe(false);
+      const rolled = _getRuntimeIdentityForTest();
+      expect(_getLockedNameForTest()).toBe("Backoffice");
+      expect(_hasMeshNodeForTest()).toBe(true);
+      expect(rolled).toMatchObject({ workspaceId });
+      expect(rolled?.agentId).not.toBe(preferredAgentId);
       expect(ctx.ui.notify).toHaveBeenCalledWith(
-        expect.stringContaining("runtime identity"),
+        expect.stringMatching(/identity.*active.*rolled/i),
         "warning",
       );
     } finally {
+      const stop = captureHandler("remote-pi stop");
+      await stop("", makeMockCtx(cwd));
       if (held.ok) held.release();
+      delete process.env["REMOTE_PI_DIRECT_CONFIG"];
+      _resetCwdLockForTest();
+      rmSync(cwd, { recursive: true, force: true });
+    }
+  });
+
+  test("a refused rolled lock remains unpublished and the retry claims the same alternate", async () => {
+    const cwd = mkdtempSync(join(tmpdir(), "remote-pi-rolled-lock-refused-"));
+    const workspaceId = writeProtectedLocalConfig(cwd, "Backoffice");
+    process.env["REMOTE_PI_DIRECT_CONFIG"] = JSON.stringify({ agent_name: "Backoffice", auto_start_relay: false });
+    const preferredIdentity = {
+      workspaceId,
+      agentId: agentIdFromSessionId(testSessionId(cwd)),
+      processEpoch: _getRuntimeProcessEpochForTest(),
+    };
+    const rolledIdentity = rollRuntimeIdentity(preferredIdentity);
+    const preferredLock = await acquireIdentityLock(preferredIdentity);
+    const rolledLock = await acquireIdentityLock(rolledIdentity);
+    expect(preferredLock.ok).toBe(true);
+    expect(rolledLock.ok).toBe(true);
+    try {
+      const root = captureHandler("remote-pi");
+      const ctx = makeMockCtx(cwd);
+      await root("", ctx);
+
+      expect(_hasMeshNodeForTest()).toBe(false);
+      expect(_getRuntimeIdentityForTest()).toEqual(preferredIdentity);
+      expect(ctx.ui.notify).not.toHaveBeenCalledWith(expect.stringMatching(/rolled this process/i), expect.any(String));
+
+      if (rolledLock.ok) rolledLock.release();
+      await root("", ctx);
+
+      expect(_hasMeshNodeForTest()).toBe(true);
+      expect(_getRuntimeIdentityForTest()).toEqual(rolledIdentity);
+      expect(ctx.ui.notify).toHaveBeenCalledWith(expect.stringMatching(/rolled this process/i), "warning");
+    } finally {
+      const stop = captureHandler("remote-pi stop");
+      await stop("", makeMockCtx(cwd));
+      if (rolledLock.ok) rolledLock.release();
+      if (preferredLock.ok) preferredLock.release();
+      delete process.env["REMOTE_PI_DIRECT_CONFIG"];
+      _resetCwdLockForTest();
+      rmSync(cwd, { recursive: true, force: true });
+    }
+  });
+
+  test("a rolled normal identity owns and reconnects the same distinct relay room", async () => {
+    vi.useFakeTimers();
+    const cwd = mkdtempSync(join(tmpdir(), "remote-pi-rolled-relay-room-"));
+    const workspaceId = writeProtectedLocalConfig(cwd, "Backoffice", true);
+    process.env["REMOTE_PI_DIRECT_CONFIG"] = JSON.stringify({ agent_name: "Backoffice", auto_start_relay: true });
+    const preferredAgentId = agentIdFromSessionId(testSessionId(cwd));
+    const preferredLock = await acquireIdentityLock({ workspaceId, agentId: preferredAgentId });
+    const captured: Array<{ roomId?: string }> = [];
+    _defaultConnectImpl = async (options?: unknown) => { captured.push(options as { roomId?: string }); };
+    expect(preferredLock.ok).toBe(true);
+    try {
+      const root = captureHandler("remote-pi");
+      const ctx = makeMockCtx(cwd);
+      await root("", ctx);
+
+      const rolledIdentity = _getRuntimeIdentityForTest();
+      expect(rolledIdentity).toMatchObject({ workspaceId });
+      expect(rolledIdentity?.agentId).not.toBe(preferredAgentId);
+      expect(captured).toHaveLength(1);
+      expect(captured[0]?.roomId).toBe(roomIdForIdentity(rolledIdentity!));
+
+      relayInstances[0]!.emit("close");
+      await vi.advanceTimersByTimeAsync(1_000);
+
+      expect(_getRuntimeIdentityForTest()).toEqual(rolledIdentity);
+      expect(captured).toHaveLength(2);
+      expect(captured[1]?.roomId).toBe(captured[0]?.roomId);
+    } finally {
+      vi.useRealTimers();
+      const stop = captureHandler("remote-pi stop");
+      await stop("", makeMockCtx(cwd));
+      if (preferredLock.ok) preferredLock.release();
+      delete process.env["REMOTE_PI_DIRECT_CONFIG"];
+      _resetCwdLockForTest();
+      rmSync(cwd, { recursive: true, force: true });
+    }
+  });
+
+  test("concurrent joins in one session action share one attempt instead of rolling against themselves", async () => {
+    const cwd = mkdtempSync(join(tmpdir(), "remote-pi-concurrent-join-"));
+    const workspaceId = writeProtectedLocalConfig(cwd, "Backoffice");
+    process.env["REMOTE_PI_DIRECT_CONFIG"] = JSON.stringify({ agent_name: "Backoffice", auto_start_relay: false });
+    const preferredAgentId = agentIdFromSessionId(testSessionId(cwd));
+    const { MeshNode } = await import("./session/mesh_node.js");
+    const originalConnect = MeshNode.prototype.connect;
+    let releaseConnect!: () => void;
+    const connect = vi.spyOn(MeshNode.prototype, "connect").mockImplementationOnce(async function (
+      this: InstanceType<typeof MeshNode>,
+    ) {
+      await new Promise<void>((resolve) => { releaseConnect = resolve; });
+      return originalConnect.call(this);
+    });
+    try {
+      const root = captureHandler("remote-pi");
+      const ctx = makeMockCtx(cwd);
+      const first = root("", ctx);
+      await vi.waitFor(() => expect(connect).toHaveBeenCalledTimes(1));
+      const second = root("", ctx);
+      await new Promise((resolve) => setTimeout(resolve, 25));
+
+      expect(connect).toHaveBeenCalledTimes(1);
+      expect(_getRuntimeIdentityForTest()).toMatchObject({ workspaceId, agentId: preferredAgentId });
+
+      releaseConnect();
+      await Promise.all([first, second]);
+      expect(connect).toHaveBeenCalledTimes(1);
+      expect(_hasMeshNodeForTest()).toBe(true);
+    } finally {
+      connect.mockRestore();
+      const stop = captureHandler("remote-pi stop");
+      await stop("", makeMockCtx(cwd));
       delete process.env["REMOTE_PI_DIRECT_CONFIG"];
       _resetCwdLockForTest();
       rmSync(cwd, { recursive: true, force: true });

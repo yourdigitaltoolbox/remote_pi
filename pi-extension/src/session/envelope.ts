@@ -4,20 +4,19 @@ import { randomBytes } from "node:crypto";
  * 5-field envelope for the agent-network local protocol (plano 19).
  * Serialized as JSONL (one JSON object per line) over UDS streams.
  */
+export interface DeliveryReceiptRequest {
+  /** Broker-added marker: target must retain before acknowledging this envelope. */
+  required: true;
+}
+
 export interface Envelope {
   from: string;
   to: string | string[];        // single name, list of names, or "broadcast"
   id: string;                   // UUID v7
   re: string | null;            // id of the message this replies to, or null
   body: unknown;
-  /**
-   * Interop with the context-lifecycle broker lineage (8886c66): that broker
-   * stamps `{ required: true }` on the final target hop and ACKs the sender
-   * `denied` unless the target answers `mesh_delivery_receipt` within its
-   * window. This build's broker never sets it; clients must still honor it so
-   * a mixed mesh doesn't report false `denied` on delivered envelopes.
-   */
-  deliveryReceipt?: { required: true };
+  /** Trusted only when added by the receiving broker's delivery path. */
+  deliveryReceipt?: DeliveryReceiptRequest;
 }
 
 const UUID_RE =
@@ -98,12 +97,15 @@ export function parse(line: string): Envelope {
   if (!("body" in o)) {
     throw new EnvelopeError("body required");
   }
-  // Same validation as the lifecycle lineage: present ⇒ exactly {required:true}.
   const deliveryReceipt = o["deliveryReceipt"];
-  if (deliveryReceipt !== undefined
-    && (!deliveryReceipt || typeof deliveryReceipt !== "object" || Array.isArray(deliveryReceipt)
-      || (deliveryReceipt as Record<string, unknown>)["required"] !== true)) {
-    throw new EnvelopeError("deliveryReceipt must be { required: true }");
+  if (deliveryReceipt !== undefined) {
+    if (!deliveryReceipt || typeof deliveryReceipt !== "object" || Array.isArray(deliveryReceipt)) {
+      throw new EnvelopeError("deliveryReceipt must be exactly { required: true }");
+    }
+    const receipt = deliveryReceipt as Record<string, unknown>;
+    if (Object.keys(receipt).length !== 1 || receipt["required"] !== true) {
+      throw new EnvelopeError("deliveryReceipt must be exactly { required: true }");
+    }
   }
   return {
     from: o["from"] as string,
@@ -111,7 +113,7 @@ export function parse(line: string): Envelope {
     id: o["id"] as string,
     re: re as string | null,
     body: o["body"],
-    ...(deliveryReceipt === undefined ? {} : { deliveryReceipt: { required: true as const } }),
+    ...(deliveryReceipt === undefined ? {} : { deliveryReceipt: { required: true } }),
   };
 }
 

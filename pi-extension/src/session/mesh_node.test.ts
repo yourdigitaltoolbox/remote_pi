@@ -3,8 +3,8 @@ import { MeshNode } from "./mesh_node.js";
 import type { PeerInfo } from "./broker.js";
 
 /**
- * Unit tests for `MeshNode.listPeersDetailed()` (the structured roster that lets
- * a client render a display-name label next to each stable identity route).
+ * Unit tests for `MeshNode.listPeersDetailed()` (the broker roster used by
+ * presentation clients and strict identity-authority resolution).
  *
  * The constructor builds a `SessionPeer` but opens no socket until `connect()`,
  * and `listPeersDetailed` only touches `peer_.request` / `peer_.address`. So we
@@ -66,15 +66,23 @@ describe("MeshNode.listPeersDetailed", () => {
     expect(detailed).toEqual([]);
   });
 
-  test("drops a detail entry whose route was filtered out of routes", async () => {
-    // A stale `peers_detailed` record with no corresponding `peers` route must
-    // not leak — detail is only kept when its route is in the flat list.
-    const ghost = peer("ghost", "~identity/ws-g/agent-g");
-    const node = makeNode({ peers: [SELF], peers_detailed: [ghost] });
+  test("preserves an incomplete broker detail so authority resolution can fail closed", async () => {
+    // Do not filter detail through flat routes or synthesize an identity route
+    // from the legacy address: the strict resolver must observe that this exact
+    // identity record lacks `identityAddress` and reject it explicitly.
+    const incomplete: PeerInfo = {
+      name: "ghost",
+      cwd: "/w",
+      address: "/w@ghost",
+      workspaceId: "ws-g",
+      agentId: "agent-g",
+      processEpoch: "epoch-g",
+    };
+    const node = makeNode({ peers: [SELF], peers_detailed: [incomplete] });
 
     const { routes, detailed } = await node.listPeersDetailed();
 
     expect(routes).toEqual([]);
-    expect(detailed).toEqual([]);
+    expect(detailed).toEqual([incomplete]);
   });
 });

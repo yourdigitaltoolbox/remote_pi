@@ -45,6 +45,28 @@ export function agentIdFromSessionId(sessionId: string): string {
   return uuidFromStableText("remote-pi-session-agent-v1", sessionId.trim());
 }
 
+/**
+ * Allocate a deterministic process-local identity after the preferred logical
+ * session identity is proven live elsewhere. The process epoch is already a
+ * fresh UUID for this runtime, so it gives repeated collision handling in the
+ * same process one stable alternate while distinct processes receive distinct
+ * routes. The workspace and epoch stay unchanged for grouping and fencing.
+ */
+export function rollRuntimeIdentity(identity: RuntimeIdentity): RuntimeIdentity {
+  if (!isRuntimeIdentity(identity)) throw new Error("Cannot roll invalid runtime identity.");
+  const rolled: RuntimeIdentity = {
+    ...identity,
+    agentId: uuidFromStableText(
+      "remote-pi-live-collision-agent-v1",
+      `${identity.agentId.toLowerCase()}\0${identity.processEpoch.toLowerCase()}`,
+    ),
+  };
+  if (!isRuntimeIdentity(rolled) || rolled.agentId === identity.agentId.toLowerCase()) {
+    throw new Error("Could not allocate a distinct rolled runtime identity.");
+  }
+  return rolled;
+}
+
 export function isRuntimeIdentity(identity: unknown): identity is RuntimeIdentity {
   if (!identity || typeof identity !== "object" || Array.isArray(identity)) return false;
   const value = identity as Partial<RuntimeIdentity>;

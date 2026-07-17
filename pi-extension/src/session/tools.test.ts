@@ -266,6 +266,15 @@ describe("public tools with current runtime identities", () => {
     const second = new SessionPeer({ sockPath, name: "worker", cwd: "/workspace", identity: secondIdentity });
     await first.start();
     await second.start();
+    // Model the production target-side spool: receipt follows local retention,
+    // not the sender's socket write. These peer-level tools tests do not load
+    // index.ts, so install the narrow receipt adapter explicitly.
+    for (const peer of [first, second]) {
+      peer.onMessage((env) => {
+        if (!env.deliveryReceipt?.required) return;
+        void peer.send("broker", { type: "mesh_delivery_receipt", envelopeId: env.id, status: "received" });
+      });
+    }
     try {
       const firstTools = makeMockPi();
       const secondTools = makeMockPi();
